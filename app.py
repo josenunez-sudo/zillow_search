@@ -159,18 +159,115 @@ def url_matches_city_state(url:str, city:str=None, state:str=None) -> bool:
             ok = False
     return ok
 
-def best_from_bing_items(items, required_city=None, required_state=None, require_match=False, mls_id=None):
+def bing_search_items(query):
+    if not BING_API_KEY: return []
+    h = {"Ocp-Apim-Subscription-Key": BING_API_KEY}
+    try:
+        if BING_CUSTOM_ID:
+            p = {"q": query, "customconfig": BING_CUSTOM_ID, "mkt": "en-US", "count": 15}
+            r = requests.get(BING_CUSTOM, headers=h, params=p, timeout=20)
+        else:
+            p = {"q": query, "mkt": "en-US", "count": 15, "responseFilter": "Webpages"}
+            r = requests.get(BING_WEB, headers=h, params=p, timeout=20)
+        r.raise_for_status()
+        data = r.json()
+        return data.get("webPages", {}).get("value") if "webPages" in data else data.get("items", []) or []
+    except requests.RequestException:
+        return []
+
+# ---- Fetch & confirm MLS on page ----
+UA_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Cache-Control": "no-cache",
+}
+def _fetch(url, timeout=10): return requests.get(url, headers=UA_HEADERS, timeout=timeout)
+
+MLS_HTML_PATTERNS = [
+    lambda mid: rf'\bMLS[^A-Za-z0-9]{{0,5}}#?\s*{re.escape(mid)}\b',
+    lambda mid: rf'\bMLS\s*#?\s*{re.escape(mid)}\b',
+    lambda mid: rf'"mls"\s*:\s*"{re.escape(mid)}"',
+    lambda mid: rf'"mlsId"\s*:\s*"{re.escape(mid)}"',
+    lambda mid: rf'"mlsId"\s*:\s*{re.escape(mid)}',
+]
+
+def page_contains_mls(html:str, mls_id:str) -> bool:
+    for mk in MLS_HTML_PATTERNS:
+        if re.search(mk(mls_id), html, re.I):
+            return True
+    return False
+
+def confirm_or_resolve_mls_on_page(url:str, mls_id:str):
+    """
+    Return:
+      - url if the page contains the MLS id,
+      - a resolved homedetails URL from inside an _rb page if that page contains the MLS id,
+      - None otherwise.
+    """
+    try:
+        r = _fetch(url); r.raise_for_status()
+        html = r.text
+        if page_contains_mls(html, mls_id):
+            return url
+        # If it's a search (_rb) page, try first few homedetails links within
+        if url.endswith("_rb/") and "/homedetails/" not in url:
+            cand = re.findall(r'href="(https://www\.zillow\.com/homedetails/[^"]+)"', html)[:5]
+            for u in cand:
+                try:
+                    rr = _fetch(u); rr.raise_for_status()
+                    if page_contains_mls(rr.text, mls_id):
+                        return u
+                except Exception:
+                    continue
+    except Exception:
+        return None
+    return None
+
+# ---- MLS-first search with confirmation ----
+def find_zillow_by_mls_with_confirmation(mls_id, required_state=None, required_city=None, mls_name=None, delay=0.35, require_match=False, max_candidates=20):
+    if not (BING_API_KEY and mls_id): return None
+    q_mls = [
+        f'"MLS# {mls_id}" site:zillow.com',
+        f'"{mls_id}" "MLS" site:zillow.com',
+        f'{mls_id} site:zillow.com/homedetails',
+    ]
+    if mls_name:
+        q_mls = [f'{q} "{mls_name}"' for q in q_mls] + q_mls
+
+    seen, candidates = set(), []
+    for q in q_mls:
+        items = bing_search_items(q)
+        for it in items:
+            url = it.get("url") or it.get("link") or ""
+            if not url or "zillow.com" not in url: continue
+            if "/homedetails/" not in url and "/homes/" not in url: continue
+            if require_match and not url_matches_city_state(url, required_city, required_state): 
+                continue
+            if url in seen: continue
+            seen.add(url); candidates.append(url)
+            if len(candidates) >= max_candidates: break
+        if len(candidates) >= max_candidates: break
+
+    # Confirm on-page MLS
+    for u in candidates:
+        time.sleep(delay)
+        ok = confirm_or_resolve_mls_on_page(u, mls_id)
+        if ok: 
+            return ok
+    return None
+
+# ---- Homedetails by address (fallback) ----
+def best_from_bing_items(items, required_city=None, required_state=None, require_match=False):
     if not items: return None
     def score(it):
         url = it.get("url") or it.get("link") or ""
-        snip = (it.get("snippet") or "").lower()
         s = 0
         if "zillow.com" in url: s += 1
         if "/homedetails/" in url: s += 4
         if "/homes/" in url: s += 1
         if "zpid" in url: s += 1
         if url_matches_city_state(url, required_city, required_state): s += 4
-        if mls_id and str(mls_id) in snip: s += 3
         return s
     filtered = []
     if require_match and required_state:
@@ -182,24 +279,7 @@ def best_from_bing_items(items, required_city=None, required_state=None, require
     top = ranked[0]
     return top.get("url") or top.get("link") or ""
 
-# --- Bing search wrappers ---
-def bing_search_items(query):
-    if not BING_API_KEY: return []
-    h = {"Ocp-Apim-Subscription-Key": BING_API_KEY}
-    try:
-        if BING_CUSTOM_ID:
-            p = {"q": query, "customconfig": BING_CUSTOM_ID, "mkt": "en-US", "count": 10}
-            r = requests.get(BING_CUSTOM, headers=h, params=p, timeout=20)
-        else:
-            p = {"q": query, "mkt": "en-US", "count": 10, "responseFilter": "Webpages"}
-            r = requests.get(BING_WEB, headers=h, params=p, timeout=20)
-        r.raise_for_status()
-        data = r.json()
-        return data.get("webPages", {}).get("value") if "webPages" in data else data.get("items", []) or []
-    except requests.RequestException:
-        return []
-
-def resolve_homedetails_with_bing(query_address, required_state=None, required_city=None, mls_id=None, mls_name=None, delay=0.25, require_match=False):
+def resolve_homedetails_with_bing(query_address, required_state=None, required_city=None, delay=0.25, require_match=False):
     if not BING_API_KEY: return None
     queries = [
         f'{query_address} site:zillow.com/homedetails',
@@ -208,19 +288,9 @@ def resolve_homedetails_with_bing(query_address, required_state=None, required_c
         f'{query_address} land site:zillow.com/homedetails',
         f'{query_address} lot site:zillow.com/homedetails',
     ]
-    if mls_id:
-        # MLS-first variants
-        queries = [
-            f'"MLS# {mls_id}" site:zillow.com/homedetails',
-            f'{mls_id} site:zillow.com/homedetails',
-            f'"{mls_id}" "MLS" site:zillow.com/homedetails',
-        ] + queries
-        if mls_name:
-            queries = [f'{q} "{mls_name}"' for q in queries[:3]] + queries  # add board name to MLS queries
-
     for q in queries:
         items = bing_search_items(q)
-        url = best_from_bing_items(items, required_city, required_state, require_match=require_match, mls_id=mls_id)
+        url = best_from_bing_items(items, required_city, required_state, require_match=require_match)
         if url and "/homedetails/" in url:
             return url
         time.sleep(delay)
@@ -247,14 +317,6 @@ def azure_search_first_zillow(query_address):
     return None
 
 # ---- Image helpers (best-effort) ----
-UA_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-    "Accept-Language": "en-US,en;q=0.9",
-    "Cache-Control": "no-cache",
-}
-def _fetch(url, timeout=8): return requests.get(url, headers=UA_HEADERS, timeout=timeout)
-
 def fetch_og_image(url):
     """Return an og:image (or similar) from homedetails page if present."""
     try:
@@ -279,7 +341,7 @@ def street_view_image(addr):
     return f"https://maps.googleapis.com/maps/api/streetview?size=400x300&location={loc}&key={GOOGLE_MAPS_API_KEY}"
 
 def picture_for_result(query_address, zurl):
-    """Prefer homedetails og:image; else Street View of the query address."""
+    """Prefer homedetails og:image; else Street View."""
     img = None
     if zurl and "/homedetails/" in zurl:
         img = fetch_og_image(zurl)
@@ -292,7 +354,7 @@ def get_thumbnail(query_address, zurl):
     return picture_for_result(query_address, zurl)
 
 # ---- Core processing ----
-def process_rows(rows, delay, land_mode, defaults, require_state, mls_first, default_mls_name):
+def process_rows(rows, delay, land_mode, defaults, require_state, mls_first, default_mls_name, max_candidates):
     out = []
     for row in rows:
         comp = extract_components(row)
@@ -304,34 +366,35 @@ def process_rows(rows, delay, land_mode, defaults, require_state, mls_first, def
         query_address = compose_query_address(street, comp["city"], comp["state"], comp["zip"], defaults)
         deeplink = construct_deeplink_from_parts(street, comp["city"], comp["state"], comp["zip"], defaults)
 
-        # Determine filters
+        # Filters for search
         required_state_val = defaults.get("state") if require_state else None
         required_city_val  = comp["city"] or defaults.get("city")
 
-        # Try MLS-first via Bing (if MLS ID present and toggle enabled)
         zurl = None
-        mls_id   = comp.get("mls_id") or ""
-        mls_name = comp.get("mls_name") or default_mls_name or ""
+        mls_id   = (comp.get("mls_id") or "").strip()
+        mls_name = (comp.get("mls_name") or default_mls_name or "").strip()
+
+        # 1) MLS-first with on-page confirmation
         if mls_first and mls_id:
-            zurl = resolve_homedetails_with_bing(
-                query_address, required_state=required_state_val,
-                required_city=required_city_val, mls_id=mls_id, mls_name=mls_name,
-                delay=min(delay, 0.5), require_match=require_state
+            zurl = find_zillow_by_mls_with_confirmation(
+                mls_id, required_state=required_state_val, required_city=required_city_val,
+                mls_name=mls_name, delay=min(delay, 0.6), require_match=require_state,
+                max_candidates=max_candidates
             )
 
-        # Azure (optional)
+        # 2) Azure (optional)
         if not zurl:
             zurl = azure_search_first_zillow(query_address)
 
-        # Address-based Bing (if still not found)
+        # 3) Address-based Bing (fallback)
         if not zurl:
             zurl = resolve_homedetails_with_bing(
                 query_address, required_state=required_state_val,
-                required_city=required_city_val, delay=min(delay, 0.5),
+                required_city=required_city_val, delay=min(delay, 0.6),
                 require_match=require_state
             )
 
-        # Fallback to the constructed (location-aware) _rb deeplink
+        # 4) Constructed _rb deeplink (final fallback)
         if not zurl:
             zurl = deeplink
 
@@ -352,20 +415,20 @@ def build_output(rows, fmt):
         items = [f'<li><a href="{r["zillow_url"]}" target="_blank" rel="noopener">{r["zillow_url"]}</a></li>'
                  for r in rows if r["zillow_url"]]
         return "<ul>\n" + "\n".join(items) + "\n</ul>\n", "text/html"
-    # txt (raw deeplinks, one per line)
+    # txt (raw deeplinks one per line)
     text = "\n".join([r['zillow_url'] for r in rows if r['zillow_url']]) + "\n"
     return text, "text/plain"
 
 # ---- Streamlit UI ----
-st.set_page_config(page_title="Zillow Deeplink Finder (MLS-aware)", page_icon="🏠", layout="wide")
-st.title("🏠 Zillow Deeplink Finder (MLS-aware)")
-st.caption("Upload a CSV → return raw Zillow deeplinks. Prefer MLS ID when present, with land-aware cleanup and city/state filtering. Thumbnails are best-effort.")
+st.set_page_config(page_title="Zillow Deeplink Finder (MLS-confirmed)", page_icon="🏠", layout="wide")
+st.title("🏠 Zillow Deeplink Finder (MLS-confirmed)")
+st.caption("Upload a CSV → returns raw Zillow deeplinks. MLS-first matching with page confirmation, land-aware cleanup, city/state filtering. Thumbnails are best-effort.")
 
 c1, c2, c3, c4, c5 = st.columns([1,1,1,1,1])
 with c1:
     fmt   = st.selectbox("Download format", ["txt","csv","md","html"], index=0)
 with c2:
-    delay = st.slider("Delay (seconds)", 0.0, 2.0, 0.4, 0.1)
+    delay = st.slider("Delay (seconds)", 0.0, 2.0, 0.5, 0.1)
 with c3:
     land_mode = st.checkbox("Land mode (clean & expand)", value=True)
 with c4:
@@ -374,7 +437,7 @@ with c5:
     mls_first = st.checkbox("Prefer MLS ID matching", value=True)
 
 st.subheader("Defaults (used when CSV is missing fields)")
-d1, d2, d3, d4 = st.columns([1,0.5,0.6,1])
+d1, d2, d3, d4, d5 = st.columns([1,0.5,0.6,1,1])
 with d1:
     default_city  = st.text_input("Default City", value="")
 with d2:
@@ -382,7 +445,9 @@ with d2:
 with d3:
     default_zip   = st.text_input("Default Zip", value="")
 with d4:
-    default_mls_name = st.text_input("Default MLS Board (e.g., TMLS)", value="")
+    default_mls_name = st.text_input("Default MLS Board (e.g., TMLS, Triangle MLS)", value="")
+with d5:
+    max_candidates = st.number_input("Max MLS candidates to check", min_value=5, max_value=40, value=20, step=1)
 
 defaults = {"city": default_city.strip(), "state": default_state.strip(), "zip": default_zip.strip()}
 
@@ -394,7 +459,8 @@ if file:
         rows = list(csv.DictReader(io.StringIO(content)))
         results = process_rows(
             rows, delay=delay, land_mode=land_mode, defaults=defaults,
-            require_state=require_state, mls_first=mls_first, default_mls_name=default_mls_name.strip()
+            require_state=require_state, mls_first=mls_first,
+            default_mls_name=default_mls_name.strip(), max_candidates=int(max_candidates)
         )
         st.success(f"Processed {len(results)} rows.")
 
