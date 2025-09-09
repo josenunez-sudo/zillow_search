@@ -442,11 +442,12 @@ def get_thumbnail(query_address, zurl):
     return picture_for_result(query_address, zurl)
 
 # ----------------------------
-# Output builders (TXT + MD are bulleted)
+# Output builders (TXT + MD are clean bulleted links; no notes)
 # ----------------------------
 def build_output(rows, fmt):
     """
-    Build downloadable output. TXT and MD are bulleted; HTML/CSV unchanged.
+    Build downloadable output. TXT and MD are bulleted and DO NOT include notes
+    (for client-facing copy/paste). HTML/CSV unchanged.
     """
     if fmt == "csv":
         s = io.StringIO()
@@ -455,34 +456,17 @@ def build_output(rows, fmt):
         return s.getvalue(), "text/csv"
 
     if fmt == "md":
-        lines = []
-        for r in rows:
-            url = r.get("zillow_url")
-            if not url:
-                continue
-            line = f"- {url}"
-            if r.get("note"):
-                line += f"  <!-- {r['note']} -->"
-            lines.append(line)
+        lines = [f"- {r['zillow_url']}" for r in rows if r.get("zillow_url")]
         return ("\n".join(lines) + "\n"), "text/markdown"
 
     if fmt == "html":
-        items = [f'<li><a href="{r["zillow_url"]}" target="_blank" rel="noopener">{r["zillow_url"]}</a>'
-                 + (f' <em>({r.get("note","")})</em>' if r.get("note") else "") + '</li>'
+        items = [f'<li><a href="{r["zillow_url"]}" target="_blank" rel="noopener">{r["zillow_url"]}</a></li>'
                  for r in rows if r.get("zillow_url")]
         return "<ul>\n" + "\n".join(items) + "\n</ul>\n", "text/html"
 
-    # txt (bulleted)
+    # txt (bulleted, no notes)
     if fmt == "txt":
-        lines = []
-        for r in rows:
-            url = r.get("zillow_url")
-            if not url:
-                continue
-            line = f"- {url}"
-            if r.get("note"):
-                line += f"  ({r['note']})"
-            lines.append(line)
+        lines = [f"- {r['zillow_url']}" for r in rows if r.get("zillow_url")]
         return ("\n".join(lines) + "\n"), "text/plain"
 
 # ----------------------------
@@ -535,7 +519,7 @@ def process_rows(rows, delay, land_mode, defaults, require_state, mls_first, def
         # Build a LOT-preserving deeplink that **always** appends location if provided in row/defaults
         deeplink = construct_deeplink_from_parts(street_raw, comp["city"], comp["state"], comp["zip"], defaults)
 
-        # Warn if missing location (will cause nationwide _rb)
+        # Optional internal note (not shown in client outputs)
         note = ""
         if not ((comp["city"] or defaults.get("city")) and (comp["state"] or defaults.get("state"))):
             note = "No city/state provided — deeplink is nationwide search."
@@ -641,13 +625,11 @@ if file:
             else:
                 col1.empty()
 
-            # Show MLS (if present), deeplink, and any note
+            # Client-facing: show clean link (and MLS if present), NO notes
             line = f"**MLS#: {r['mls_id']}**  \n{r['zillow_url']}" if r.get("mls_id") else r["zillow_url"]
-            if r.get("note"):
-                line += f"  \n*{r['note']}*"
             col2.markdown(line)
 
-        # --- DEBUG / DIAGNOSTICS ---
+        # --- DEBUG / DIAGNOSTICS (internal; optional) ---
         with st.expander("🔎 Debug: per-row details"):
             verify = st.checkbox("Verify pages (slow: fetch each final URL)")
 
@@ -701,13 +683,13 @@ if file:
                 st.write("Variant preview unavailable.")
 
         if fmt in ("md","txt"):
-            st.subheader("Preview")
+            st.subheader("Preview (client-facing)")
             st.code(payload, language="markdown" if fmt=="md" else "text")
 
-        # Diagnostics summary
+        # Optional internal reminder (won't appear in downloads)
         missing_loc = sum(1 for r in results if "nationwide" in (r.get("note") or ""))
         if missing_loc:
-            st.warning(f"{missing_loc} row(s) had no city/state in the CSV or defaults; their deeplinks search nationwide. Set Default City/State above or add columns to your CSV.")
+            st.info(f"{missing_loc} row(s) lacked city/state in CSV or defaults (internal note only).")
 
     except Exception as e:
         st.error(f"Error: {e}")
