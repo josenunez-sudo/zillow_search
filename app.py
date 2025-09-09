@@ -442,25 +442,48 @@ def get_thumbnail(query_address, zurl):
     return picture_for_result(query_address, zurl)
 
 # ----------------------------
-# Output builders
+# Output builders (TXT + MD are bulleted)
 # ----------------------------
 def build_output(rows, fmt):
+    """
+    Build downloadable output. TXT and MD are bulleted; HTML/CSV unchanged.
+    """
     if fmt == "csv":
         s = io.StringIO()
         w = csv.DictWriter(s, fieldnames=["input_address","mls_id","zillow_url","note"])
         w.writeheader(); w.writerows(rows)
         return s.getvalue(), "text/csv"
+
     if fmt == "md":
-        text = "\n".join([f"- {r['zillow_url']}" + (f"  <!-- {r.get('note','')} -->" if r.get("note") else "")
-                          for r in rows if r['zillow_url']]) + "\n"
-        return text, "text/markdown"
+        lines = []
+        for r in rows:
+            url = r.get("zillow_url")
+            if not url:
+                continue
+            line = f"- {url}"
+            if r.get("note"):
+                line += f"  <!-- {r['note']} -->"
+            lines.append(line)
+        return ("\n".join(lines) + "\n"), "text/markdown"
+
     if fmt == "html":
         items = [f'<li><a href="{r["zillow_url"]}" target="_blank" rel="noopener">{r["zillow_url"]}</a>'
                  + (f' <em>({r.get("note","")})</em>' if r.get("note") else "") + '</li>'
-                 for r in rows if r["zillow_url"]]
+                 for r in rows if r.get("zillow_url")]
         return "<ul>\n" + "\n".join(items) + "\n</ul>\n", "text/html"
-    text = "\n".join([r['zillow_url'] for r in rows if r['zillow_url']]) + "\n"
-    return text, "text/plain"
+
+    # txt (bulleted)
+    if fmt == "txt":
+        lines = []
+        for r in rows:
+            url = r.get("zillow_url")
+            if not url:
+                continue
+            line = f"- {url}"
+            if r.get("note"):
+                line += f"  ({r['note']})"
+            lines.append(line)
+        return ("\n".join(lines) + "\n"), "text/plain"
 
 # ----------------------------
 # Deeplink builder that ALWAYS appends location if available
