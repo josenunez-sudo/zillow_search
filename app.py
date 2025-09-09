@@ -213,8 +213,8 @@ def url_matches_city_state(url:str, city:str=None, state:str=None) -> bool:
     u = (url or '')
     ok = True
     if state:
-        st = state.upper().strip()
-        if f"-{st}-" not in u and f"/{st.lower()}/" not in u:
+        st2 = state.upper().strip()
+        if f"-{st2}-" not in u and f"/{st2.lower()}/" not in u:
             ok = False
     if city and ok:
         cs = f"-{_slug(city)}-"
@@ -624,11 +624,64 @@ if file:
                 line += f"  \n*{r['note']}*"
             col2.markdown(line)
 
+        # --- DEBUG / DIAGNOSTICS ---
+        with st.expander("🔎 Debug: per-row details"):
+            verify = st.checkbox("Verify pages (slow: fetch each final URL)")
+
+            def has_token(s, token):
+                return (token and token.lower() in (s or "").lower())
+
+            dbg_rows = []
+            for r in results:
+                url = r["zillow_url"]
+                is_homedetails = ("/homedetails/" in url)
+                city = defaults.get("city")
+                state = defaults.get("state")
+                row_dbg = {
+                    "MLS": r.get("mls_id") or "",
+                    "Final URL": url,
+                    "Type": "homedetails" if is_homedetails else "_rb search",
+                    "City token in URL": "yes" if has_token(url, city) else "no",
+                    "State token in URL": "yes" if (state and (f"-{state.lower()}-" in url or f"/{state.lower()}/" in url)) else "no",
+                    "Note": r.get("note") or ""
+                }
+                if verify:
+                    try:
+                        resp = requests.get(url, headers={"User-Agent":"Mozilla/5.0"}, timeout=12)
+                        html = resp.text if resp.ok else ""
+                        onpage_city = "yes" if (city and re.search(re.escape(city), html, re.I)) else "no"
+                        onpage_state = "yes" if (state and re.search(rf'\b{re.escape(state)}\b', html, re.I)) else "no"
+                        mls = r.get("mls_id") or ""
+                        onpage_mls = "n/a"
+                        if mls:
+                            onpage_mls = "yes" if re.search(rf'\bMLS[^A-Za-z0-9]{{0,5}}#?\s*{re.escape(mls)}\b', html, re.I) else "no"
+                        row_dbg.update({"On-page City": onpage_city, "On-page State": onpage_state, "On-page MLS": onpage_mls})
+                    except Exception:
+                        row_dbg.update({"On-page City":"err","On-page State":"err","On-page MLS":"err"})
+                dbg_rows.append(row_dbg)
+
+            st.dataframe(dbg_rows, use_container_width=True)
+
+            # Show the first 3 street variants for the first 5 rows (helps confirm LOT handling)
+            st.caption("Address variants (first 5 rows):")
+            try:
+                for i, raw_row in enumerate(rows[:5]):
+                    comp = extract_components(raw_row)
+                    street_raw = comp["street_raw"]
+                    street_clean = clean_land_street(street_raw) if land_mode else street_raw
+                    v = generate_address_variants(street_raw, comp["city"], comp["state"], comp["zip"], defaults)
+                    if land_mode:
+                        v = list(dict.fromkeys(v + generate_address_variants(street_clean, comp["city"], comp["state"], comp["zip"], defaults)))
+                    st.write(f"Row {i+1} — street_raw: `{street_raw}`")
+                    st.code("\n".join(v[:3]) or "(no variants)", language="text")
+            except Exception:
+                st.write("Variant preview unavailable.")
+
         if fmt in ("md","txt"):
             st.subheader("Preview")
             st.code(payload, language="markdown" if fmt=="md" else "text")
 
-        # Diagnostics
+        # Diagnostics summary
         missing_loc = sum(1 for r in results if "nationwide" in (r.get("note") or ""))
         if missing_loc:
             st.warning(f"{missing_loc} row(s) had no city/state in the CSV or defaults; their deeplinks search nationwide. Set Default City/State above or add columns to your CSV.")
