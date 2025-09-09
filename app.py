@@ -3,7 +3,9 @@ from datetime import datetime
 import requests
 from urllib.parse import quote_plus
 
-# ---- Load optional secrets into env ----
+# ----------------------------
+# Load optional secrets -> env
+# ----------------------------
 for k in ["AZURE_SEARCH_ENDPOINT","AZURE_SEARCH_INDEX","AZURE_SEARCH_API_KEY",
           "BING_API_KEY","BING_CUSTOM_CONFIG_ID","GOOGLE_MAPS_API_KEY"]:
     try:
@@ -12,18 +14,24 @@ for k in ["AZURE_SEARCH_ENDPOINT","AZURE_SEARCH_INDEX","AZURE_SEARCH_API_KEY",
     except Exception:
         pass
 
-# ---- Config (from env) ----
+# ----------------------------
+# Config (from env)
+# ----------------------------
 AZURE_SEARCH_ENDPOINT = os.getenv("AZURE_SEARCH_ENDPOINT","").rstrip("/")
 AZURE_SEARCH_INDEX    = os.getenv("AZURE_SEARCH_INDEX","")
 AZURE_SEARCH_KEY      = os.getenv("AZURE_SEARCH_API_KEY","")
+
 BING_API_KEY          = os.getenv("BING_API_KEY","")
 BING_CUSTOM_ID        = os.getenv("BING_CUSTOM_CONFIG_ID","")
+
 GOOGLE_MAPS_API_KEY   = os.getenv("GOOGLE_MAPS_API_KEY","")
 
 BING_WEB    = "https://api.bing.microsoft.com/v7.0/search"
 BING_CUSTOM = "https://api.bing.microsoft.com/v7.0/custom/search"
 
-# ---- Address/MLS parsing helpers ----
+# ----------------------------
+# CSV field keys
+# ----------------------------
 ADDR_PRIMARY = {
     "full_address","address","property address","property_address","site address","site_address",
     "street address","street_address","listing address","listing_address","location"
@@ -39,11 +47,58 @@ STATE_KEYS = {"state","st","province","region"}
 ZIP_KEYS   = {"zip","zip code","postal code","postalcode","zip_code","postal_code"}
 COUNTY_KEYS= {"county","county name"}
 
-# Common MLS field names in CSV
 MLS_ID_KEYS   = {"mls","mls id","mls_id","mls #","mls#","mls number","mlsnumber","listing id","listing_id"}
 MLS_NAME_KEYS = {"mls name","mls board","mls provider","source","source mls","mls source"}
 
-# Land-oriented cleaning
+# ----------------------------
+# Normalizers
+# ----------------------------
+def norm_key(k:str) -> str:
+    return re.sub(r"\s+"," ", (k or "").strip().lower())
+
+def get_first_by_keys(row, keys):
+    for k in row.keys():
+        if norm_key(k) in keys:
+            v = str(row[k]).strip()
+            if v:
+                return v
+    return ""
+
+def extract_components(row):
+    """Return components: street_raw, city, state, zip, county, mls_id, mls_name."""
+    n = { norm_key(k): (str(v).strip() if v is not None else "") for k,v in row.items() }
+
+    # Full address?
+    for k in list(n.keys()):
+        if k in ADDR_PRIMARY and n[k]:
+            return {
+                "street_raw": n[k],
+                "city": "", "state": "", "zip": "", "county": "",
+                "mls_id": get_first_by_keys(n, MLS_ID_KEYS),
+                "mls_name": get_first_by_keys(n, MLS_NAME_KEYS)
+            }
+
+    # Build from parts
+    num    = get_first_by_keys(n, NUM_KEYS)
+    name   = get_first_by_keys(n, NAME_KEYS)
+    suf    = get_first_by_keys(n, SUF_KEYS)
+    city   = get_first_by_keys(n, CITY_KEYS)
+    state  = get_first_by_keys(n, STATE_KEYS)
+    zipc   = get_first_by_keys(n, ZIP_KEYS)
+    county = get_first_by_keys(n, COUNTY_KEYS)
+
+    street_parts = [x for x in [num, name, suf] if x]
+    street_raw = " ".join(street_parts).strip()
+
+    return {
+        "street_raw": street_raw, "city": city, "state": state, "zip": zipc, "county": county,
+        "mls_id": get_first_by_keys(n, MLS_ID_KEYS),
+        "mls_name": get_first_by_keys(n, MLS_NAME_KEYS)
+    }
+
+# ----------------------------
+# Land-aware cleanup + variants
+# ----------------------------
 LAND_LEAD_TOKENS = {"lot","lt","tract","parcel","blk","block","tbd"}
 HWY_EXPAND = {
     r"\bhwy\b": "highway",
@@ -60,46 +115,11 @@ HWY_EXPAND = {
     r"\bsq\b": "square",
     r"\bcir\b": "circle",
 }
-
-def norm_key(k): return re.sub(r"\s+"," ", (k or "").strip().lower())
-
-def get_first_by_keys(row, keys):
-    for k in row.keys():
-        if norm_key(k) in keys:
-            v = str(row[k]).strip()
-            if v:
-                return v
-    return ""
-
-def extract_components(row):
-    """Return components: street_raw, city, state, zip, county, mls_id, mls_name."""
-    n = { norm_key(k): (str(v).strip() if v is not None else "") for k,v in row.items() }
-
-    # Full-address field present?
-    for k in list(n.keys()):
-        if k in ADDR_PRIMARY and n[k]:
-            return {"street_raw": n[k], "city":"", "state":"", "zip":"", "county":"",
-                    "mls_id": get_first_by_keys(n, MLS_ID_KEYS),
-                    "mls_name": get_first_by_keys(n, MLS_NAME_KEYS)}
-
-    # Assemble from parts
-    num    = get_first_by_keys(n, NUM_KEYS)
-    name   = get_first_by_keys(n, NAME_KEYS)
-    suf    = get_first_by_keys(n, SUF_KEYS)
-    city   = get_first_by_keys(n, CITY_KEYS)
-    state  = get_first_by_keys(n, STATE_KEYS)
-    zipc   = get_first_by_keys(n, ZIP_KEYS)
-    county = get_first_by_keys(n, COUNTY_KEYS)
-
-    street_parts = [x for x in [num, name, suf] if x]
-    street_raw = " ".join(street_parts).strip()
-
-    return {"street_raw": street_raw, "city": city, "state": state, "zip": zipc, "county": county,
-            "mls_id": get_first_by_keys(n, MLS_ID_KEYS),
-            "mls_name": get_first_by_keys(n, MLS_NAME_KEYS)}
+DIR_MAP = {'s':'south','n':'north','e':'east','w':'west'}
+LOT_REGEX = re.compile(r'\b(?:lot|lt)\s*[-#:]?\s*([A-Za-z0-9]+)\b', re.I)
 
 def clean_land_street(street:str) -> str:
-    """Land mode: strip '0', LOT/TRACT prefixes, expand HWY/rd/etc., normalize spacing."""
+    """A 'clean' form (for some variants). We will ALSO keep LOT-preserving variants elsewhere."""
     if not street: return street
     s = street.strip()
     s = re.sub(r"^\s*0[\s\-]+", "", s)  # drop leading "0 "
@@ -118,31 +138,74 @@ def clean_land_street(street:str) -> str:
 
 def compose_query_address(street, city, state, zipc, defaults):
     parts = [street]
-    c  = city  or defaults.get("city","")
-    st= state or defaults.get("state","")
-    z  = zipc  or defaults.get("zip","")
+    c  = (city  or defaults.get("city","")).strip()
+    st = (state or defaults.get("state","")).strip()
+    z  = (zipc  or defaults.get("zip","")).strip()
     if c: parts.append(c)
     if st: parts.append(st)
     if z: parts.append(z)
     return " ".join([p for p in parts if p]).strip()
 
-def construct_deeplink_from_parts(street, city, state, zipc, defaults):
-    c  = (city  or defaults.get("city","")).strip()
-    st = (state or defaults.get("state","")).strip()
-    z  = (zipc  or defaults.get("zip","")).strip()
-    slug_parts = [street]
-    loc_parts  = [p for p in [c, st] if p]
-    if loc_parts:
-        slug_parts.append(", ".join(loc_parts))
-    if z:
-        slug_parts[-1] = f"{slug_parts[-1]} {z}" if slug_parts else z
-    slug = ", ".join(slug_parts)
-    a = slug.lower()
-    a = re.sub(r"[^\w\s,-]", "", a).replace(",", "")
-    a = re.sub(r"\s+", "-", a.strip())
-    return f"https://www.zillow.com/homes/{a}_rb/"
+def generate_address_variants(street, city, state, zipc, defaults):
+    """
+    Yield multiple street variants (keep & strip LOT; Hwy/Highway; US/U.S.; S/South),
+    each appended with city/state/zip if available.
+    """
+    city = (city or defaults.get("city","")).strip()
+    st   = (state or defaults.get("state","")).strip()
+    z    = (zipc or defaults.get("zip","")).strip()
 
-# ---- Bing helpers + filters (avoid wrong states/cities) ----
+    base = (street or "").strip()
+
+    # detect lot number (if present)
+    lot_match = LOT_REGEX.search(base)
+    lot_num = lot_match.group(1) if lot_match else None
+
+    # normalize core tokens for mixing
+    core = base
+    core = re.sub(r'\bu\.?s\.?\b', 'US', core, flags=re.I)
+    core = re.sub(r'\bhwy\b', 'highway', core, flags=re.I)
+    core = re.sub(r'\b([NSEW])\b', lambda m: DIR_MAP.get(m.group(1).lower(), m.group(1)), core, flags=re.I)
+
+    # core variants
+    variants = set()
+    variants.add(core)
+    variants.add(re.sub(r'\bhighway\b', 'hwy', core, flags=re.I))
+    variants.add(re.sub(r'\bUS\b', 'U.S.', core, flags=re.I))
+    variants.add(re.sub(r'\bUS\b\s*(\d+)', r'US-\1', core, flags=re.I))  # US-301
+
+    # short directions
+    variants |= { re.sub(r'\bsouth\b', 's', v, flags=re.I) for v in list(variants) }
+
+    # LOT-preserved
+    lot_variants = set(variants)
+    if lot_num:
+        for v in list(variants):
+            lot_variants.add(f"lot {lot_num} {v}")
+            lot_variants.add(f"{v} lot {lot_num}")
+            lot_variants.add(f"lot-{lot_num} {v}")
+
+    # LOT-stripped
+    stripped_variants = { LOT_REGEX.sub('', v).strip() for v in list(lot_variants) }
+
+    all_street_variants = set()
+    all_street_variants |= lot_variants
+    all_street_variants |= stripped_variants
+
+    # attach location
+    out = []
+    for sv in all_street_variants:
+        parts = [sv]
+        if city: parts.append(city)
+        if st:   parts.append(st)
+        if z:    parts.append(z)
+        out.append(" ".join(p for p in parts if p))
+    # unique + keep order
+    return [s for s in dict.fromkeys(out) if s.strip()]
+
+# ----------------------------
+# Bing search helpers
+# ----------------------------
 def _slug(text:str) -> str:
     return re.sub(r'[^a-z0-9]+', '-', (text or '').lower()).strip('-')
 
@@ -175,14 +238,17 @@ def bing_search_items(query):
     except requests.RequestException:
         return []
 
-# ---- Fetch & confirm MLS on page ----
+# ----------------------------
+# Fetch + confirm on-page MLS
+# ----------------------------
 UA_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
     "Accept-Language": "en-US,en;q=0.9",
     "Cache-Control": "no-cache",
 }
-def _fetch(url, timeout=10): return requests.get(url, headers=UA_HEADERS, timeout=timeout)
+def _fetch(url, timeout=10):
+    return requests.get(url, headers=UA_HEADERS, timeout=timeout)
 
 MLS_HTML_PATTERNS = [
     lambda mid: rf'\bMLS[^A-Za-z0-9]{{0,5}}#?\s*{re.escape(mid)}\b',
@@ -202,7 +268,7 @@ def confirm_or_resolve_mls_on_page(url:str, mls_id:str):
     """
     Return:
       - url if the page contains the MLS id,
-      - a resolved homedetails URL from inside an _rb page if that page contains the MLS id,
+      - a resolved homedetails URL found inside an _rb page that contains the MLS id,
       - None otherwise.
     """
     try:
@@ -210,7 +276,6 @@ def confirm_or_resolve_mls_on_page(url:str, mls_id:str):
         html = r.text
         if page_contains_mls(html, mls_id):
             return url
-        # If it's a search (_rb) page, try first few homedetails links within
         if url.endswith("_rb/") and "/homedetails/" not in url:
             cand = re.findall(r'href="(https://www\.zillow\.com/homedetails/[^"]+)"', html)[:5]
             for u in cand:
@@ -224,8 +289,11 @@ def confirm_or_resolve_mls_on_page(url:str, mls_id:str):
         return None
     return None
 
-# ---- MLS-first search with confirmation ----
+# ----------------------------
+# Resolvers (MLS-first & variants)
+# ----------------------------
 def find_zillow_by_mls_with_confirmation(mls_id, required_state=None, required_city=None, mls_name=None, delay=0.35, require_match=False, max_candidates=20):
+    """Search Bing for MLS id, collect Zillow candidates, open pages and confirm MLS appears."""
     if not (BING_API_KEY and mls_id): return None
     q_mls = [
         f'"MLS# {mls_id}" site:zillow.com',
@@ -249,7 +317,6 @@ def find_zillow_by_mls_with_confirmation(mls_id, required_state=None, required_c
             if len(candidates) >= max_candidates: break
         if len(candidates) >= max_candidates: break
 
-    # Confirm on-page MLS
     for u in candidates:
         time.sleep(delay)
         ok = confirm_or_resolve_mls_on_page(u, mls_id)
@@ -257,46 +324,70 @@ def find_zillow_by_mls_with_confirmation(mls_id, required_state=None, required_c
             return ok
     return None
 
-# ---- Homedetails by address (fallback) ----
-def best_from_bing_items(items, required_city=None, required_state=None, require_match=False):
-    if not items: return None
-    def score(it):
-        url = it.get("url") or it.get("link") or ""
-        s = 0
-        if "zillow.com" in url: s += 1
-        if "/homedetails/" in url: s += 4
-        if "/homes/" in url: s += 1
-        if "zpid" in url: s += 1
-        if url_matches_city_state(url, required_city, required_state): s += 4
-        return s
-    filtered = []
-    if require_match and required_state:
-        for it in items:
-            u = it.get("url") or it.get("link") or ""
-            if url_matches_city_state(u, required_city, required_state):
-                filtered.append(it)
-    ranked = sorted(filtered or items, key=score, reverse=True)
-    top = ranked[0]
-    return top.get("url") or top.get("link") or ""
-
-def resolve_homedetails_with_bing(query_address, required_state=None, required_city=None, delay=0.25, require_match=False):
+def resolve_homedetails_with_bing_variants(address_variants, required_state=None, required_city=None, mls_id=None, delay=0.3, require_match=False):
+    """Try multiple address variants; collect candidates; confirm MLS (if provided) or city/state on page."""
     if not BING_API_KEY: return None
-    queries = [
-        f'{query_address} site:zillow.com/homedetails',
-        f'{query_address} zpid site:zillow.com',
-        f'"{query_address}" site:zillow.com/homedetails',
-        f'{query_address} land site:zillow.com/homedetails',
-        f'{query_address} lot site:zillow.com/homedetails',
-    ]
-    for q in queries:
-        items = bing_search_items(q)
-        url = best_from_bing_items(items, required_city, required_state, require_match=require_match)
-        if url and "/homedetails/" in url:
-            return url
+    candidates, seen = [], set()
+
+    for qaddr in address_variants:
+        queries = [
+            f'{qaddr} site:zillow.com/homedetails',
+            f'"{qaddr}" site:zillow.com/homedetails',
+            f'{qaddr} land site:zillow.com/homedetails',
+            f'{qaddr} lot site:zillow.com/homedetails',
+        ]
+        if mls_id:
+            mls_q = [
+                f'"MLS# {mls_id}" site:zillow.com/homedetails',
+                f'{mls_id} site:zillow.com/homedetails',
+                f'"{mls_id}" "MLS" site:zillow.com/homedetails',
+            ]
+            queries = mls_q + queries
+
+        for q in queries:
+            items = bing_search_items(q)
+            for it in items:
+                url = it.get("url") or it.get("link") or ""
+                if not url or "zillow.com" not in url: continue
+                if "/homedetails/" not in url and "/homes/" not in url: continue
+                if require_match and not url_matches_city_state(url, required_city, required_state):
+                    continue
+                if url in seen: continue
+                seen.add(url); candidates.append(url)
+            time.sleep(delay)
+
+    # Confirm per-candidate
+    for u in candidates:
         time.sleep(delay)
+        try:
+            r = _fetch(u); r.raise_for_status()
+            html = r.text
+            ok = False
+            if mls_id:
+                ok = page_contains_mls(html, mls_id)
+            if not ok and (required_city or required_state):
+                if required_city and re.search(re.escape(required_city), html, re.I):
+                    ok = True
+                if required_state and re.search(rf'\b{re.escape(required_state)}\b', html, re.I):
+                    ok = True
+            if ok and "/homedetails/" not in u:
+                cand = re.findall(r'href="(https://www\.zillow\.com/homedetails/[^"]+)"', html)[:5]
+                for uu in cand or []:
+                    try:
+                        rr = _fetch(uu); rr.raise_for_status()
+                        if (not mls_id) or page_contains_mls(rr.text, mls_id):
+                            return uu
+                    except Exception:
+                        continue
+            if ok:
+                return u
+        except Exception:
+            continue
     return None
 
-# ---- Azure (optional) ----
+# ----------------------------
+# Azure (optional)
+# ----------------------------
 def azure_search_first_zillow(query_address):
     if not (AZURE_SEARCH_ENDPOINT and AZURE_SEARCH_INDEX and AZURE_SEARCH_KEY):
         return None
@@ -316,7 +407,9 @@ def azure_search_first_zillow(query_address):
         return None
     return None
 
-# ---- Image helpers (best-effort) ----
+# ----------------------------
+# Images (best-effort)
+# ----------------------------
 def fetch_og_image(url):
     """Return an og:image (or similar) from homedetails page if present."""
     try:
@@ -353,18 +446,50 @@ def picture_for_result(query_address, zurl):
 def get_thumbnail(query_address, zurl):
     return picture_for_result(query_address, zurl)
 
-# ---- Core processing ----
+# ----------------------------
+# Output builders
+# ----------------------------
+def build_output(rows, fmt):
+    if fmt == "csv":
+        s = io.StringIO()
+        w = csv.DictWriter(s, fieldnames=["input_address","mls_id","zillow_url"])
+        w.writeheader(); w.writerows(rows)
+        return s.getvalue(), "text/csv"
+    if fmt == "md":
+        text = "\n".join([f"- {r['zillow_url']}" for r in rows if r['zillow_url']]) + "\n"
+        return text, "text/markdown"
+    if fmt == "html":
+        items = [f'<li><a href="{r["zillow_url"]}" target="_blank" rel="noopener">{r["zillow_url"]}</a></li>'
+                 for r in rows if r["zillow_url"]]
+        return "<ul>\n" + "\n".join(items) + "\n</ul>\n", "text/html"
+    text = "\n".join([r['zillow_url'] for r in rows if r['zillow_url']]) + "\n"
+    return text, "text/plain"
+
+# ----------------------------
+# Core processing
+# ----------------------------
 def process_rows(rows, delay, land_mode, defaults, require_state, mls_first, default_mls_name, max_candidates):
     out = []
     for row in rows:
         comp = extract_components(row)
-        street = comp["street_raw"]
-        if land_mode:
-            street = clean_land_street(street)
 
-        # Build query & deeplink WITH location
-        query_address = compose_query_address(street, comp["city"], comp["state"], comp["zip"], defaults)
-        deeplink = construct_deeplink_from_parts(street, comp["city"], comp["state"], comp["zip"], defaults)
+        street_raw = comp["street_raw"]
+        street_clean = clean_land_street(street_raw) if land_mode else street_raw
+
+        # Build address variants from the ORIGINAL (preserving LOT), plus city/state/zip
+        variants = generate_address_variants(street_raw, comp["city"], comp["state"], comp["zip"], defaults)
+        if land_mode:
+            # also include a cleaned variant (already includes city/state when composed)
+            variants = list(dict.fromkeys(variants + generate_address_variants(street_clean, comp["city"], comp["state"], comp["zip"], defaults)))
+
+        # For display/StreetView, use the first variant as "query_address"
+        query_address = variants[0] if variants else compose_query_address(street_raw, comp["city"], comp["state"], comp["zip"], defaults)
+
+        # Build a LOT-preserving deeplink slug from first variant (fallback)
+        a = query_address.lower()
+        a = re.sub(r"[^\w\s,-]", "", a).replace(",", "")
+        a = re.sub(r"\s+", "-", a.strip())
+        deeplink = f"https://www.zillow.com/homes/{a}_rb/"
 
         # Filters for search
         required_state_val = defaults.get("state") if require_state else None
@@ -386,15 +511,14 @@ def process_rows(rows, delay, land_mode, defaults, require_state, mls_first, def
         if not zurl:
             zurl = azure_search_first_zillow(query_address)
 
-        # 3) Address-based Bing (fallback)
+        # 3) Address-based (variants) with page confirmation bias
         if not zurl:
-            zurl = resolve_homedetails_with_bing(
-                query_address, required_state=required_state_val,
-                required_city=required_city_val, delay=min(delay, 0.6),
-                require_match=require_state
+            zurl = resolve_homedetails_with_bing_variants(
+                variants, required_state=required_state_val, required_city=required_city_val,
+                mls_id=mls_id or None, delay=min(delay, 0.6), require_match=require_state
             )
 
-        # 4) Constructed _rb deeplink (final fallback)
+        # 4) Fallback
         if not zurl:
             zurl = deeplink
 
@@ -402,27 +526,12 @@ def process_rows(rows, delay, land_mode, defaults, require_state, mls_first, def
         time.sleep(min(delay, 0.5))
     return out
 
-def build_output(rows, fmt):
-    if fmt == "csv":
-        s = io.StringIO()
-        w = csv.DictWriter(s, fieldnames=["input_address","mls_id","zillow_url"])
-        w.writeheader(); w.writerows(rows)
-        return s.getvalue(), "text/csv"
-    if fmt == "md":
-        text = "\n".join([f"- {r['zillow_url']}" for r in rows if r['zillow_url']]) + "\n"
-        return text, "text/markdown"
-    if fmt == "html":
-        items = [f'<li><a href="{r["zillow_url"]}" target="_blank" rel="noopener">{r["zillow_url"]}</a></li>'
-                 for r in rows if r["zillow_url"]]
-        return "<ul>\n" + "\n".join(items) + "\n</ul>\n", "text/html"
-    # txt (raw deeplinks one per line)
-    text = "\n".join([r['zillow_url'] for r in rows if r['zillow_url']]) + "\n"
-    return text, "text/plain"
-
-# ---- Streamlit UI ----
-st.set_page_config(page_title="Zillow Deeplink Finder (MLS-confirmed)", page_icon="🏠", layout="wide")
-st.title("🏠 Zillow Deeplink Finder (MLS-confirmed)")
-st.caption("Upload a CSV → returns raw Zillow deeplinks. MLS-first matching with page confirmation, land-aware cleanup, city/state filtering. Thumbnails are best-effort.")
+# ----------------------------
+# Streamlit UI
+# ----------------------------
+st.set_page_config(page_title="Zillow Deeplink Finder (MLS-confirmed, land-aware)", page_icon="🏠", layout="wide")
+st.title("🏠 Zillow Deeplink Finder (MLS-confirmed, land-aware)")
+st.caption("Upload a CSV → returns raw Zillow deeplinks. Tries MLS-first with on-page confirmation, keeps LOT variants, and appends city/state. Thumbnails are best-effort.")
 
 c1, c2, c3, c4, c5 = st.columns([1,1,1,1,1])
 with c1:
@@ -430,14 +539,14 @@ with c1:
 with c2:
     delay = st.slider("Delay (seconds)", 0.0, 2.0, 0.5, 0.1)
 with c3:
-    land_mode = st.checkbox("Land mode (clean & expand)", value=True)
+    land_mode = st.checkbox("Land mode (also try cleaned forms)", value=True)
 with c4:
     require_state = st.checkbox("Require state match in results", value=True)
 with c5:
     mls_first = st.checkbox("Prefer MLS ID matching", value=True)
 
 st.subheader("Defaults (used when CSV is missing fields)")
-d1, d2, d3, d4, d5 = st.columns([1,0.5,0.6,1,1])
+d1, d2, d3, d4, d5 = st.columns([1,0.6,0.6,1,1])
 with d1:
     default_city  = st.text_input("Default City", value="")
 with d2:
@@ -457,6 +566,7 @@ if file:
     try:
         content = file.read().decode("utf-8-sig")
         rows = list(csv.DictReader(io.StringIO(content)))
+
         results = process_rows(
             rows, delay=delay, land_mode=land_mode, defaults=defaults,
             require_state=require_state, mls_first=mls_first,
@@ -494,4 +604,4 @@ if file:
     except Exception as e:
         st.error(f"Error: {e}")
 else:
-    st.info("Set Default City/State and Default MLS board (optional), then upload your CSV.")
+    st.info("Set Default City/State (or include them per row) and, if possible, provide MLS IDs in the CSV.")
