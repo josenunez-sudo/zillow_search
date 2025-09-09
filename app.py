@@ -239,7 +239,7 @@ def bing_search_items(query):
         return []
 
 # ----------------------------
-# Fetch + confirm on-page MLS
+# Fetch + confirm on-page (MLS or City/State)
 # ----------------------------
 UA_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36",
@@ -264,24 +264,40 @@ def page_contains_mls(html:str, mls_id:str) -> bool:
             return True
     return False
 
-def confirm_or_resolve_mls_on_page(url:str, mls_id:str):
+def page_contains_city_state(html:str, city:str=None, state:str=None) -> bool:
+    ok = False
+    if city and re.search(re.escape(city), html, re.I):
+        ok = True
+    if state and re.search(rf'\b{re.escape(state)}\b', html, re.I):
+        ok = True
+    return ok
+
+def confirm_or_resolve_on_page(url:str, mls_id:str=None, required_city:str=None, required_state:str=None):
     """
-    Return:
-      - url if the page contains the MLS id,
-      - a resolved homedetails URL found inside an _rb page that contains the MLS id,
-      - None otherwise.
+    Accept if:
+      - the page contains the MLS id, OR
+      - the page contains the required city/state tokens.
+    If it's a search (_rb) page, also try the first few homedetails links within.
     """
     try:
         r = _fetch(url); r.raise_for_status()
         html = r.text
-        if page_contains_mls(html, mls_id):
+
+        # Direct accept?
+        if mls_id and page_contains_mls(html, mls_id):
             return url
+        if page_contains_city_state(html, required_city, required_state):
+            if "/homedetails/" in url:
+                return url
+
+        # If search page, drill down
         if url.endswith("_rb/") and "/homedetails/" not in url:
-            cand = re.findall(r'href="(https://www\.zillow\.com/homedetails/[^"]+)"', html)[:5]
+            cand = re.findall(r'href="(https://www\.zillow\.com/homedetails/[^"]+)"', html)[:8]
             for u in cand:
                 try:
                     rr = _fetch(u); rr.raise_for_status()
-                    if page_contains_mls(rr.text, mls_id):
+                    h2 = rr.text
+                    if (mls_id and page_contains_mls(h2, mls_id)) or page_contains_city_state(h2, required_city, required_state):
                         return u
                 except Exception:
                     continue
@@ -293,7 +309,7 @@ def confirm_or_resolve_mls_on_page(url:str, mls_id:str):
 # Resolvers (MLS-first & variants)
 # ----------------------------
 def find_zillow_by_mls_with_confirmation(mls_id, required_state=None, required_city=None, mls_name=None, delay=0.35, require_match=False, max_candidates=20):
-    """Search Bing for MLS id, collect Zillow candidates, open pages and confirm MLS appears."""
+    """Search Bing for MLS id, collect Zillow candidates, open pages and confirm MLS OR City/State appears."""
     if not (BING_API_KEY and mls_id): return None
     q_mls = [
         f'"MLS# {mls_id}" site:zillow.com',
@@ -319,13 +335,13 @@ def find_zillow_by_mls_with_confirmation(mls_id, required_state=None, required_c
 
     for u in candidates:
         time.sleep(delay)
-        ok = confirm_or_resolve_mls_on_page(u, mls_id)
-        if ok: 
+        ok = confirm_or_resolve_on_page(u, mls_id=mls_id, required_city=required_city, required_state=required_state)
+        if ok:
             return ok
     return None
 
 def resolve_homedetails_with_bing_variants(address_variants, required_state=None, required_city=None, mls_id=None, delay=0.3, require_match=False):
-    """Try multiple address variants; collect candidates; confirm MLS (if provided) or city/state on page."""
+    """Try multiple address variants; collect candidates; confirm MLS OR City/State on page."""
     if not BING_API_KEY: return None
     candidates, seen = [], set()
 
@@ -359,30 +375,9 @@ def resolve_homedetails_with_bing_variants(address_variants, required_state=None
     # Confirm per-candidate
     for u in candidates:
         time.sleep(delay)
-        try:
-            r = _fetch(u); r.raise_for_status()
-            html = r.text
-            ok = False
-            if mls_id:
-                ok = page_contains_mls(html, mls_id)
-            if not ok and (required_city or required_state):
-                if required_city and re.search(re.escape(required_city), html, re.I):
-                    ok = True
-                if required_state and re.search(rf'\b{re.escape(required_state)}\b', html, re.I):
-                    ok = True
-            if ok and "/homedetails/" not in u:
-                cand = re.findall(r'href="(https://www\.zillow\.com/homedetails/[^"]+)"', html)[:5]
-                for uu in cand or []:
-                    try:
-                        rr = _fetch(uu); rr.raise_for_status()
-                        if (not mls_id) or page_contains_mls(rr.text, mls_id):
-                            return uu
-                    except Exception:
-                        continue
-            if ok:
-                return u
-        except Exception:
-            continue
+        ok = confirm_or_resolve_on_page(u, mls_id=mls_id, required_city=required_city, required_state=required_state)
+        if ok:
+            return ok
     return None
 
 # ----------------------------
@@ -452,18 +447,46 @@ def get_thumbnail(query_address, zurl):
 def build_output(rows, fmt):
     if fmt == "csv":
         s = io.StringIO()
-        w = csv.DictWriter(s, fieldnames=["input_address","mls_id","zillow_url"])
+        w = csv.DictWriter(s, fieldnames=["input_address","mls_id","zillow_url","note"])
         w.writeheader(); w.writerows(rows)
         return s.getvalue(), "text/csv"
     if fmt == "md":
-        text = "\n".join([f"- {r['zillow_url']}" for r in rows if r['zillow_url']]) + "\n"
+        text = "\n".join([f"- {r['zillow_url']}" + (f"  <!-- {r.get('note','')} -->" if r.get("note") else "")
+                          for r in rows if r['zillow_url']]) + "\n"
         return text, "text/markdown"
     if fmt == "html":
-        items = [f'<li><a href="{r["zillow_url"]}" target="_blank" rel="noopener">{r["zillow_url"]}</a></li>'
+        items = [f'<li><a href="{r["zillow_url"]}" target="_blank" rel="noopener">{r["zillow_url"]}</a>'
+                 + (f' <em>({r.get("note","")})</em>' if r.get("note") else "") + '</li>'
                  for r in rows if r["zillow_url"]]
         return "<ul>\n" + "\n".join(items) + "\n</ul>\n", "text/html"
     text = "\n".join([r['zillow_url'] for r in rows if r['zillow_url']]) + "\n"
     return text, "text/plain"
+
+# ----------------------------
+# Deeplink builder that ALWAYS appends location if available
+# ----------------------------
+def construct_deeplink_from_parts(street, city, state, zipc, defaults):
+    """Zillow search deeplink that includes city/state (and zip when present)."""
+    c = (city or defaults.get("city","")).strip()
+    st_abbr = (state or defaults.get("state","")).strip()
+    z = (zipc or defaults.get("zip","")).strip()
+
+    slug_parts = [street]
+    loc_parts = [p for p in [c, st_abbr] if p]
+    if loc_parts:
+        slug_parts.append(", ".join(loc_parts))
+    if z:
+        if slug_parts:
+            slug_parts[-1] = f"{slug_parts[-1]} {z}"
+        else:
+            slug_parts.append(z)
+
+    slug = ", ".join(slug_parts)
+    a = slug.lower()
+    a = re.sub(r"[^\w\s,-]", "", a)
+    a = a.replace(",", "")
+    a = re.sub(r"\s+", "-", a.strip())
+    return f"https://www.zillow.com/homes/{a}_rb/"
 
 # ----------------------------
 # Core processing
@@ -476,20 +499,23 @@ def process_rows(rows, delay, land_mode, defaults, require_state, mls_first, def
         street_raw = comp["street_raw"]
         street_clean = clean_land_street(street_raw) if land_mode else street_raw
 
-        # Build address variants from the ORIGINAL (preserving LOT), plus city/state/zip
+        # Build address variants from ORIGINAL (preserving LOT), plus city/state/zip
         variants = generate_address_variants(street_raw, comp["city"], comp["state"], comp["zip"], defaults)
         if land_mode:
-            # also include a cleaned variant (already includes city/state when composed)
-            variants = list(dict.fromkeys(variants + generate_address_variants(street_clean, comp["city"], comp["state"], comp["zip"], defaults)))
+            variants = list(dict.fromkeys(
+                variants + generate_address_variants(street_clean, comp["city"], comp["state"], comp["zip"], defaults)
+            ))
 
-        # For display/StreetView, use the first variant as "query_address"
+        # Use first variant for display/StreetView
         query_address = variants[0] if variants else compose_query_address(street_raw, comp["city"], comp["state"], comp["zip"], defaults)
 
-        # Build a LOT-preserving deeplink slug from first variant (fallback)
-        a = query_address.lower()
-        a = re.sub(r"[^\w\s,-]", "", a).replace(",", "")
-        a = re.sub(r"\s+", "-", a.strip())
-        deeplink = f"https://www.zillow.com/homes/{a}_rb/"
+        # Build a LOT-preserving deeplink that **always** appends location if provided in row/defaults
+        deeplink = construct_deeplink_from_parts(street_raw, comp["city"], comp["state"], comp["zip"], defaults)
+
+        # Warn if missing location (will cause nationwide _rb)
+        note = ""
+        if not ((comp["city"] or defaults.get("city")) and (comp["state"] or defaults.get("state"))):
+            note = "No city/state provided — deeplink is nationwide search."
 
         # Filters for search
         required_state_val = defaults.get("state") if require_state else None
@@ -499,7 +525,7 @@ def process_rows(rows, delay, land_mode, defaults, require_state, mls_first, def
         mls_id   = (comp.get("mls_id") or "").strip()
         mls_name = (comp.get("mls_name") or default_mls_name or "").strip()
 
-        # 1) MLS-first with on-page confirmation
+        # 1) MLS-first with on-page confirmation (MLS or City/State)
         if mls_first and mls_id:
             zurl = find_zillow_by_mls_with_confirmation(
                 mls_id, required_state=required_state_val, required_city=required_city_val,
@@ -522,7 +548,7 @@ def process_rows(rows, delay, land_mode, defaults, require_state, mls_first, def
         if not zurl:
             zurl = deeplink
 
-        out.append({"input_address": query_address, "mls_id": mls_id, "zillow_url": zurl})
+        out.append({"input_address": query_address, "mls_id": mls_id, "zillow_url": zurl, "note": note})
         time.sleep(min(delay, 0.5))
     return out
 
@@ -531,7 +557,7 @@ def process_rows(rows, delay, land_mode, defaults, require_state, mls_first, def
 # ----------------------------
 st.set_page_config(page_title="Zillow Deeplink Finder (MLS-confirmed, land-aware)", page_icon="🏠", layout="wide")
 st.title("🏠 Zillow Deeplink Finder (MLS-confirmed, land-aware)")
-st.caption("Upload a CSV → returns raw Zillow deeplinks. Tries MLS-first with on-page confirmation, keeps LOT variants, and appends city/state. Thumbnails are best-effort.")
+st.caption("Upload a CSV → returns raw Zillow deeplinks. MLS-first matching with on-page confirmation, LOT-preserving variants, and location-appended deeplinks. Thumbnails are best-effort.")
 
 c1, c2, c3, c4, c5 = st.columns([1,1,1,1,1])
 with c1:
@@ -591,17 +617,23 @@ if file:
                     col1.empty()
             else:
                 col1.empty()
-            # Show MLS (if present) and deeplink
-            if r.get("mls_id"):
-                col2.markdown(f"**MLS#: {r['mls_id']}**  \n{r['zillow_url']}")
-            else:
-                col2.write(r["zillow_url"])
+
+            # Show MLS (if present), deeplink, and any note
+            line = f"**MLS#: {r['mls_id']}**  \n{r['zillow_url']}" if r.get("mls_id") else r["zillow_url"]
+            if r.get("note"):
+                line += f"  \n*{r['note']}*"
+            col2.markdown(line)
 
         if fmt in ("md","txt"):
             st.subheader("Preview")
             st.code(payload, language="markdown" if fmt=="md" else "text")
 
+        # Diagnostics
+        missing_loc = sum(1 for r in results if "nationwide" in (r.get("note") or ""))
+        if missing_loc:
+            st.warning(f"{missing_loc} row(s) had no city/state in the CSV or defaults; their deeplinks search nationwide. Set Default City/State above or add columns to your CSV.")
+
     except Exception as e:
         st.error(f"Error: {e}")
 else:
-    st.info("Set Default City/State (or include them per row) and, if possible, provide MLS IDs in the CSV.")
+    st.info("Set Default City/State (or include them per row), then upload your CSV.")
