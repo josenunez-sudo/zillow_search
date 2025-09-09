@@ -1,7 +1,3 @@
-mkdir -p ~/zillow-streamlit-app
-cd ~/zillow-streamlit-app
-
-cat > app.py <<'PY'
 import os, csv, io, re, time, json, streamlit as st
 from datetime import datetime
 import requests
@@ -181,13 +177,3 @@ if file:
         st.error(f"Error: {e}")
 else:
     st.info("Choose a CSV to begin.")
-PY
-
-cat > requirements.txt <<'REQ'
-streamlit
-requests
-REQ
-
-python3 -m ensurepip --upgrade
-python3 -m pip install --upgrade pip -r requirements.txt
-streamlit run app.py
