@@ -5,7 +5,7 @@ from urllib.parse import quote_plus
 
 # ---- Load optional secrets into env ----
 for k in ["AZURE_SEARCH_ENDPOINT","AZURE_SEARCH_INDEX","AZURE_SEARCH_API_KEY",
-          "BING_API_KEY","BING_CUSTOM_CONFIG_ID"]:
+          "BING_API_KEY","BING_CUSTOM_CONFIG_ID","GOOGLE_MAPS_API_KEY"]:
     try:
         if k in st.secrets and st.secrets[k]:
             os.environ[k] = st.secrets[k]
@@ -18,6 +18,7 @@ AZURE_SEARCH_INDEX    = os.getenv("AZURE_SEARCH_INDEX","")
 AZURE_SEARCH_KEY      = os.getenv("AZURE_SEARCH_API_KEY","")
 BING_API_KEY          = os.getenv("BING_API_KEY","")
 BING_CUSTOM_ID        = os.getenv("BING_CUSTOM_CONFIG_ID","")
+GOOGLE_MAPS_API_KEY   = os.getenv("GOOGLE_MAPS_API_KEY","")
 
 BING_WEB    = "https://api.bing.microsoft.com/v7.0/search"
 BING_CUSTOM = "https://api.bing.microsoft.com/v7.0/custom/search"
@@ -67,7 +68,7 @@ def get_first_by_keys(row, keys):
     return ""
 
 def extract_components(row):
-    """Return components dict: street_raw, city, state, zip, county if present."""
+    """Return components: street_raw, city, state, zip, county (when present)."""
     n = { norm_key(k): (str(v).strip() if v is not None else "") for k,v in row.items() }
 
     # A) Full-address field present
@@ -79,7 +80,6 @@ def extract_components(row):
     num  = get_first_by_keys(n, NUM_KEYS)
     name = get_first_by_keys(n, NAME_KEYS)
     suf  = get_first_by_keys(n, SUF_KEYS)
-    # NOTE: Unit is skipped for land; it often misleads parcel matching
     city = get_first_by_keys(n, CITY_KEYS)
     state= get_first_by_keys(n, STATE_KEYS)
     zipc = get_first_by_keys(n, ZIP_KEYS)
@@ -241,6 +241,53 @@ def azure_search_first_zillow(query_address):
         return None
     return None
 
+# ---- Image helpers (best-effort) ----
+UA_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Cache-Control": "no-cache",
+}
+
+def _fetch(url, timeout=8):
+    return requests.get(url, headers=UA_HEADERS, timeout=timeout)
+
+def fetch_og_image(url):
+    """Return an og:image (or similar) from homedetails page if present."""
+    try:
+        r = _fetch(url); r.raise_for_status()
+        html = r.text
+        for pat in [
+            r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)["\']',
+            r'<meta[^>]+property=["\']og:image:secure_url["\'][^>]+content=["\']([^"\']+)["\']',
+            r'"image"\s*:\s*"(https?://[^"]+)"',
+            r'"image"\s*:\s*\[\s*"(https?://[^"]+)"',
+        ]:
+            m = re.search(pat, html, re.I)
+            if m: return m.group(1)
+    except Exception:
+        return None
+    return None
+
+def street_view_image(addr):
+    """Optional fallback via Google Street View Static API."""
+    if not GOOGLE_MAPS_API_KEY: return None
+    loc = quote_plus(addr)
+    return f"https://maps.googleapis.com/maps/api/streetview?size=400x300&location={loc}&key={GOOGLE_MAPS_API_KEY}"
+
+def picture_for_result(query_address, zurl):
+    """Prefer homedetails og:image; else Street View of the query address."""
+    img = None
+    if zurl and "/homedetails/" in zurl:
+        img = fetch_og_image(zurl)
+    if not img:
+        img = street_view_image(query_address)
+    return img
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def get_thumbnail(query_address, zurl):
+    return picture_for_result(query_address, zurl)
+
 # ---- Core processing ----
 def process_rows(rows, delay, land_mode, defaults, require_state):
     out = []
@@ -296,9 +343,9 @@ def build_output(rows, fmt):
 # ---- Streamlit UI ----
 st.set_page_config(page_title="Zillow Deeplink Finder (Land-aware)", page_icon="🏠", layout="wide")
 st.title("🏠 Zillow Deeplink Finder (Land-aware)")
-st.caption("Uploads a CSV → returns raw Zillow deeplinks. Land mode cleans LOT/TRACT/0 prefixes and appends city/state for better matches.")
+st.caption("Upload a CSV → returns raw Zillow deeplinks. Land mode cleans LOT/TRACT/0 prefixes and appends city/state. Thumbnails are best-effort.")
 
-c1, c2, c3, c4 = st.columns([1,1,1,1])
+c1, c2, c3, c4, c5 = st.columns([1,1,1,1,1])
 with c1:
     fmt   = st.selectbox("Download format", ["txt","csv","md","html"], index=0)
 with c2:
@@ -307,6 +354,8 @@ with c3:
     land_mode = st.checkbox("Land mode (clean & expand)", value=True)
 with c4:
     require_state = st.checkbox("Require state match in results", value=True)
+with c5:
+    show_images = st.checkbox("Show thumbnails", value=True)
 
 st.subheader("Fallback location (used when CSV is missing fields)")
 d1, d2, d3 = st.columns([1,0.5,0.6])
@@ -333,11 +382,26 @@ if file:
         payload, mime = build_output(results, fmt)
         st.download_button("Download result", data=payload, file_name=name, mime=mime)
 
-        st.subheader("Preview")
-        if fmt in ("md","txt"):
-            st.code(payload, language="markdown" if fmt=="md" else "text")
+        # --- RESULTS (thumbnails + links) ---
+        if show_images:
+            st.subheader("Results")
+            for r in results:
+                col1, col2 = st.columns([1, 4], gap="small")
+                img_url = get_thumbnail(r["input_address"], r["zillow_url"])
+                if img_url:
+                    try:
+                        col1.image(img_url, use_column_width=True)
+                    except Exception:
+                        col1.empty()
+                else:
+                    col1.empty()
+                col2.write(r["zillow_url"])
         else:
             st.dataframe(results, use_container_width=True)
+
+        if fmt in ("md","txt"):
+            st.subheader("Preview")
+            st.code(payload, language="markdown" if fmt=="md" else "text")
 
     except Exception as e:
         st.error(f"Error: {e}")
