@@ -1,6 +1,5 @@
-# app.py — Ultra-Minimal Zillow Deeplink Finder (clickable list + conditional images)
-# One central input, one Run button, clickable bulleted results, then simple format download.
-# Images section appears ONLY if every result has an image.
+# app.py — Ultra-Minimal Zillow Deeplink Finder (images-if-any + dropdown+export)
+# One central input, one Run button, clickable bulleted results, format dropdown, Export button, and Images section if ANY image exists.
 
 import os, csv, io, re, time, json
 from datetime import datetime
@@ -42,6 +41,7 @@ for k in ["AZURE_SEARCH_ENDPOINT","AZURE_SEARCH_INDEX","AZURE_SEARCH_API_KEY",
 AZURE_SEARCH_ENDPOINT = os.getenv("AZURE_SEARCH_ENDPOINT","").rstrip("/")
 AZURE_SEARCH_INDEX    = os.getenv("AZURE_SEARCH_INDEX","")
 AZURE_SEARCH_KEY      = os.getenv("AZURE_SEARCH_API_KEY","")
+
 BING_API_KEY          = os.getenv("BING_API_KEY","")
 BING_CUSTOM_ID        = os.getenv("BING_CUSTOM_CONFIG_ID","")
 GOOGLE_MAPS_API_KEY   = os.getenv("GOOGLE_MAPS_API_KEY","")
@@ -400,7 +400,7 @@ def fetch_og_image(url: str) -> Optional[str]:
             r'"image"\s*:\s*\[\s*"(https?://[^"]+)"',
         ]:
             m = re.search(pat, html, re.I)
-            if m: 
+            if m:
                 return m.group(1)
     except Exception:
         return None
@@ -500,26 +500,24 @@ if clicked:
 
         # ---- RESULTS (clickable bulleted list) ----
         st.markdown("#### Results")
-        # Clickable, opens in new tab
         items = [f'<li><a href="{r["zillow_url"]}" target="_blank" rel="noopener">{r["zillow_url"]}</a></li>'
                  for r in results if r.get("zillow_url")]
         st.markdown("<ul class='link-list'>" + "\n".join(items) + "</ul>", unsafe_allow_html=True)
 
-        # ---- Download controls (set a default fmt now so session always has it) ----
-        default_fmt = "txt"  # requested default: bulleted list
+        # ---- Format dropdown + Export button directly under it ----
         fmt_options = ["txt","csv","md","html"]
-        fmt = st.selectbox("Download format", fmt_options, index=fmt_options.index(default_fmt))
+        fmt = st.selectbox("Download format", fmt_options, index=0)
         payload, mime = build_output(results, fmt)
         ts = datetime.utcnow().strftime("%Y%m%d-%H%M%S")
-        st.download_button("Download", data=payload, file_name=f"zillow_links_{ts}.{fmt}", mime=mime, use_container_width=True)
+        st.download_button("Export", data=payload, file_name=f"zillow_links_{ts}.{fmt}", mime=mime, use_container_width=True)
 
-        # ---- Images section (appears only if every link has an image) ----
-        # Collect thumbnails (cached)
+        # ---- Images section (appears if ANY link has an image) ----
         thumbs: List[Optional[str]] = [get_thumbnail(r["input_address"], r["zillow_url"]) for r in results]
-        if all(thumbs) and len(thumbs) == len(results):
+        imgs = [(r, img) for r, img in zip(results, thumbs) if img]
+        if imgs:
             st.markdown("#### Images")
             cols = st.columns(3)
-            for i, (r, img) in enumerate(zip(results, thumbs)):
+            for i, (r, img) in enumerate(imgs):
                 with cols[i % 3]:
                     st.image(img, use_column_width=True)
                     st.caption(r["input_address"] if r.get("input_address") else "Listing")
@@ -551,15 +549,16 @@ if results and not clicked:
 
     payload, mime = build_output(results, fmt)
     ts = datetime.utcnow().strftime("%Y%m%d-%H%M%S")
-    st.download_button("Download", data=payload,
+    st.download_button("Export", data=payload,
                        file_name=f"zillow_links_{ts}.{fmt}", mime=mime, use_container_width=True)
 
-    # Images section (only if ALL have images)
+    # Images section (appears if ANY link has an image)
     thumbs: List[Optional[str]] = [get_thumbnail(r.get("input_address",""), r.get("zillow_url","")) for r in results]
-    if all(thumbs) and len(thumbs) == len(results):
+    imgs = [(r, img) for r, img in zip(results, thumbs) if img]
+    if imgs:
         st.markdown("#### Images")
         cols = st.columns(3)
-        for i, (r, img) in enumerate(zip(results, thumbs)):
+        for i, (r, img) in enumerate(imgs):
             with cols[i % 3]:
                 st.image(img, use_column_width=True)
                 st.caption(r.get("input_address","Listing"))
