@@ -1,4 +1,5 @@
 # app.py — Address Alchemist
+# - Uses /mnt/data/link.avif as the favicon (via pillow-avif-plugin)
 # - Title uses FedEx-like font (Barlow Condensed) in white
 # - Minimal input area with live count, de-dup, trim, preview
 # - Default Streamlit drag&drop uploader (no custom styling)
@@ -14,11 +15,39 @@ from html import escape
 
 import requests
 import streamlit as st
+from PIL import Image
+
+# ----------------------------
+# Favicon: load AVIF and convert to PNG bytes for Streamlit
+# ----------------------------
+# Make sure requirements.txt includes: pillow-avif-plugin>=1.4.7
+try:
+    import pillow_avif  # noqa: F401  # registers AVIF with Pillow
+except Exception:
+    pillow_avif = None
+
+def _page_icon_from_avif(path: str):
+    if not os.path.exists(path):
+        return "⚗️"  # fallback emoji
+    try:
+        im = Image.open(path)   # AVIF -> Pillow Image (via plugin)
+        im.load()
+        if im.mode not in ("RGB", "RGBA"):
+            im = im.convert("RGBA")
+        buf = io.BytesIO()
+        im.save(buf, format="PNG")  # convert to PNG bytes for favicon
+        return buf.getvalue()
+    except Exception:
+        return "⚗️"
 
 # ----------------------------
 # Page setup & styles
 # ----------------------------
-st.set_page_config(page_title="Address Alchemist", page_icon="⚗️", layout="centered")
+st.set_page_config(
+    page_title="Address Alchemist",
+    page_icon=_page_icon_from_avif("/mnt/data/link.avif"),
+    layout="centered",
+)
 
 st.markdown("""
 <style>
