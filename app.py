@@ -17,7 +17,7 @@ import streamlit as st
 # ----------------------------
 # Page setup & styles
 # ----------------------------
-st.set_page_config(page_title="Zillow Deeplink Finder", layout="centered")
+st.set_page_config(page_title="Address Alchemist", layout="centered")
 
 st.markdown("""
 <style>
