@@ -1,11 +1,10 @@
 # app.py — Address Alchemist
-# - Uses /mnt/data/link.avif as the favicon (via pillow-avif-plugin)
-# - Title uses FedEx-like font (Barlow Condensed) in white
+# - AVIF favicon (/mnt/data/link.avif) via pillow-avif-plugin
+# - Title uses Barlow Condensed (white)
 # - Minimal input area with live count, de-dup, trim, preview
-# - Default Streamlit drag&drop uploader (no custom styling)
-# - Poppy Run (blue) and Export (green) buttons
 # - Clickable bulleted results (open in new tab)
-# - Images section shows if ANY item has an image (now prefers Zillow's hero photo)
+# - Images section shows if ANY item has an image (prefers Zillow hero photo)
+# - NEW: Image Log table shows per-link fetch details (status code, stage, selected URL, errors)
 # - Safe rerender with remembered format and filenames
 
 import os, csv, io, re, time, json
@@ -20,9 +19,9 @@ from PIL import Image
 # ----------------------------
 # Favicon: load AVIF and convert to PNG bytes for Streamlit
 # ----------------------------
-# Make sure requirements.txt includes: pillow-avif-plugin>=1.4.7
+# requirements.txt: pillow-avif-plugin>=1.4.7
 try:
-    import pillow_avif  # noqa: F401  # registers AVIF with Pillow
+    import pillow_avif  # noqa: F401
 except Exception:
     pillow_avif = None
 
@@ -30,12 +29,12 @@ def _page_icon_from_avif(path: str):
     if not os.path.exists(path):
         return "⚗️"  # fallback emoji
     try:
-        im = Image.open(path)   # AVIF -> Pillow Image (via plugin)
+        im = Image.open(path)
         im.load()
         if im.mode not in ("RGB", "RGBA"):
             im = im.convert("RGBA")
         buf = io.BytesIO()
-        im.save(buf, format="PNG")  # convert to PNG bytes for favicon
+        im.save(buf, format="PNG")
         return buf.getvalue()
     except Exception:
         return "⚗️"
@@ -51,32 +50,27 @@ st.set_page_config(
 
 st.markdown("""
 <style>
-/* Import a free, FedEx-like condensed sans */
 @import url('https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@600;700;800&display=swap');
 
-/* Layout */
 .block-container { max-width: 760px; }
 .center-box { border: 1px solid rgba(0,0,0,.08); border-radius: 12px; padding: 16px; }
 
-/* App Title — FedEx-style font, white color */
 .app-title {
   font-family: 'Barlow Condensed', system-ui, -apple-system, Segoe UI, Roboto, 'Helvetica Neue', Arial, sans-serif;
   font-weight: 800;
   font-size: 2.1rem;
   line-height: 1.1;
   letter-spacing: -0.01em;
-  color: #ffffff;            /* <- white title */
+  color: #ffffff;
   margin: 0 0 8px 0;
-  text-shadow: 0 1px 2px rgba(0,0,0,.25); /* subtle readability boost */
+  text-shadow: 0 1px 2px rgba(0,0,0,.25);
 }
 .app-sub { color: #6b7280; margin: 0 0 12px 0; }
 
-/* Body text helpers */
 .small { color: #6b7280; font-size: 12.5px; margin-top: 6px; }
 ul.link-list { margin: 0 0 .5rem 1.2rem; padding: 0; }
 ul.link-list li { margin: 0.2rem 0; }
 
-/* Buttons — poppy */
 .stButton>button {
   width: 100%;
   height: 48px;
@@ -105,7 +99,6 @@ ul.link-list li { margin: 0.2rem 0; }
   outline-offset: 2px;
 }
 
-/* Download (Export) button — green theme */
 .stDownloadButton>button {
   width: 100%;
   height: 48px;
@@ -134,11 +127,8 @@ ul.link-list li { margin: 0.2rem 0; }
   outline-offset: 2px;
 }
 
-/* Paste area: softer focus ring */
 textarea { border-radius: 10px !important; }
 textarea:focus { outline: 3px solid #93c5fd !important; outline-offset: 2px; }
-
-/* Hide ONLY the uploader clear button (if present) */
 [data-testid="stFileUploadClearButton"] { display: none !important; }
 </style>
 """, unsafe_allow_html=True)
@@ -263,7 +253,7 @@ def generate_address_variants(street, city, state, zipc, defaults):
     return [s for s in dict.fromkeys(out) if s.strip()]
 
 # ----------------------------
-# Web search + confirmation
+# Web fetch helpers
 # ----------------------------
 def _slug(text:str) -> str:
     return re.sub(r'[^a-z0-9]+', '-', (text or '').lower()).strip('-')
@@ -301,7 +291,14 @@ def bing_search_items(query):
     except requests.RequestException:
         return []
 
-UA_HEADERS = {"User-Agent":"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126 Safari/537.36"}
+# Strengthened headers (better luck vs bot protection)
+UA_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Cache-Control": "no-cache",
+}
+
 def _fetch(url, timeout=REQUEST_TIMEOUT):
     return requests.get(url, headers=UA_HEADERS, timeout=timeout)
 
@@ -445,18 +442,11 @@ def construct_deeplink_from_parts(street, city, state, zipc, defaults):
     return f"https://www.zillow.com/homes/{a}_rb/"
 
 # ----------------------------
-# Zillow-first image helper (NEW)
+# Zillow-first image helper
 # ----------------------------
 def extract_zillow_first_image(html: str) -> Optional[str]:
-    """
-    Find the first Zillow hero photo from the homedetails page HTML.
-    Prefers the explicit <img src="...cc_ft_960.jpg"> if present,
-    otherwise parses a photos.zillowstatic srcset and picks a good size.
-    """
     if not html:
         return None
-
-    # 1) Direct <img src=".../fp/<hash>-cc_ft_960.(jpg|webp)"> (prefer a few sizes)
     for target_w in ("960", "1152", "768", "1536"):
         m = re.search(
             rf'<img[^>]+src=["\'](https://photos\.zillowstatic\.com/fp/[^"\']+-cc_ft_{target_w}\.(?:jpg|webp))["\']',
@@ -464,8 +454,6 @@ def extract_zillow_first_image(html: str) -> Optional[str]:
         )
         if m:
             return m.group(1)
-
-    # 2) Parse the first srcset on the Zillow CDN and choose the largest <= 1152 (or else the largest)
     srcset_match = re.search(
         r'srcset=["\']([^"\']*photos\.zillowstatic\.com[^"\']+)["\']',
         html, re.I
@@ -484,22 +472,18 @@ def extract_zillow_first_image(html: str) -> Optional[str]:
             if up_to:
                 return sorted(((w,u) for (w,u) in candidates if w <= 1152), key=lambda x: x[0])[-1][1]
             return sorted(candidates, key=lambda x: x[0])[-1][1]
-
-    # 3) Any photos.zillowstatic fp URL with cc_ft_* we can find
     m = re.search(r'(https://photos\.zillowstatic\.com/fp/\S+-cc_ft_\d+\.(?:jpg|webp))', html, re.I)
     if m:
         return m.group(1)
-
     return None
 
 # ----------------------------
-# Single-row pipeline + image fetchers
+# Single-row pipeline
 # ----------------------------
 def process_single_row(row, *, delay=0.5, land_mode=True, defaults=None,
                        require_state=True, mls_first=True, default_mls_name="", max_candidates=20):
     defaults = defaults or {"city":"", "state":"", "zip":""}
     comp = extract_components(row)
-
     street_raw = comp["street_raw"]
     street_clean = clean_land_street(street_raw) if land_mode else street_raw
 
@@ -521,7 +505,6 @@ def process_single_row(row, *, delay=0.5, land_mode=True, defaults=None,
     mls_id   = (comp.get("mls_id") or "").strip()
     mls_name = (comp.get("mls_name") or default_mls_name or "").strip()
 
-    # 1) MLS-first
     if mls_first and mls_id:
         zurl, mtype = find_zillow_by_mls_with_confirmation(
             mls_id, required_state=required_state_val, required_city=required_city_val,
@@ -530,12 +513,10 @@ def process_single_row(row, *, delay=0.5, land_mode=True, defaults=None,
         )
         if zurl: status = "mls_match" if mtype == "mls_match" else "city_state_match"
 
-    # 2) Azure optional
     if not zurl:
         z = azure_search_first_zillow(query_address)
         if z: zurl, status = z, "azure_hit"
 
-    # 3) Address variants via Bing
     if not zurl:
         zurl, mtype = resolve_homedetails_with_bing_variants(
             variants, required_state=required_state_val, required_city=required_city_val,
@@ -544,57 +525,75 @@ def process_single_row(row, *, delay=0.5, land_mode=True, defaults=None,
         if zurl:
             status = "mls_match" if mtype == "mls_match" else "city_state_match"
 
-    # 4) Fallback deeplink
     if not zurl:
         zurl, status = deeplink, "deeplink_fallback"
 
     time.sleep(min(delay, 0.4))
     return {"input_address": query_address, "mls_id": mls_id, "zillow_url": zurl, "note": note, "status": status}
 
-def fetch_og_image(url: str) -> Optional[str]:
-    """Prefer the on-page Zillow hero photo; else fall back to og:image/JSON hints."""
-    try:
-        r = _fetch(url); r.raise_for_status()
-        html = r.text
+# ----------------------------
+# Image selection + LOGGING
+# ----------------------------
+def picture_for_result_with_log(query_address: str, zurl: str):
+    """
+    Returns (image_url: Optional[str], log: Dict[str, Any])
+    log fields: url, stage, status_code, html_len, selected, errors[list]
+    """
+    log = {"url": zurl, "stage": None, "status_code": None, "html_len": None, "selected": None, "errors": []}
 
-        # Prefer the exact Zillow photo from the <picture>/<img srcset>
-        zfirst = extract_zillow_first_image(html)
-        if zfirst:
-            return zfirst
-
-        # Fall back to og:image / JSON image hints
-        for pat in [
-            r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)["\']',
-            r'<meta[^>]+property=["\']og:image:secure_url["\'][^>]+content=["\']([^"\']+)["\']',
-            r'"image"\s*:\s*"(https?://[^"]+)"',
-            r'"image"\s*:\s*\[\s*"(https?://[^"]+)"',
-        ]:
-            m = re.search(pat, html, re.I)
-            if m:
-                return m.group(1)
-    except Exception:
-        return None
-    return None
-
-def street_view_image(addr: str) -> Optional[str]:
-    key = GOOGLE_MAPS_API_KEY
-    if not key or not addr:
-        return None
-    from urllib.parse import quote_plus
-    loc = quote_plus(addr)
-    return f"https://maps.googleapis.com/maps/api/streetview?size=600x400&location={loc}&key={key}"
-
-def picture_for_result(query_address: str, zurl: str) -> Optional[str]:
-    img = None
+    # Try Zillow page
     if zurl and "/homedetails/" in zurl:
-        img = fetch_og_image(zurl)
-    if not img:
-        img = street_view_image(query_address)
-    return img
+        try:
+            r = _fetch(zurl)
+            log["status_code"] = r.status_code
+            if r.ok:
+                html = r.text
+                log["html_len"] = len(html)
+                zfirst = extract_zillow_first_image(html)
+                if zfirst:
+                    log["stage"] = "zillow_hero"
+                    log["selected"] = zfirst
+                    return zfirst, log
 
-@st.cache_data(ttl=3600, show_spinner=False)
-def get_thumbnail(query_address: str, zurl: str) -> Optional[str]:
-    return picture_for_result(query_address, zurl)
+                # Fall back to og:image and JSON image hints
+                for pat in [
+                    r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)["\']',
+                    r'<meta[^>]+property=["\']og:image:secure_url["\'][^>]+content=["\']([^"\']+)["\']',
+                    r'"image"\s*:\s*"(https?://[^"]+)"',
+                    r'"image"\s*:\s*\[\s*"(https?://[^"]+)"',
+                ]:
+                    m = re.search(pat, html, re.I)
+                    if m:
+                        log["stage"] = "og_image"
+                        log["selected"] = m.group(1)
+                        return m.group(1), log
+            else:
+                log["errors"].append(f"http_error:{r.status_code}")
+        except Exception as e:
+            log["errors"].append(f"fetch_err:{e!r}")
+
+    # Street View fallback
+    try:
+        key = GOOGLE_MAPS_API_KEY
+        if key and query_address:
+            from urllib.parse import quote_plus
+            loc = quote_plus(query_address)
+            sv = f"https://maps.googleapis.com/maps/api/streetview?size=600x400&location={loc}&key={key}"
+            log["stage"] = "street_view"
+            log["selected"] = sv
+            return sv, log
+        else:
+            if not key:
+                log["errors"].append("no_google_maps_key")
+    except Exception as e:
+        log["errors"].append(f"sv_err:{e!r}")
+
+    log["stage"] = "none"
+    return None, log
+
+@st.cache_data(ttl=900, show_spinner=False)
+def get_thumbnail_and_log(query_address: str, zurl: str):
+    return picture_for_result_with_log(query_address, zurl)
 
 # ----------------------------
 # Output (downloads)
@@ -612,7 +611,6 @@ def build_output(rows: List[Dict[str, Any]], fmt: str):
         items = [f'<li><a href="{r["zillow_url"]}" target="_blank" rel="noopener">{r["zillow_url"]}</a></li>'
                  for r in rows if r.get("zillow_url")]
         return "<ul>\n" + "\n".join(items) + "\n</ul>\n", "text/html"
-    # txt (default) — ALWAYS bulleted list
     lines = [f"- {r['zillow_url']}" for r in rows if r.get("zillow_url")]
     return ("\n".join(lines) + "\n"), "text/plain"
 
@@ -641,10 +639,9 @@ with opt2:
 with opt3:
     show_preview = st.checkbox("Show preview", value=True)
 
-# Default Streamlit drag & drop look
 file = st.file_uploader("Upload CSV", type=["csv"], label_visibility="collapsed")
 
-# Live parsing of pasted lines (for preview; used on run if no CSV)
+# Live parsing of pasted lines
 lines_raw = (paste or "").splitlines()
 lines = [ln.strip() if trim_spaces else ln for ln in lines_raw]
 lines = [ln for ln in lines if ln.strip()]
@@ -678,9 +675,55 @@ clicked = st.button("Run", use_container_width=True)
 # ----------------------------
 # Run pipeline
 # ----------------------------
+def _render_results_and_downloads(results: List[Dict[str, Any]]):
+    # Results list
+    st.markdown("#### Results")
+    items = [f'<li><a href="{r["zillow_url"]}" target="_blank" rel="noopener">{r["zillow_url"]}</a></li>'
+             for r in results if r.get("zillow_url")]
+    st.markdown("<ul class='link-list'>" + "\n".join(items) + "</ul>", unsafe_allow_html=True)
+
+    # Export
+    fmt_options = ["txt","csv","md","html"]
+    prev_fmt = (st.session_state.get("__results__") or {}).get("fmt")
+    default_idx = fmt_options.index(prev_fmt) if prev_fmt in fmt_options else 0
+    fmt = st.selectbox("Download format", fmt_options, index=default_idx)
+    payload, mime = build_output(results, fmt)
+    ts = datetime.utcnow().strftime("%Y%m%d-%H%M%S")
+    st.download_button("Export", data=payload,
+                       file_name=f"address_alchemist_links_{ts}.{fmt}",
+                       mime=mime, use_container_width=True)
+    st.session_state["__results__"] = {"results": results, "fmt": fmt}
+
+    # Images + LOG
+    thumbs_logs = [get_thumbnail_and_log(r["input_address"], r["zillow_url"]) for r in results]
+    imgs = [(r, tup[0]) for r, tup in zip(results, thumbs_logs) if tup[0]]
+
+    if imgs:
+        st.markdown("#### Images")
+        cols = st.columns(3)
+        for i, (r, img) in enumerate(imgs):
+            with cols[i % 3]:
+                st.image(img, use_column_width=True)
+                st.caption(r.get("input_address") or "Listing")
+
+    # Image Log (always shown so you can debug when nothing appears)
+    st.markdown("#### Image Log")
+    log_rows = []
+    for idx, (img, log) in enumerate(thumbs_logs, start=1):
+        log_rows.append({
+            "#": idx,
+            "Stage": (log or {}).get("stage"),
+            "Selected": img or "",
+            "HTTP": (log or {}).get("status_code"),
+            "HTML len": (log or {}).get("html_len"),
+            "Zillow URL": (log or {}).get("url"),
+            "Errors": "; ".join((log or {}).get("errors") or []),
+        })
+    st.dataframe(log_rows, use_container_width=True)
+
 if clicked:
     try:
-        # Prefer CSV; otherwise use processed paste lines
+        # Prefer CSV; otherwise pasted lines
         if file is not None:
             content = file.read().decode("utf-8-sig")
             rows_in = list(csv.DictReader(io.StringIO(content)))
@@ -711,34 +754,7 @@ if clicked:
             prog.progress(i/len(rows_in), text=f"Processed {i}/{len(rows_in)}")
         prog.progress(1.0, text="Done")
 
-        # ---- RESULTS (clickable bulleted list) ----
-        st.markdown("#### Results")
-        items = [f'<li><a href="{r["zillow_url"]}" target="_blank" rel="noopener">{r["zillow_url"]}</a></li>'
-                 for r in results if r.get("zillow_url")]
-        st.markdown("<ul class='link-list'>" + "\n".join(items) + "</ul>", unsafe_allow_html=True)
-
-        # ---- Format dropdown + Export button ----
-        fmt_options = ["txt","csv","md","html"]
-        fmt = st.selectbox("Download format", fmt_options, index=0)
-        payload, mime = build_output(results, fmt)
-        ts = datetime.utcnow().strftime("%Y%m%d-%H%M%S")
-        st.download_button("Export", data=payload,
-                           file_name=f"address_alchemist_links_{ts}.{fmt}",
-                           mime=mime, use_container_width=True)
-
-        # ---- Images section (appears if ANY link has an image) ----
-        thumbs: List[Optional[str]] = [get_thumbnail(r["input_address"], r["zillow_url"]) for r in results]
-        imgs = [(r, img) for r, img in zip(results, thumbs) if img]
-        if imgs:
-            st.markdown("#### Images")
-            cols = st.columns(3)
-            for i, (r, img) in enumerate(imgs):
-                with cols[i % 3]:
-                    st.image(img, use_column_width=True)
-                    st.caption(r["input_address"] if r.get("input_address") else "Listing")
-
-        # Persist for rerender
-        st.session_state["__results__"] = {"results": results, "fmt": fmt}
+        _render_results_and_downloads(results)
 
     except Exception as e:
         st.error("We hit an error while processing.")
@@ -746,41 +762,12 @@ if clicked:
             st.exception(e)
 
 # ----------------------------
-# Keep last results visible on rerender (KeyError-proof)
+# Keep last results visible on rerender
 # ----------------------------
-fmt_options = ["txt","csv","md","html"]
 data = st.session_state.get("__results__") or {}
 results = data.get("results") or []
-
 if results and not clicked:
-    st.markdown("#### Results")
-    items = [f'<li><a href="{r.get("zillow_url","")}" target="_blank" rel="noopener">{r.get("zillow_url","")}</a></li>'
-             for r in results if r.get("zillow_url")]
-    st.markdown("<ul class='link-list'>" + "\n".join(items) + "</ul>", unsafe_allow_html=True)
-
-    prev_fmt = data.get("fmt")
-    default_idx = fmt_options.index(prev_fmt) if prev_fmt in fmt_options else 0
-    fmt = st.selectbox("Download format", fmt_options, index=default_idx)
-
-    payload, mime = build_output(results, fmt)
-    ts = datetime.utcnow().strftime("%Y%m%d-%H%M%S")
-    st.download_button("Export", data=payload,
-                       file_name=f"address_alchemist_links_{ts}.{fmt}",
-                       mime=mime, use_container_width=True)
-
-    # Images section (appears if ANY link has an image)
-    thumbs: List[Optional[str]] = [get_thumbnail(r.get("input_address",""), r.get("zillow_url","")) for r in results]
-    imgs = [(r, img) for r, img in zip(results, thumbs) if img]
-    if imgs:
-        st.markdown("#### Images")
-        cols = st.columns(3)
-        for i, (r, img) in enumerate(imgs):
-            with cols[i % 3]:
-                st.image(img, use_column_width=True)
-                st.caption(r.get("input_address","Listing"))
-
-    # keep session fmt in sync
-    st.session_state["__results__"]["fmt"] = fmt
+    _render_results_and_downloads(results)
 else:
     if not clicked:
         st.info("Paste addresses or upload a CSV, then click **Run**.")
