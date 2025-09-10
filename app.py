@@ -706,7 +706,6 @@ def results_list_with_copy_all(results: List[Dict[str, Any]]):
         if not url:
             continue
         safe_url = escape(url)
-        # keep bullets visually and links clickable
         li_html.append(f'<li><a href="{safe_url}" target="_blank" rel="noopener">{safe_url}</a></li>')
     items_html = "\n".join(li_html) if li_html else "<li>(no results)</li>"
 
@@ -720,10 +719,15 @@ def results_list_with_copy_all(results: List[Dict[str, Any]]):
             --blue2: #1d4ed8;
             --blue-focus: #93c5fd;
           }}
-          body {{ margin: 0; font-family: -apple-system, Segoe UI, Roboto, Arial, sans-serif; }}
+          html, body {{
+            margin: 0;
+            font-family: -apple-system, Segoe UI, Roboto, Arial, sans-serif;
+          }}
+          /* Provide internal spacing so the absolute button isn't clipped */
           .results-wrap {{
             position: relative;
-            padding-top: 8px;
+            box-sizing: border-box;
+            padding: 12px 132px 8px 0; /* top | right | bottom | left */
           }}
           ul.link-list {{
             margin: 0 0 .5rem 1.2rem;
@@ -732,11 +736,12 @@ def results_list_with_copy_all(results: List[Dict[str, Any]]):
           }}
           ul.link-list li {{ margin: 0.35rem 0; }}
 
-          /* Copy All button styled like site buttons */
+          /* Copy All button styled like site buttons, safely inset from edges */
           .copyall-btn {{
             position: absolute;
-            top: -6px;
-            right: 0;
+            top: 0;                 /* no negative offset => not clipped at top */
+            right: 8px;             /* slight inset from right edge */
+            z-index: 5;             /* render over list items */
             padding: 8px 12px;
             height: 36px;
             border: 0;
@@ -751,6 +756,7 @@ def results_list_with_copy_all(results: List[Dict[str, Any]]):
             transform: translateY(-2px);
             transition: opacity .18s ease, box-shadow .2s ease, filter .2s ease, transform .06s ease;
           }}
+          /* Reveal on hover of the whole results area */
           .results-wrap:hover .copyall-btn {{
             opacity: 1;
             transform: translateY(0);
@@ -770,6 +776,18 @@ def results_list_with_copy_all(results: List[Dict[str, Any]]):
           }}
           .copyall-btn.success {{ background: linear-gradient(180deg, #16a34a 0%, #15803d 100%) }}
           .copyall-btn.error   {{ background: linear-gradient(180deg, #dc2626 0%, #b91c1c 100%) }}
+
+          /* Responsive: if the iframe is very narrow, stack the button above the list */
+          @media (max-width: 420px) {{
+            .results-wrap {{
+              padding-right: 12px;   /* drop the reserved right space */
+              padding-top: 48px;     /* give room for button above list */
+            }}
+            .copyall-btn {{
+              top: 8px;
+              right: 8px;
+            }}
+          }}
         </style>
       </head>
       <body>
@@ -812,8 +830,7 @@ def results_list_with_copy_all(results: List[Dict[str, Any]]):
       </body>
     </html>
     """
-    # Estimate height: 46px per row + extra for button
-    est_h = max(100, min(46 * max(1, len(li_html)) + 40, 1200))
+    est_h = max(100, min(46 * max(1, len(li_html)) + 56, 1200))  # a bit more headroom for button
     components.html(html, height=est_h, scrolling=False)
 
 # ----------------------------
