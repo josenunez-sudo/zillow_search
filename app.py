@@ -1,15 +1,20 @@
-# app.py — Ultra-Minimal Zillow Deeplink Finder (images-if-any + dropdown+export)
-# One central input, one Run button, clickable bulleted results, format dropdown, Export button, and Images section if ANY image exists.
+# app.py — Ultra-Minimal Zillow Deeplink Finder
+# - Improved paste/upload section (count, de-dup, trim, preview, nicer dropzone)
+# - One central Run button (blue), Export button (green)
+# - Clickable bulleted results (open in new tab)
+# - Images section shows if ANY item has an image
+# - Safe rerender with remembered format
 
 import os, csv, io, re, time, json
 from datetime import datetime
-from typing import List, Dict, Any, Optional, Tuple
+from typing import List, Dict, Any, Optional
+from html import escape
 
 import requests
 import streamlit as st
 
 # ----------------------------
-# Minimal page setup & styles
+# Page setup & styles
 # ----------------------------
 st.set_page_config(page_title="Zillow Deeplink Finder", layout="centered")
 
@@ -82,10 +87,26 @@ ul.link-list li { margin: 0.2rem 0; }
   outline-offset: 2px;
 }
 
+/* Paste area: softer focus ring */
+textarea { border-radius: 10px !important; }
+textarea:focus { outline: 3px solid #93c5fd !important; outline-offset: 2px; }
+
+/* Friendlier CSV dropzone */
+[data-testid="stFileUploaderDropzone"] {
+  border: 2px dashed #cbd5e1 !important;
+  background: #f8fafc !important;
+  border-radius: 12px !important;
+}
+[data-testid="stFileUploaderDropzone"]:hover {
+  border-color: #94a3b8 !important;
+  background: #f1f5f9 !important;
+}
+
 /* Hide ONLY the uploader clear button (if present) */
 [data-testid="stFileUploadClearButton"] { display: none !important; }
 </style>
 """, unsafe_allow_html=True)
+
 # ----------------------------
 # Env/secrets (optional)
 # ----------------------------
@@ -100,7 +121,6 @@ for k in ["AZURE_SEARCH_ENDPOINT","AZURE_SEARCH_INDEX","AZURE_SEARCH_API_KEY",
 AZURE_SEARCH_ENDPOINT = os.getenv("AZURE_SEARCH_ENDPOINT","").rstrip("/")
 AZURE_SEARCH_INDEX    = os.getenv("AZURE_SEARCH_INDEX","")
 AZURE_SEARCH_KEY      = os.getenv("AZURE_SEARCH_API_KEY","")
-
 BING_API_KEY          = os.getenv("BING_API_KEY","")
 BING_CUSTOM_ID        = os.getenv("BING_CUSTOM_CONFIG_ID","")
 GOOGLE_MAPS_API_KEY   = os.getenv("GOOGLE_MAPS_API_KEY","")
@@ -137,7 +157,8 @@ def extract_components(row):
     n = { norm_key(k): (str(v).strip() if v is not None else "") for k,v in row.items() }
     for k in n.keys():
         if k in ADDR_PRIMARY and n[k]:
-            return {"street_raw": n[k], "city":"", "state":"", "zip":"", "mls_id": get_first_by_keys(n, MLS_ID_KEYS),
+            return {"street_raw": n[k], "city":"", "state":"", "zip":"",
+                    "mls_id": get_first_by_keys(n, MLS_ID_KEYS),
                     "mls_name": get_first_by_keys(n, MLS_NAME_KEYS)}
     num   = get_first_by_keys(n, NUM_KEYS)
     name  = get_first_by_keys(n, NAME_KEYS)
@@ -276,7 +297,7 @@ def confirm_or_resolve_on_page(url:str, mls_id:str=None, required_city:str=None,
         if page_contains_city_state(html, required_city, required_state) and "/homedetails/" in url:
             return url, "city_state_match"
         if url.endswith("_rb/") and "/homedetails/" not in url:
-            cand = re.findall(r'href="(https://www\.zillow\.com/homedetails/[^"]+)"', html)[:8]
+            cand = re.findall(r'href="(https://www\\.zillow\\.com/homedetails/[^"]+)"', html)[:8]
             for u in cand:
                 try:
                     rr = _fetch(u); rr.raise_for_status()
@@ -387,7 +408,7 @@ def construct_deeplink_from_parts(street, city, state, zipc, defaults):
     a = slug.lower(); a = re.sub(r"[^\w\s,-]", "", a).replace(",", ""); a = re.sub(r"\s+", "-", a.strip())
     return f"https://www.zillow.com/homes/{a}_rb/"
 
-# Single-row pipeline (with strong defaults)
+# Single-row pipeline
 def process_single_row(row, *, delay=0.5, land_mode=True, defaults=None,
                        require_state=True, mls_first=True, default_mls_name="", max_candidates=20):
     defaults = defaults or {"city":"", "state":"", "zip":""}
@@ -448,7 +469,6 @@ def process_single_row(row, *, delay=0.5, land_mode=True, defaults=None,
 # Images (best-effort) + cache
 # ----------------------------
 def fetch_og_image(url: str) -> Optional[str]:
-    """Try to extract og:image (or similar) from homedetails page."""
     try:
         r = _fetch(url); r.raise_for_status()
         html = r.text
@@ -466,7 +486,6 @@ def fetch_og_image(url: str) -> Optional[str]:
     return None
 
 def street_view_image(addr: str) -> Optional[str]:
-    """Fallback via Google Street View Static API (requires GOOGLE_MAPS_API_KEY)."""
     key = GOOGLE_MAPS_API_KEY
     if not key or not addr:
         return None
@@ -507,25 +526,68 @@ def build_output(rows: List[Dict[str, Any]], fmt: str):
     return ("\n".join(lines) + "\n"), "text/plain"
 
 # ----------------------------
-# Minimal UI
+# UI — Improved Input Section
 # ----------------------------
 st.markdown("### Zillow Deeplink Finder")
 
 st.markdown('<div class="center-box">', unsafe_allow_html=True)
+st.markdown("**Paste addresses** (one per line) _or_ **drop a CSV**")
+
 paste = st.text_area(
-    "Paste addresses (one per line) or upload a CSV",
-    placeholder="407 E Woodall St, Smithfield, NC 27577\n13 Herndon Ct, Clayton, NC 27520",
-    height=120
+    label="Paste addresses",
+    label_visibility="collapsed",
+    placeholder="407 E Woodall St, Smithfield, NC 27577\n13 Herndon Ct, Clayton, NC 27520\n123 US-301 S, Four Oaks, NC 27524",
+    height=160,
+    key="input_paste"
 )
-file  = st.file_uploader("Upload CSV", type=["csv"])
-st.markdown('<div class="small">CSV can include columns for address/city/state/zip and optional MLS ID.</div>', unsafe_allow_html=True)
+
+opt1, opt2, opt3 = st.columns([1.1, 1, 1.2])
+with opt1:
+    remove_dupes = st.checkbox("Remove duplicates", value=True)
+with opt2:
+    trim_spaces = st.checkbox("Auto-trim", value=True)
+with opt3:
+    show_preview = st.checkbox("Show preview", value=True)
+
+file = st.file_uploader("Upload CSV", type=["csv"], label_visibility="collapsed")
+
+# Live parsing of pasted lines (used for preview and can be used for run if no CSV)
+lines_raw = (paste or "").splitlines()
+lines = [ln.strip() if trim_spaces else ln for ln in lines_raw]
+lines = [ln for ln in lines if ln.strip()]
+if remove_dupes:
+    lines = list(dict.fromkeys(lines))
+
+count = len(lines)
+dupe_count = max(0, len([l for l in lines_raw if (l.strip() if trim_spaces else l)]) - count)
+helper_bits = [f"**{count}** line{'s' if count != 1 else ''} detected"]
+if remove_dupes and dupe_count:
+    helper_bits.append(f"{dupe_count} duplicate{'s' if dupe_count != 1 else ''} removed")
+st.caption(" • ".join(helper_bits) + "  •  Tip: one address per line. CSV needs a header row.")
+
+if show_preview and count:
+    st.markdown("**Preview** (first 5):")
+    preview = lines[:5]
+    st.markdown(
+        "<ul class='link-list'>" +
+        "\n".join([f"<li>{escape(p)}</li>" for p in preview]) +
+        ("<li>…</li>" if count > 5 else "") +
+        "</ul>",
+        unsafe_allow_html=True
+    )
 st.markdown('</div>', unsafe_allow_html=True)
 
+# ----------------------------
+# Run button
+# ----------------------------
 clicked = st.button("Run", use_container_width=True)
 
+# ----------------------------
+# Run pipeline
+# ----------------------------
 if clicked:
     try:
-        # Prefer CSV; otherwise parse pasted lines
+        # Prefer CSV; otherwise use processed paste lines
         if file is not None:
             content = file.read().decode("utf-8-sig")
             rows_in = list(csv.DictReader(io.StringIO(content)))
@@ -533,7 +595,6 @@ if clicked:
                 st.error("No rows detected in CSV. Ensure a header row and at least one data row.")
                 st.stop()
         else:
-            lines = [ln.strip() for ln in (paste or "").splitlines() if ln.strip()]
             if not lines:
                 st.error("Please paste at least one address or upload a CSV.")
                 st.stop()
@@ -545,8 +606,8 @@ if clicked:
         for i, row in enumerate(rows_in, start=1):
             res = process_single_row(
                 row,
-                delay=0.5,             # sensible default
-                land_mode=True,        # good for LOT/land
+                delay=0.5,
+                land_mode=True,
                 defaults=defaults,
                 require_state=True,
                 mls_first=True,
