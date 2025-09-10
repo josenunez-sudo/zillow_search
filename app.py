@@ -18,12 +18,13 @@ st.markdown("""
 .block-container { max-width: 760px; }
 h3 { margin-bottom: .35rem; }
 .center-box { border: 1px solid rgba(0,0,0,.08); border-radius: 12px; padding: 16px; }
-label[data-baseweb="typography"] { font-weight: 600; }
-button[kind="secondary"] { display: none; } /* hide clear buttons on file input */
 .stButton>button { border-radius: 10px; height: 42px; font-weight: 600; }
 .small { color: #6b7280; font-size: 12.5px; margin-top: 6px; }
 ul.link-list { margin: 0 0 .5rem 1.2rem; padding: 0; }
 ul.link-list li { margin: 0.2rem 0; }
+
+/* Hide ONLY the uploader clear button (if present in your Streamlit version). */
+[data-testid="stFileUploadClearButton"] { display: none !important; }
 </style>
 """, unsafe_allow_html=True)
 
