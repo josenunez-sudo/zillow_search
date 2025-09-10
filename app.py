@@ -5,7 +5,7 @@
 # - Default Streamlit drag&drop uploader (no custom styling)
 # - Poppy Run (blue) and Export (green) buttons
 # - Clickable bulleted results (open in new tab)
-# - Images section shows if ANY item has an image
+# - Images section shows if ANY item has an image (now prefers Zillow's hero photo)
 # - Safe rerender with remembered format and filenames
 
 import os, csv, io, re, time, json
@@ -444,7 +444,57 @@ def construct_deeplink_from_parts(street, city, state, zipc, defaults):
     a = slug.lower(); a = re.sub(r"[^\w\s,-]", "", a).replace(",", ""); a = re.sub(r"\s+", "-", a.strip())
     return f"https://www.zillow.com/homes/{a}_rb/"
 
-# Single-row pipeline
+# ----------------------------
+# Zillow-first image helper (NEW)
+# ----------------------------
+def extract_zillow_first_image(html: str) -> Optional[str]:
+    """
+    Find the first Zillow hero photo from the homedetails page HTML.
+    Prefers the explicit <img src="...cc_ft_960.jpg"> if present,
+    otherwise parses a photos.zillowstatic srcset and picks a good size.
+    """
+    if not html:
+        return None
+
+    # 1) Direct <img src=".../fp/<hash>-cc_ft_960.(jpg|webp)"> (prefer a few sizes)
+    for target_w in ("960", "1152", "768", "1536"):
+        m = re.search(
+            rf'<img[^>]+src=["\'](https://photos\.zillowstatic\.com/fp/[^"\']+-cc_ft_{target_w}\.(?:jpg|webp))["\']',
+            html, re.I
+        )
+        if m:
+            return m.group(1)
+
+    # 2) Parse the first srcset on the Zillow CDN and choose the largest <= 1152 (or else the largest)
+    srcset_match = re.search(
+        r'srcset=["\']([^"\']*photos\.zillowstatic\.com[^"\']+)["\']',
+        html, re.I
+    )
+    if srcset_match:
+        srcset = srcset_match.group(1)
+        candidates = []
+        for part in srcset.split(","):
+            part = part.strip()
+            m = re.match(r'(https://photos\.zillowstatic\.com/\S+)\s+(\d+)w', part, re.I)
+            if m:
+                url, w = m.group(1), int(m.group(2))
+                candidates.append((w, url))
+        if candidates:
+            up_to = [u for (w,u) in candidates if w <= 1152]
+            if up_to:
+                return sorted(((w,u) for (w,u) in candidates if w <= 1152), key=lambda x: x[0])[-1][1]
+            return sorted(candidates, key=lambda x: x[0])[-1][1]
+
+    # 3) Any photos.zillowstatic fp URL with cc_ft_* we can find
+    m = re.search(r'(https://photos\.zillowstatic\.com/fp/\S+-cc_ft_\d+\.(?:jpg|webp))', html, re.I)
+    if m:
+        return m.group(1)
+
+    return None
+
+# ----------------------------
+# Single-row pipeline + image fetchers
+# ----------------------------
 def process_single_row(row, *, delay=0.5, land_mode=True, defaults=None,
                        require_state=True, mls_first=True, default_mls_name="", max_candidates=20):
     defaults = defaults or {"city":"", "state":"", "zip":""}
@@ -501,13 +551,18 @@ def process_single_row(row, *, delay=0.5, land_mode=True, defaults=None,
     time.sleep(min(delay, 0.4))
     return {"input_address": query_address, "mls_id": mls_id, "zillow_url": zurl, "note": note, "status": status}
 
-# ----------------------------
-# Images (best-effort) + cache
-# ----------------------------
 def fetch_og_image(url: str) -> Optional[str]:
+    """Prefer the on-page Zillow hero photo; else fall back to og:image/JSON hints."""
     try:
         r = _fetch(url); r.raise_for_status()
         html = r.text
+
+        # Prefer the exact Zillow photo from the <picture>/<img srcset>
+        zfirst = extract_zillow_first_image(html)
+        if zfirst:
+            return zfirst
+
+        # Fall back to og:image / JSON image hints
         for pat in [
             r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)["\']',
             r'<meta[^>]+property=["\']og:image:secure_url["\'][^>]+content=["\']([^"\']+)["\']',
