@@ -1,5 +1,6 @@
 # app.py — Ultra-Minimal Zillow Deeplink Finder
-# - Improved paste/upload section (count, de-dup, trim, preview, nicer dropzone)
+# - Reverted file uploader (drag & drop) to default Streamlit style
+# - Improved paste/upload section (count, de-dup, trim, preview)
 # - One central Run button (blue), Export button (green)
 # - Clickable bulleted results (open in new tab)
 # - Images section shows if ANY item has an image
@@ -90,17 +91,6 @@ ul.link-list li { margin: 0.2rem 0; }
 /* Paste area: softer focus ring */
 textarea { border-radius: 10px !important; }
 textarea:focus { outline: 3px solid #93c5fd !important; outline-offset: 2px; }
-
-/* Friendlier CSV dropzone */
-[data-testid="stFileUploaderDropzone"] {
-  border: 2px dashed #cbd5e1 !important;
-  background: #f8fafc !important;
-  border-radius: 12px !important;
-}
-[data-testid="stFileUploaderDropzone"]:hover {
-  border-color: #94a3b8 !important;
-  background: #f1f5f9 !important;
-}
 
 /* Hide ONLY the uploader clear button (if present) */
 [data-testid="stFileUploadClearButton"] { display: none !important; }
@@ -549,6 +539,7 @@ with opt2:
 with opt3:
     show_preview = st.checkbox("Show preview", value=True)
 
+# Default Streamlit drag & drop look (no custom styling)
 file = st.file_uploader("Upload CSV", type=["csv"], label_visibility="collapsed")
 
 # Live parsing of pasted lines (used for preview and can be used for run if no CSV)
