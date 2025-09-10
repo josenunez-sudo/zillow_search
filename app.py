@@ -6,7 +6,7 @@
 # - Clickable results (open in new tab)
 # - Images section shows if ANY item has an image, labeled with MLS#/Address + “Open Zillow”
 # - Image selection priority: CSV Photo > Zillow hero > og:image > Street View
-# - Image Log includes CSV presence, chosen stage, errors
+# - Image Log HIDDEN by default; enable with ?debug=1 or env AA_DEBUG=1
 # - Safe rerender with remembered format and filenames
 
 import os, csv, io, re, time, json
@@ -140,6 +140,29 @@ textarea:focus { outline: 3px solid #93c5fd !important; outline-offset: 2px; }
 .img-label a:hover { text-decoration: underline; }
 </style>
 """, unsafe_allow_html=True)
+
+# ----------------------------
+# Debug mode toggle (URL param or env)
+# ----------------------------
+def _get_debug_mode() -> bool:
+    try:
+        qp = st.query_params if hasattr(st, "query_params") else st.experimental_get_query_params()
+        val = ""
+        if isinstance(qp, dict):
+            raw = qp.get("debug", "")
+            if isinstance(raw, list):
+                val = raw[0] if raw else ""
+            else:
+                val = raw
+        else:
+            # Mapping-like
+            val = qp.get("debug", "")
+        token = (str(val) or os.getenv("AA_DEBUG", ""))
+    except Exception:
+        token = os.getenv("AA_DEBUG", "")
+    return str(token).lower() in ("1", "true", "yes", "on")
+
+DEBUG_MODE = _get_debug_mode()
 
 # ----------------------------
 # Env/secrets (optional)
@@ -697,7 +720,7 @@ st.markdown('</div>', unsafe_allow_html=True)
 clicked = st.button("Run", use_container_width=True)
 
 # ----------------------------
-# Results HTML with hover-to-copy-all button
+# Results HTML with hover-to-copy-all button (inset, not clipped)
 # ----------------------------
 def results_list_with_copy_all(results: List[Dict[str, Any]]):
     li_html = []
@@ -723,11 +746,10 @@ def results_list_with_copy_all(results: List[Dict[str, Any]]):
             margin: 0;
             font-family: -apple-system, Segoe UI, Roboto, Arial, sans-serif;
           }}
-          /* Provide internal spacing so the absolute button isn't clipped */
           .results-wrap {{
             position: relative;
             box-sizing: border-box;
-            padding: 12px 132px 8px 0; /* top | right | bottom | left */
+            padding: 12px 132px 8px 0; /* space reserved for button on the right */
           }}
           ul.link-list {{
             margin: 0 0 .5rem 1.2rem;
@@ -736,12 +758,11 @@ def results_list_with_copy_all(results: List[Dict[str, Any]]):
           }}
           ul.link-list li {{ margin: 0.35rem 0; }}
 
-          /* Copy All button styled like site buttons, safely inset from edges */
           .copyall-btn {{
             position: absolute;
-            top: 0;                 /* no negative offset => not clipped at top */
-            right: 8px;             /* slight inset from right edge */
-            z-index: 5;             /* render over list items */
+            top: 0;               /* avoid clipping at top */
+            right: 8px;           /* slight inset from right edge */
+            z-index: 5;
             padding: 8px 12px;
             height: 36px;
             border: 0;
@@ -756,7 +777,6 @@ def results_list_with_copy_all(results: List[Dict[str, Any]]):
             transform: translateY(-2px);
             transition: opacity .18s ease, box-shadow .2s ease, filter .2s ease, transform .06s ease;
           }}
-          /* Reveal on hover of the whole results area */
           .results-wrap:hover .copyall-btn {{
             opacity: 1;
             transform: translateY(0);
@@ -777,11 +797,10 @@ def results_list_with_copy_all(results: List[Dict[str, Any]]):
           .copyall-btn.success {{ background: linear-gradient(180deg, #16a34a 0%, #15803d 100%) }}
           .copyall-btn.error   {{ background: linear-gradient(180deg, #dc2626 0%, #b91c1c 100%) }}
 
-          /* Responsive: if the iframe is very narrow, stack the button above the list */
           @media (max-width: 420px) {{
             .results-wrap {{
-              padding-right: 12px;   /* drop the reserved right space */
-              padding-top: 48px;     /* give room for button above list */
+              padding-right: 12px;
+              padding-top: 48px;   /* room for button above list */
             }}
             .copyall-btn {{
               top: 8px;
@@ -830,7 +849,7 @@ def results_list_with_copy_all(results: List[Dict[str, Any]]):
       </body>
     </html>
     """
-    est_h = max(100, min(46 * max(1, len(li_html)) + 56, 1200))  # a bit more headroom for button
+    est_h = max(100, min(46 * max(1, len(li_html)) + 56, 1200))  # extra headroom for button
     components.html(html, height=est_h, scrolling=False)
 
 # ----------------------------
@@ -881,21 +900,22 @@ def _render_results_and_downloads(results: List[Dict[str, Any]]):
                     unsafe_allow_html=True
                 )
 
-    # Image Log (always shown)
-    st.markdown("#### Image Log")
-    log_rows = []
-    for idx, (img, log) in enumerate(thumbs_logs, start=1):
-        log_rows.append({
-            "#": idx,
-            "CSV Photo?": "yes" if (log or {}).get("csv_provided") else "no",
-            "Stage": (log or {}).get("stage"),
-            "Selected": img or "",
-            "HTTP": (log or {}).get("status_code"),
-            "HTML len": (log or {}).get("html_len"),
-            "Zillow URL": (log or {}).get("url"),
-            "Errors": "; ".join((log or {}).get("errors") or []),
-        })
-    st.dataframe(log_rows, use_container_width=True)
+    # Image Log (hidden by default; enable with ?debug=1 or AA_DEBUG=1)
+    if DEBUG_MODE:
+        st.markdown("#### Image Log")
+        log_rows = []
+        for idx, (img, log) in enumerate(thumbs_logs, start=1):
+            log_rows.append({
+                "#": idx,
+                "CSV Photo?": "yes" if (log or {}).get("csv_provided") else "no",
+                "Stage": (log or {}).get("stage"),
+                "Selected": img or "",
+                "HTTP": (log or {}).get("status_code"),
+                "HTML len": (log or {}).get("html_len"),
+                "Zillow URL": (log or {}).get("url"),
+                "Errors": "; ".join((log or {}).get("errors") or []),
+            })
+        st.dataframe(log_rows, use_container_width=True)
 
 # ----------------------------
 # Run pipeline
