@@ -3,8 +3,9 @@
 # - Title uses Barlow Condensed (white)
 # - Minimal input area with live count, de-dup, trim, preview
 # - Clickable bulleted results (open in new tab)
-# - Images section shows if ANY item has an image (prefers Zillow hero photo)
-# - NEW: Image Log table shows per-link fetch details (status code, stage, selected URL, errors)
+# - Images section shows if ANY item has an image
+# - Image selection priority: CSV Photo > Zillow hero > og:image > Street View
+# - Image Log includes CSV presence, chosen stage, errors
 # - Safe rerender with remembered format and filenames
 
 import os, csv, io, re, time, json
@@ -19,9 +20,9 @@ from PIL import Image
 # ----------------------------
 # Favicon: load AVIF and convert to PNG bytes for Streamlit
 # ----------------------------
-# requirements.txt: pillow-avif-plugin>=1.4.7
+# requirements.txt must include: pillow-avif-plugin>=1.4.7
 try:
-    import pillow_avif  # noqa: F401
+    import pillow_avif  # noqa: F401  # registers AVIF with Pillow
 except Exception:
     pillow_avif = None
 
@@ -167,6 +168,7 @@ STATE_KEYS = {"state","st","province","region"}
 ZIP_KEYS   = {"zip","zip code","postal code","postalcode","zip_code","postal_code"}
 MLS_ID_KEYS   = {"mls","mls id","mls_id","mls #","mls#","mls number","mlsnumber","listing id","listing_id"}
 MLS_NAME_KEYS = {"mls name","mls board","mls provider","source","source mls","mls source"}
+PHOTO_KEYS = {"photo","image","photo url","image url","picture","thumbnail","thumb","img","img url","img_url"}
 
 def norm_key(k:str) -> str:
     return re.sub(r"\s+"," ", (k or "").strip().lower())
@@ -291,14 +293,12 @@ def bing_search_items(query):
     except requests.RequestException:
         return []
 
-# Strengthened headers (better luck vs bot protection)
 UA_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
     "Accept-Language": "en-US,en;q=0.9",
     "Cache-Control": "no-cache",
 }
-
 def _fetch(url, timeout=REQUEST_TIMEOUT):
     return requests.get(url, headers=UA_HEADERS, timeout=timeout)
 
@@ -478,11 +478,15 @@ def extract_zillow_first_image(html: str) -> Optional[str]:
     return None
 
 # ----------------------------
-# Single-row pipeline
+# Single-row pipeline (now captures CSV photo)
 # ----------------------------
 def process_single_row(row, *, delay=0.5, land_mode=True, defaults=None,
                        require_state=True, mls_first=True, default_mls_name="", max_candidates=20):
     defaults = defaults or {"city":"", "state":"", "zip":""}
+
+    # Capture CSV photo URL if provided (header: Photo/Image/etc.)
+    csv_photo = get_first_by_keys(row, PHOTO_KEYS)
+
     comp = extract_components(row)
     street_raw = comp["street_raw"]
     street_clean = clean_land_street(street_raw) if land_mode else street_raw
@@ -529,19 +533,30 @@ def process_single_row(row, *, delay=0.5, land_mode=True, defaults=None,
         zurl, status = deeplink, "deeplink_fallback"
 
     time.sleep(min(delay, 0.4))
-    return {"input_address": query_address, "mls_id": mls_id, "zillow_url": zurl, "note": note, "status": status}
+    return {"input_address": query_address, "mls_id": mls_id, "zillow_url": zurl, "note": note, "status": status,
+            "csv_photo": csv_photo}
 
 # ----------------------------
-# Image selection + LOGGING
+# Image selection + LOGGING (CSV first)
 # ----------------------------
-def picture_for_result_with_log(query_address: str, zurl: str):
+def picture_for_result_with_log(query_address: str, zurl: str, csv_photo_url: Optional[str] = None):
     """
     Returns (image_url: Optional[str], log: Dict[str, Any])
-    log fields: url, stage, status_code, html_len, selected, errors[list]
+    log fields: url, csv_provided(bool), stage, status_code, html_len, selected, errors[list]
     """
-    log = {"url": zurl, "stage": None, "status_code": None, "html_len": None, "selected": None, "errors": []}
+    log = {"url": zurl, "csv_provided": bool(csv_photo_url), "stage": None,
+           "status_code": None, "html_len": None, "selected": None, "errors": []}
 
-    # Try Zillow page
+    # 0) CSV Photo (if provided)
+    def _looks_like_url(u: str) -> bool:
+        return isinstance(u, str) and (u.startswith("http://") or u.startswith("https://") or u.startswith("data:"))
+
+    if csv_photo_url and _looks_like_url(csv_photo_url):
+        log["stage"] = "csv_photo"
+        log["selected"] = csv_photo_url
+        return csv_photo_url, log
+
+    # 1) Zillow page hero / og:image
     if zurl and "/homedetails/" in zurl:
         try:
             r = _fetch(zurl)
@@ -555,7 +570,7 @@ def picture_for_result_with_log(query_address: str, zurl: str):
                     log["selected"] = zfirst
                     return zfirst, log
 
-                # Fall back to og:image and JSON image hints
+                # Fall back to og:image / JSON image hints
                 for pat in [
                     r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)["\']',
                     r'<meta[^>]+property=["\']og:image:secure_url["\'][^>]+content=["\']([^"\']+)["\']',
@@ -572,7 +587,7 @@ def picture_for_result_with_log(query_address: str, zurl: str):
         except Exception as e:
             log["errors"].append(f"fetch_err:{e!r}")
 
-    # Street View fallback
+    # 2) Street View fallback
     try:
         key = GOOGLE_MAPS_API_KEY
         if key and query_address:
@@ -592,8 +607,8 @@ def picture_for_result_with_log(query_address: str, zurl: str):
     return None, log
 
 @st.cache_data(ttl=900, show_spinner=False)
-def get_thumbnail_and_log(query_address: str, zurl: str):
-    return picture_for_result_with_log(query_address, zurl)
+def get_thumbnail_and_log(query_address: str, zurl: str, csv_photo_url: Optional[str]):
+    return picture_for_result_with_log(query_address, zurl, csv_photo_url)
 
 # ----------------------------
 # Output (downloads)
@@ -601,7 +616,8 @@ def get_thumbnail_and_log(query_address: str, zurl: str):
 def build_output(rows: List[Dict[str, Any]], fmt: str):
     if fmt == "csv":
         s = io.StringIO()
-        w = csv.DictWriter(s, fieldnames=["input_address","mls_id","zillow_url","note","status"])
+        # include csv_photo in CSV export for traceability
+        w = csv.DictWriter(s, fieldnames=["input_address","mls_id","zillow_url","note","status","csv_photo"])
         w.writeheader(); w.writerows(rows)
         return s.getvalue(), "text/csv"
     if fmt == "md":
@@ -611,6 +627,7 @@ def build_output(rows: List[Dict[str, Any]], fmt: str):
         items = [f'<li><a href="{r["zillow_url"]}" target="_blank" rel="noopener">{r["zillow_url"]}</a></li>'
                  for r in rows if r.get("zillow_url")]
         return "<ul>\n" + "\n".join(items) + "\n</ul>\n", "text/html"
+    # txt (default) — ALWAYS bulleted list
     lines = [f"- {r['zillow_url']}" for r in rows if r.get("zillow_url")]
     return ("\n".join(lines) + "\n"), "text/plain"
 
@@ -673,7 +690,7 @@ st.markdown('</div>', unsafe_allow_html=True)
 clicked = st.button("Run", use_container_width=True)
 
 # ----------------------------
-# Run pipeline
+# Render helper
 # ----------------------------
 def _render_results_and_downloads(results: List[Dict[str, Any]]):
     # Results list
@@ -694,8 +711,8 @@ def _render_results_and_downloads(results: List[Dict[str, Any]]):
                        mime=mime, use_container_width=True)
     st.session_state["__results__"] = {"results": results, "fmt": fmt}
 
-    # Images + LOG
-    thumbs_logs = [get_thumbnail_and_log(r["input_address"], r["zillow_url"]) for r in results]
+    # Images + LOG (CSV photo respected)
+    thumbs_logs = [get_thumbnail_and_log(r["input_address"], r["zillow_url"], r.get("csv_photo")) for r in results]
     imgs = [(r, tup[0]) for r, tup in zip(results, thumbs_logs) if tup[0]]
 
     if imgs:
@@ -706,12 +723,13 @@ def _render_results_and_downloads(results: List[Dict[str, Any]]):
                 st.image(img, use_column_width=True)
                 st.caption(r.get("input_address") or "Listing")
 
-    # Image Log (always shown so you can debug when nothing appears)
+    # Image Log (always shown)
     st.markdown("#### Image Log")
     log_rows = []
     for idx, (img, log) in enumerate(thumbs_logs, start=1):
         log_rows.append({
             "#": idx,
+            "CSV Photo?": "yes" if (log or {}).get("csv_provided") else "no",
             "Stage": (log or {}).get("stage"),
             "Selected": img or "",
             "HTTP": (log or {}).get("status_code"),
@@ -721,6 +739,9 @@ def _render_results_and_downloads(results: List[Dict[str, Any]]):
         })
     st.dataframe(log_rows, use_container_width=True)
 
+# ----------------------------
+# Run pipeline
+# ----------------------------
 if clicked:
     try:
         # Prefer CSV; otherwise pasted lines
@@ -734,6 +755,7 @@ if clicked:
             if not lines:
                 st.error("Please paste at least one address or upload a CSV.")
                 st.stop()
+            # for pasted input, no csv_photo available
             rows_in = [{"address": ln} for ln in lines]
 
         defaults = {"city":"", "state":"", "zip":""}
