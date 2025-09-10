@@ -1,5 +1,6 @@
-# app.py — Ultra-Minimal Zillow Deeplink Finder
-# One central input, one Run button, results beneath (bulleted), then simple format download.
+# app.py — Ultra-Minimal Zillow Deeplink Finder (clickable list + conditional images)
+# One central input, one Run button, clickable bulleted results, then simple format download.
+# Images section appears ONLY if every result has an image.
 
 import os, csv, io, re, time, json
 from datetime import datetime
@@ -9,7 +10,7 @@ import requests
 import streamlit as st
 
 # ----------------------------
-# Minimal page setup
+# Minimal page setup & styles
 # ----------------------------
 st.set_page_config(page_title="Zillow Deeplink Finder", layout="centered")
 
@@ -22,6 +23,8 @@ label[data-baseweb="typography"] { font-weight: 600; }
 button[kind="secondary"] { display: none; } /* hide clear buttons on file input */
 .stButton>button { border-radius: 10px; height: 42px; font-weight: 600; }
 .small { color: #6b7280; font-size: 12.5px; margin-top: 6px; }
+ul.link-list { margin: 0 0 .5rem 1.2rem; padding: 0; }
+ul.link-list li { margin: 0.2rem 0; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -39,11 +42,10 @@ for k in ["AZURE_SEARCH_ENDPOINT","AZURE_SEARCH_INDEX","AZURE_SEARCH_API_KEY",
 AZURE_SEARCH_ENDPOINT = os.getenv("AZURE_SEARCH_ENDPOINT","").rstrip("/")
 AZURE_SEARCH_INDEX    = os.getenv("AZURE_SEARCH_INDEX","")
 AZURE_SEARCH_KEY      = os.getenv("AZURE_SEARCH_API_KEY","")
-
 BING_API_KEY          = os.getenv("BING_API_KEY","")
 BING_CUSTOM_ID        = os.getenv("BING_CUSTOM_CONFIG_ID","")
-
-REQUEST_TIMEOUT = 12
+GOOGLE_MAPS_API_KEY   = os.getenv("GOOGLE_MAPS_API_KEY","")
+REQUEST_TIMEOUT       = 12
 
 # ----------------------------
 # Address parsing + helpers
@@ -383,6 +385,51 @@ def process_single_row(row, *, delay=0.5, land_mode=True, defaults=None,
     time.sleep(min(delay, 0.4))
     return {"input_address": query_address, "mls_id": mls_id, "zillow_url": zurl, "note": note, "status": status}
 
+# ----------------------------
+# Images (best-effort) + cache
+# ----------------------------
+def fetch_og_image(url: str) -> Optional[str]:
+    """Try to extract og:image (or similar) from homedetails page."""
+    try:
+        r = _fetch(url); r.raise_for_status()
+        html = r.text
+        for pat in [
+            r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)["\']',
+            r'<meta[^>]+property=["\']og:image:secure_url["\'][^>]+content=["\']([^"\']+)["\']',
+            r'"image"\s*:\s*"(https?://[^"]+)"',
+            r'"image"\s*:\s*\[\s*"(https?://[^"]+)"',
+        ]:
+            m = re.search(pat, html, re.I)
+            if m: 
+                return m.group(1)
+    except Exception:
+        return None
+    return None
+
+def street_view_image(addr: str) -> Optional[str]:
+    """Fallback via Google Street View Static API (requires GOOGLE_MAPS_API_KEY)."""
+    key = GOOGLE_MAPS_API_KEY
+    if not key or not addr:
+        return None
+    from urllib.parse import quote_plus
+    loc = quote_plus(addr)
+    return f"https://maps.googleapis.com/maps/api/streetview?size=600x400&location={loc}&key={key}"
+
+def picture_for_result(query_address: str, zurl: str) -> Optional[str]:
+    img = None
+    if zurl and "/homedetails/" in zurl:
+        img = fetch_og_image(zurl)
+    if not img:
+        img = street_view_image(query_address)
+    return img
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def get_thumbnail(query_address: str, zurl: str) -> Optional[str]:
+    return picture_for_result(query_address, zurl)
+
+# ----------------------------
+# Output (downloads)
+# ----------------------------
 def build_output(rows: List[Dict[str, Any]], fmt: str):
     if fmt == "csv":
         s = io.StringIO()
@@ -406,7 +453,11 @@ def build_output(rows: List[Dict[str, Any]], fmt: str):
 st.markdown("### Zillow Deeplink Finder")
 
 st.markdown('<div class="center-box">', unsafe_allow_html=True)
-paste = st.text_area("Paste addresses (one per line) or upload a CSV", placeholder="407 E Woodall St, Smithfield, NC 27577\n13 Herndon Ct, Clayton, NC 27520", height=120)
+paste = st.text_area(
+    "Paste addresses (one per line) or upload a CSV",
+    placeholder="407 E Woodall St, Smithfield, NC 27577\n13 Herndon Ct, Clayton, NC 27520",
+    height=120
+)
 file  = st.file_uploader("Upload CSV", type=["csv"])
 st.markdown('<div class="small">CSV can include columns for address/city/state/zip and optional MLS ID.</div>', unsafe_allow_html=True)
 st.markdown('</div>', unsafe_allow_html=True)
@@ -430,7 +481,7 @@ if clicked:
             rows_in = [{"address": ln} for ln in lines]
 
         defaults = {"city":"", "state":"", "zip":""}  # minimal UI: no defaults panel
-        results = []
+        results: List[Dict[str, Any]] = []
         prog = st.progress(0, text="Processing…")
         for i, row in enumerate(rows_in, start=1):
             res = process_single_row(
@@ -447,32 +498,74 @@ if clicked:
             prog.progress(i/len(rows_in), text=f"Processed {i}/{len(rows_in)}")
         prog.progress(1.0, text="Done")
 
-        # Show bulleted list immediately
+        # ---- RESULTS (clickable bulleted list) ----
         st.markdown("#### Results")
-        bullets = "\n".join([f"- {r['zillow_url']}" for r in results if r.get("zillow_url")]) + "\n"
-        st.code(bullets, language="text")
+        # Clickable, opens in new tab
+        items = [f'<li><a href="{r["zillow_url"]}" target="_blank" rel="noopener">{r["zillow_url"]}</a></li>'
+                 for r in results if r.get("zillow_url")]
+        st.markdown("<ul class='link-list'>" + "\n".join(items) + "</ul>", unsafe_allow_html=True)
 
-        # Simple format picker + download after results
-        fmt = st.selectbox("Download format", ["txt","csv","md","html"], index=0)
+        # ---- Download controls (set a default fmt now so session always has it) ----
+        default_fmt = "txt"  # requested default: bulleted list
+        fmt_options = ["txt","csv","md","html"]
+        fmt = st.selectbox("Download format", fmt_options, index=fmt_options.index(default_fmt))
         payload, mime = build_output(results, fmt)
         ts = datetime.utcnow().strftime("%Y%m%d-%H%M%S")
         st.download_button("Download", data=payload, file_name=f"zillow_links_{ts}.{fmt}", mime=mime, use_container_width=True)
 
-        # Persist for rerender
-        st.session_state["__results__"] = {"results": results, "payload": payload, "mime": mime, "fmt": fmt}
+        # ---- Images section (appears only if every link has an image) ----
+        # Collect thumbnails (cached)
+        thumbs: List[Optional[str]] = [get_thumbnail(r["input_address"], r["zillow_url"]) for r in results]
+        if all(thumbs) and len(thumbs) == len(results):
+            st.markdown("#### Images")
+            cols = st.columns(3)
+            for i, (r, img) in enumerate(zip(results, thumbs)):
+                with cols[i % 3]:
+                    st.image(img, use_column_width=True)
+                    st.caption(r["input_address"] if r.get("input_address") else "Listing")
+
+        # Persist for rerender (always include fmt)
+        st.session_state["__results__"] = {"results": results, "fmt": fmt}
 
     except Exception as e:
         st.error("We hit an error while processing.")
         with st.expander("Details"):
             st.exception(e)
 
-# If user navigates without re-running, keep last results visible
-data = st.session_state.get("__results__")
-if data and not clicked:
+# ----------------------------
+# Keep last results visible on rerender (KeyError-proof)
+# ----------------------------
+fmt_options = ["txt","csv","md","html"]
+data = st.session_state.get("__results__") or {}
+results = data.get("results") or []
+
+if results and not clicked:
     st.markdown("#### Results")
-    bullets = "\n".join([f"- {r['zillow_url']}" for r in data["results"] if r.get("zillow_url")]) + "\n"
-    st.code(bullets, language="text")
-    fmt = st.selectbox("Download format", ["txt","csv","md","html"], index=["txt","csv","md","html"].index(data["fmt"]))
-    payload, mime = build_output(data["results"], fmt)
+    items = [f'<li><a href="{r.get("zillow_url","")}" target="_blank" rel="noopener">{r.get("zillow_url","")}</a></li>'
+             for r in results if r.get("zillow_url")]
+    st.markdown("<ul class='link-list'>" + "\n".join(items) + "</ul>", unsafe_allow_html=True)
+
+    prev_fmt = data.get("fmt")
+    default_idx = fmt_options.index(prev_fmt) if prev_fmt in fmt_options else 0
+    fmt = st.selectbox("Download format", fmt_options, index=default_idx)
+
+    payload, mime = build_output(results, fmt)
     ts = datetime.utcnow().strftime("%Y%m%d-%H%M%S")
-    st.download_button("Download", data=payload, file_name=f"zillow_links_{ts}.{fmt}", mime=mime, use_container_width=True)
+    st.download_button("Download", data=payload,
+                       file_name=f"zillow_links_{ts}.{fmt}", mime=mime, use_container_width=True)
+
+    # Images section (only if ALL have images)
+    thumbs: List[Optional[str]] = [get_thumbnail(r.get("input_address",""), r.get("zillow_url","")) for r in results]
+    if all(thumbs) and len(thumbs) == len(results):
+        st.markdown("#### Images")
+        cols = st.columns(3)
+        for i, (r, img) in enumerate(zip(results, thumbs)):
+            with cols[i % 3]:
+                st.image(img, use_column_width=True)
+                st.caption(r.get("input_address","Listing"))
+
+    # keep session fmt in sync
+    st.session_state["__results__"]["fmt"] = fmt
+else:
+    if not clicked:
+        st.info("Paste addresses or upload a CSV, then click **Run**.")
