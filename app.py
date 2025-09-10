@@ -1,10 +1,11 @@
-# app.py — Ultra-Minimal Address Alchemist
-# - Reverted file uploader (drag & drop) to default Streamlit style
-# - Improved paste/upload section (count, de-dup, trim, preview)
-# - One central Run button (blue), Export button (green)
+# app.py — Address Alchemist
+# - Title styled FedEx-like (Barlow Condensed, bold/condensed + purple/orange split)
+# - Minimal input area with live count, de-dup, trim, preview
+# - Default Streamlit drag&drop uploader (reverted styling)
+# - Poppy Run (blue) and Export (green) buttons
 # - Clickable bulleted results (open in new tab)
 # - Images section shows if ANY item has an image
-# - Safe rerender with remembered format
+# - Safe rerender with remembered format and filenames
 
 import os, csv, io, re, time, json
 from datetime import datetime
@@ -17,20 +18,36 @@ import streamlit as st
 # ----------------------------
 # Page setup & styles
 # ----------------------------
-st.set_page_config(page_title="Address Alchemist", layout="centered")
+st.set_page_config(page_title="Address Alchemist", page_icon="⚗️", layout="centered")
 
 st.markdown("""
 <style>
+/* Import a free, FedEx-like condensed sans */
+@import url('https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@600;700;800&display=swap');
+
 /* Layout */
 .block-container { max-width: 760px; }
 .center-box { border: 1px solid rgba(0,0,0,.08); border-radius: 12px; padding: 16px; }
 
-/* Text */
+/* App Title — FedEx-style vibe */
+.app-title {
+  font-family: 'Barlow Condensed', system-ui, -apple-system, Segoe UI, Roboto, 'Helvetica Neue', Arial, sans-serif;
+  font-weight: 800;
+  font-size: 2.1rem;
+  line-height: 1.1;
+  letter-spacing: -0.01em;
+  margin: 0 0 8px 0;
+}
+.app-title .brand-a { color: #4D148C; }  /* FedEx Purple */
+.app-title .brand-b { color: #FF6A00; }  /* FedEx Orange */
+.app-sub { color: #6b7280; margin: 0 0 12px 0; }
+
+/* Body text helpers */
 .small { color: #6b7280; font-size: 12.5px; margin-top: 6px; }
 ul.link-list { margin: 0 0 .5rem 1.2rem; padding: 0; }
 ul.link-list li { margin: 0.2rem 0; }
 
-/* Buttons — make them pop */
+/* Buttons — poppy */
 .stButton>button {
   width: 100%;
   height: 48px;
@@ -465,8 +482,8 @@ def fetch_og_image(url: str) -> Optional[str]:
         for pat in [
             r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)["\']',
             r'<meta[^>]+property=["\']og:image:secure_url["\'][^>]+content=["\']([^"\']+)["\']',
-            r'"image"\s*:\s*"(https?://[^"]+)"',
-            r'"image"\s*:\s*\[\s*"(https?://[^"]+)"',
+            r'"image"\\s*:\\s*"(https?://[^"]+)"',
+            r'"image"\\s*:\\s*\\[\\s*"(https?://[^"]+)"',
         ]:
             m = re.search(pat, html, re.I)
             if m:
@@ -516,9 +533,10 @@ def build_output(rows: List[Dict[str, Any]], fmt: str):
     return ("\n".join(lines) + "\n"), "text/plain"
 
 # ----------------------------
-# UI — Improved Input Section
+# UI — Title + Input Section
 # ----------------------------
-st.markdown("### Address Alchemist")
+st.markdown('<h2 class="app-title"><span class="brand-a">Address</span> <span class="brand-b">Alchemist</span></h2>', unsafe_allow_html=True)
+st.markdown('<p class="app-sub">Paste addresses → get verified Zillow links</p>', unsafe_allow_html=True)
 
 st.markdown('<div class="center-box">', unsafe_allow_html=True)
 st.markdown("**Paste addresses** (one per line) _or_ **drop a CSV**")
@@ -539,10 +557,10 @@ with opt2:
 with opt3:
     show_preview = st.checkbox("Show preview", value=True)
 
-# Default Streamlit drag & drop look (no custom styling)
+# Default Streamlit drag & drop look
 file = st.file_uploader("Upload CSV", type=["csv"], label_visibility="collapsed")
 
-# Live parsing of pasted lines (used for preview and can be used for run if no CSV)
+# Live parsing of pasted lines (for preview; used on run if no CSV)
 lines_raw = (paste or "").splitlines()
 lines = [ln.strip() if trim_spaces else ln for ln in lines_raw]
 lines = [ln for ln in lines if ln.strip()]
@@ -591,7 +609,7 @@ if clicked:
                 st.stop()
             rows_in = [{"address": ln} for ln in lines]
 
-        defaults = {"city":"", "state":"", "zip":""}  # minimal UI: no defaults panel
+        defaults = {"city":"", "state":"", "zip":""}
         results: List[Dict[str, Any]] = []
         prog = st.progress(0, text="Processing…")
         for i, row in enumerate(rows_in, start=1):
@@ -615,12 +633,14 @@ if clicked:
                  for r in results if r.get("zillow_url")]
         st.markdown("<ul class='link-list'>" + "\n".join(items) + "</ul>", unsafe_allow_html=True)
 
-        # ---- Format dropdown + Export button directly under it ----
+        # ---- Format dropdown + Export button ----
         fmt_options = ["txt","csv","md","html"]
         fmt = st.selectbox("Download format", fmt_options, index=0)
         payload, mime = build_output(results, fmt)
         ts = datetime.utcnow().strftime("%Y%m%d-%H%M%S")
-        st.download_button("Export", data=payload, file_name=f"zillow_links_{ts}.{fmt}", mime=mime, use_container_width=True)
+        st.download_button("Export", data=payload,
+                           file_name=f"address_alchemist_links_{ts}.{fmt}",
+                           mime=mime, use_container_width=True)
 
         # ---- Images section (appears if ANY link has an image) ----
         thumbs: List[Optional[str]] = [get_thumbnail(r["input_address"], r["zillow_url"]) for r in results]
@@ -633,7 +653,7 @@ if clicked:
                     st.image(img, use_column_width=True)
                     st.caption(r["input_address"] if r.get("input_address") else "Listing")
 
-        # Persist for rerender (always include fmt)
+        # Persist for rerender
         st.session_state["__results__"] = {"results": results, "fmt": fmt}
 
     except Exception as e:
@@ -661,7 +681,8 @@ if results and not clicked:
     payload, mime = build_output(results, fmt)
     ts = datetime.utcnow().strftime("%Y%m%d-%H%M%S")
     st.download_button("Export", data=payload,
-                       file_name=f"zillow_links_{ts}.{fmt}", mime=mime, use_container_width=True)
+                       file_name=f"address_alchemist_links_{ts}.{fmt}",
+                       mime=mime, use_container_width=True)
 
     # Images section (appears if ANY link has an image)
     thumbs: List[Optional[str]] = [get_thumbnail(r.get("input_address",""), r.get("zillow_url","")) for r in results]
