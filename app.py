@@ -15,19 +15,77 @@ st.set_page_config(page_title="Zillow Deeplink Finder", layout="centered")
 
 st.markdown("""
 <style>
+/* Layout */
 .block-container { max-width: 760px; }
-h3 { margin-bottom: .35rem; }
 .center-box { border: 1px solid rgba(0,0,0,.08); border-radius: 12px; padding: 16px; }
-.stButton>button { border-radius: 10px; height: 42px; font-weight: 600; }
+
+/* Text */
 .small { color: #6b7280; font-size: 12.5px; margin-top: 6px; }
 ul.link-list { margin: 0 0 .5rem 1.2rem; padding: 0; }
 ul.link-list li { margin: 0.2rem 0; }
 
-/* Hide ONLY the uploader clear button (if present in your Streamlit version). */
+/* Buttons — make them pop */
+.stButton>button {
+  width: 100%;
+  height: 48px;
+  padding: 0.65rem 1rem;
+  border-radius: 12px;
+  border: 0;
+  color: #fff !important;
+  font-weight: 700;
+  letter-spacing: .02em;
+  background: linear-gradient(180deg, #2563eb 0%, #1d4ed8 100%);
+  box-shadow: 0 8px 24px rgba(37,99,235,.35), 0 2px 6px rgba(0,0,0,.12);
+  transition: transform .06s ease, box-shadow .2s ease, filter .2s ease;
+}
+.stButton>button:hover {
+  transform: translateY(-1px);
+  box-shadow: 0 10px 28px rgba(37,99,235,.45), 0 2px 8px rgba(0,0,0,.14);
+  filter: brightness(1.03);
+}
+.stButton>button:active {
+  transform: translateY(0);
+  filter: brightness(.98);
+  box-shadow: 0 6px 18px rgba(37,99,235,.35), 0 1px 4px rgba(0,0,0,.12);
+}
+.stButton>button:focus-visible {
+  outline: 3px solid #93c5fd;
+  outline-offset: 2px;
+}
+
+/* Download (Export) button — green theme */
+.stDownloadButton>button {
+  width: 100%;
+  height: 48px;
+  padding: 0.65rem 1rem;
+  border-radius: 12px;
+  border: 0;
+  color: #fff !important;
+  font-weight: 700;
+  letter-spacing: .02em;
+  background: linear-gradient(180deg, #16a34a 0%, #15803d 100%);
+  box-shadow: 0 8px 24px rgba(22,163,74,.35), 0 2px 6px rgba(0,0,0,.12);
+  transition: transform .06s ease, box-shadow .2s ease, filter .2s ease;
+}
+.stDownloadButton>button:hover {
+  transform: translateY(-1px);
+  box-shadow: 0 10px 28px rgba(22,163,74,.45), 0 2px 8px rgba(0,0,0,.14);
+  filter: brightness(1.03);
+}
+.stDownloadButton>button:active {
+  transform: translateY(0);
+  filter: brightness(.98);
+  box-shadow: 0 6px 18px rgba(22,163,74,.35), 0 1px 4px rgba(0,0,0,.12);
+}
+.stDownloadButton>button:focus-visible {
+  outline: 3px solid #86efac;
+  outline-offset: 2px;
+}
+
+/* Hide ONLY the uploader clear button (if present) */
 [data-testid="stFileUploadClearButton"] { display: none !important; }
 </style>
 """, unsafe_allow_html=True)
-
 # ----------------------------
 # Env/secrets (optional)
 # ----------------------------
