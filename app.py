@@ -2,7 +2,7 @@
 # - AVIF favicon (/mnt/data/link.avif) via pillow-avif-plugin
 # - Title uses Barlow Condensed (white)
 # - Minimal input area with live count, de-dup, trim, preview
-# - Results list now includes a hover-to-copy button per item (copies URL)
+# - Results list: hover-to-copy-all button (copies full bulleted list)
 # - Clickable results (open in new tab)
 # - Images section shows if ANY item has an image, labeled with MLS#/Address + “Open Zillow”
 # - Image selection priority: CSV Photo > Zillow hero > og:image > Street View
@@ -72,7 +72,6 @@ st.markdown("""
 
 .small { color: #6b7280; font-size: 12.5px; margin-top: 6px; }
 ul.link-list { margin: 0 0 .5rem 1.2rem; padding: 0; }
-ul.link-list li { margin: 0.2rem 0; }
 
 .stButton>button {
   width: 100%;
@@ -698,96 +697,132 @@ st.markdown('</div>', unsafe_allow_html=True)
 clicked = st.button("Run", use_container_width=True)
 
 # ----------------------------
-# Helper: Results HTML with hover-to-copy buttons
+# Results HTML with hover-to-copy-all button
 # ----------------------------
-def results_list_with_copy(results: List[Dict[str, Any]]):
-    # Build items
+def results_list_with_copy_all(results: List[Dict[str, Any]]):
     li_html = []
     for r in results:
         url = (r.get("zillow_url") or "").strip()
         if not url:
             continue
         safe_url = escape(url)
-        li_html.append(f"""
-          <li class="li-item">
-            <a href="{safe_url}" target="_blank" rel="noopener">{safe_url}</a>
-            <button class="copy-btn" data-copy="{safe_url}" title="Copy link" aria-label="Copy link">📋</button>
-          </li>
-        """)
+        # keep bullets visually and links clickable
+        li_html.append(f'<li><a href="{safe_url}" target="_blank" rel="noopener">{safe_url}</a></li>')
     items_html = "\n".join(li_html) if li_html else "<li>(no results)</li>"
 
-    # Component HTML/CSS/JS (isolated iframe)
     html = f"""
     <html>
       <head>
         <meta charset="utf-8" />
         <style>
-          body {{ margin: 0; font-family: -apple-system, Segoe UI, Roboto, Arial, sans-serif; }}
-          ul.link-list {{ margin: 0 0 .5rem 1.2rem; padding: 0; }}
-          ul.link-list li {{ margin: 0.35rem 0; position: relative; padding-right: 44px; }}
-          .copy-btn {{
-            position: absolute; right: 0; top: 50%; transform: translateY(-50%);
-            border: 0; border-radius: 8px; height: 28px; width: 34px;
-            background: #eef2ff; color: #1f2937; cursor: pointer;
-            opacity: 0; transition: opacity .18s ease, background .2s ease, transform .06s ease;
+          :root {{
+            --blue1: #2563eb;
+            --blue2: #1d4ed8;
+            --blue-focus: #93c5fd;
           }}
-          .li-item:hover .copy-btn {{ opacity: 1; }}
-          .copy-btn:hover {{ background: #e0e7ff; }}
-          .copy-btn:active {{ transform: translateY(calc(-50% + 1px)); }}
-          .copy-btn.success {{ background: #dcfce7; }}
-          .copy-btn.error   {{ background: #fee2e2; }}
-          a {{ text-decoration: none; }}
-          a:hover {{ text-decoration: underline; }}
+          body {{ margin: 0; font-family: -apple-system, Segoe UI, Roboto, Arial, sans-serif; }}
+          .results-wrap {{
+            position: relative;
+            padding-top: 8px;
+          }}
+          ul.link-list {{
+            margin: 0 0 .5rem 1.2rem;
+            padding: 0;
+            list-style: disc;
+          }}
+          ul.link-list li {{ margin: 0.35rem 0; }}
+
+          /* Copy All button styled like site buttons */
+          .copyall-btn {{
+            position: absolute;
+            top: -6px;
+            right: 0;
+            padding: 8px 12px;
+            height: 36px;
+            border: 0;
+            border-radius: 12px;
+            color: #fff;
+            font-weight: 700;
+            letter-spacing: .02em;
+            background: linear-gradient(180deg, var(--blue1) 0%, var(--blue2) 100%);
+            box-shadow: 0 8px 24px rgba(37,99,235,.35), 0 2px 6px rgba(0,0,0,.12);
+            cursor: pointer;
+            opacity: 0;
+            transform: translateY(-2px);
+            transition: opacity .18s ease, box-shadow .2s ease, filter .2s ease, transform .06s ease;
+          }}
+          .results-wrap:hover .copyall-btn {{
+            opacity: 1;
+            transform: translateY(0);
+          }}
+          .copyall-btn:hover {{
+            box-shadow: 0 10px 28px rgba(37,99,235,.45), 0 2px 8px rgba(0,0,0,.14);
+            filter: brightness(1.03);
+          }}
+          .copyall-btn:active {{
+            transform: translateY(1px);
+            filter: brightness(.98);
+            box-shadow: 0 6px 18px rgba(37,99,235,.35), 0 1px 4px rgba(0,0,0,.12);
+          }}
+          .copyall-btn:focus-visible {{
+            outline: 3px solid var(--blue-focus);
+            outline-offset: 2px;
+          }}
+          .copyall-btn.success {{ background: linear-gradient(180deg, #16a34a 0%, #15803d 100%) }}
+          .copyall-btn.error   {{ background: linear-gradient(180deg, #dc2626 0%, #b91c1c 100%) }}
         </style>
       </head>
       <body>
-        <ul class="link-list">
-          {items_html}
-        </ul>
+        <div class="results-wrap">
+          <button id="copyAll" class="copyall-btn" title="Copy all links" aria-label="Copy all links">Copy All</button>
+          <ul class="link-list" id="resultsList">
+            {items_html}
+          </ul>
+        </div>
         <script>
           (function() {{
-            const btns = Array.from(document.querySelectorAll('.copy-btn'));
-            btns.forEach(btn => {{
-              btn.addEventListener('click', async (e) => {{
-                const text = btn.getAttribute('data-copy') || '';
-                try {{
-                  await navigator.clipboard.writeText(text);
-                  const prev = btn.textContent;
-                  btn.textContent = '✓';
-                  btn.classList.remove('error');
-                  btn.classList.add('success');
-                  setTimeout(() => {{
-                    btn.textContent = prev;
-                    btn.classList.remove('success');
-                  }}, 900);
-                }} catch (err) {{
-                  const prev = btn.textContent;
-                  btn.textContent = '×';
-                  btn.classList.remove('success');
-                  btn.classList.add('error');
-                  setTimeout(() => {{
-                    btn.textContent = prev;
-                    btn.classList.remove('error');
-                  }}, 900);
-                }}
-              }});
+            const btn = document.getElementById('copyAll');
+            const list = document.getElementById('resultsList');
+
+            function buildBulletedText() {{
+              const anchors = Array.from(list.querySelectorAll('li a'));
+              const lines = anchors.map(a => '- ' + (a.getAttribute('href') || a.textContent || '').trim());
+              return lines.join('\\n') + (lines.length ? '\\n' : '');
+            }}
+
+            btn.addEventListener('click', async () => {{
+              const text = buildBulletedText();
+              try {{
+                await navigator.clipboard.writeText(text);
+                const prev = btn.textContent;
+                btn.textContent = '✓ Copied';
+                btn.classList.remove('error');
+                btn.classList.add('success');
+                setTimeout(() => {{ btn.textContent = prev; btn.classList.remove('success'); }}, 1000);
+              }} catch (e) {{
+                const prev = btn.textContent;
+                btn.textContent = '× Error';
+                btn.classList.remove('success');
+                btn.classList.add('error');
+                setTimeout(() => {{ btn.textContent = prev; btn.classList.remove('error'); }}, 1000);
+              }}
             }});
           }})();
         </script>
       </body>
     </html>
     """
-    # Estimate height: 42px per row + small headroom
-    est_h = max(80, min(42 * max(1, len(li_html)) + 20, 1000))
+    # Estimate height: 46px per row + extra for button
+    est_h = max(100, min(46 * max(1, len(li_html)) + 40, 1200))
     components.html(html, height=est_h, scrolling=False)
 
 # ----------------------------
 # Render helper
 # ----------------------------
 def _render_results_and_downloads(results: List[Dict[str, Any]]):
-    # Results list (with copy buttons)
+    # Results list (with copy-all)
     st.markdown("#### Results")
-    results_list_with_copy(results)
+    results_list_with_copy_all(results)
 
     # Export
     fmt_options = ["txt","csv","md","html"]
