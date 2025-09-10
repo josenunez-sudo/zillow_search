@@ -1,4 +1,4 @@
-# app.py — Ultra-Minimal Zillow Deeplink Finder
+# app.py — Ultra-Minimal Address Alchemist
 # - Reverted file uploader (drag & drop) to default Streamlit style
 # - Improved paste/upload section (count, de-dup, trim, preview)
 # - One central Run button (blue), Export button (green)
@@ -518,7 +518,7 @@ def build_output(rows: List[Dict[str, Any]], fmt: str):
 # ----------------------------
 # UI — Improved Input Section
 # ----------------------------
-st.markdown("### Zillow Deeplink Finder")
+st.markdown("### Address Alchemist")
 
 st.markdown('<div class="center-box">', unsafe_allow_html=True)
 st.markdown("**Paste addresses** (one per line) _or_ **drop a CSV**")
