@@ -1,7 +1,7 @@
 # app.py — Address Alchemist
-# - Title styled FedEx-like (Barlow Condensed, bold/condensed + purple/orange split)
+# - Title uses FedEx-like font (Barlow Condensed) in white
 # - Minimal input area with live count, de-dup, trim, preview
-# - Default Streamlit drag&drop uploader (reverted styling)
+# - Default Streamlit drag&drop uploader (no custom styling)
 # - Poppy Run (blue) and Export (green) buttons
 # - Clickable bulleted results (open in new tab)
 # - Images section shows if ANY item has an image
@@ -29,17 +29,17 @@ st.markdown("""
 .block-container { max-width: 760px; }
 .center-box { border: 1px solid rgba(0,0,0,.08); border-radius: 12px; padding: 16px; }
 
-/* App Title — FedEx-style vibe */
+/* App Title — FedEx-style font, white color */
 .app-title {
   font-family: 'Barlow Condensed', system-ui, -apple-system, Segoe UI, Roboto, 'Helvetica Neue', Arial, sans-serif;
   font-weight: 800;
   font-size: 2.1rem;
   line-height: 1.1;
   letter-spacing: -0.01em;
+  color: #ffffff;            /* <- white title */
   margin: 0 0 8px 0;
+  text-shadow: 0 1px 2px rgba(0,0,0,.25); /* subtle readability boost */
 }
-.app-title .brand-a { color: #4D148C; }  /* FedEx Purple */
-.app-title .brand-b { color: #FF6A00; }  /* FedEx Orange */
 .app-sub { color: #6b7280; margin: 0 0 12px 0; }
 
 /* Body text helpers */
@@ -482,8 +482,8 @@ def fetch_og_image(url: str) -> Optional[str]:
         for pat in [
             r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)["\']',
             r'<meta[^>]+property=["\']og:image:secure_url["\'][^>]+content=["\']([^"\']+)["\']',
-            r'"image"\\s*:\\s*"(https?://[^"]+)"',
-            r'"image"\\s*:\\s*\\[\\s*"(https?://[^"]+)"',
+            r'"image"\s*:\s*"(https?://[^"]+)"',
+            r'"image"\s*:\s*\[\s*"(https?://[^"]+)"',
         ]:
             m = re.search(pat, html, re.I)
             if m:
@@ -535,7 +535,7 @@ def build_output(rows: List[Dict[str, Any]], fmt: str):
 # ----------------------------
 # UI — Title + Input Section
 # ----------------------------
-st.markdown('<h2 class="app-title"><span class="brand-a">Address</span> <span class="brand-b">Alchemist</span></h2>', unsafe_allow_html=True)
+st.markdown('<h2 class="app-title">Address Alchemist</h2>', unsafe_allow_html=True)
 st.markdown('<p class="app-sub">Paste addresses → get verified Zillow links</p>', unsafe_allow_html=True)
 
 st.markdown('<div class="center-box">', unsafe_allow_html=True)
