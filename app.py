@@ -2,11 +2,11 @@
 # - AVIF favicon (/mnt/data/link.avif) via pillow-avif-plugin
 # - Title uses Barlow Condensed (white)
 # - Minimal input area with live count, de-dup, trim, preview
-# - Clickable bulleted results (open in new tab)
-# - Images section shows if ANY item has an image
+# - Results list now includes a hover-to-copy button per item (copies URL)
+# - Clickable results (open in new tab)
+# - Images section shows if ANY item has an image, labeled with MLS#/Address + “Open Zillow”
 # - Image selection priority: CSV Photo > Zillow hero > og:image > Street View
 # - Image Log includes CSV presence, chosen stage, errors
-# - Images now labeled per house: **MLS#**, Address, and "Open Zillow" link
 # - Safe rerender with remembered format and filenames
 
 import os, csv, io, re, time, json
@@ -16,6 +16,7 @@ from html import escape
 
 import requests
 import streamlit as st
+import streamlit.components.v1 as components
 from PIL import Image
 
 # ----------------------------
@@ -485,13 +486,13 @@ def extract_zillow_first_image(html: str) -> Optional[str]:
     return None
 
 # ----------------------------
-# Single-row pipeline (now captures CSV photo)
+# Single-row pipeline (captures CSV photo)
 # ----------------------------
 def process_single_row(row, *, delay=0.5, land_mode=True, defaults=None,
                        require_state=True, mls_first=True, default_mls_name="", max_candidates=20):
     defaults = defaults or {"city":"", "state":"", "zip":""}
 
-    # Capture CSV photo URL if provided (header: Photo/Image/etc.)
+    # CSV photo URL if provided (header: Photo/Image/etc.)
     csv_photo = get_first_by_keys(row, PHOTO_KEYS)
 
     comp = extract_components(row)
@@ -697,14 +698,96 @@ st.markdown('</div>', unsafe_allow_html=True)
 clicked = st.button("Run", use_container_width=True)
 
 # ----------------------------
+# Helper: Results HTML with hover-to-copy buttons
+# ----------------------------
+def results_list_with_copy(results: List[Dict[str, Any]]):
+    # Build items
+    li_html = []
+    for r in results:
+        url = (r.get("zillow_url") or "").strip()
+        if not url:
+            continue
+        safe_url = escape(url)
+        li_html.append(f"""
+          <li class="li-item">
+            <a href="{safe_url}" target="_blank" rel="noopener">{safe_url}</a>
+            <button class="copy-btn" data-copy="{safe_url}" title="Copy link" aria-label="Copy link">📋</button>
+          </li>
+        """)
+    items_html = "\n".join(li_html) if li_html else "<li>(no results)</li>"
+
+    # Component HTML/CSS/JS (isolated iframe)
+    html = f"""
+    <html>
+      <head>
+        <meta charset="utf-8" />
+        <style>
+          body {{ margin: 0; font-family: -apple-system, Segoe UI, Roboto, Arial, sans-serif; }}
+          ul.link-list {{ margin: 0 0 .5rem 1.2rem; padding: 0; }}
+          ul.link-list li {{ margin: 0.35rem 0; position: relative; padding-right: 44px; }}
+          .copy-btn {{
+            position: absolute; right: 0; top: 50%; transform: translateY(-50%);
+            border: 0; border-radius: 8px; height: 28px; width: 34px;
+            background: #eef2ff; color: #1f2937; cursor: pointer;
+            opacity: 0; transition: opacity .18s ease, background .2s ease, transform .06s ease;
+          }}
+          .li-item:hover .copy-btn {{ opacity: 1; }}
+          .copy-btn:hover {{ background: #e0e7ff; }}
+          .copy-btn:active {{ transform: translateY(calc(-50% + 1px)); }}
+          .copy-btn.success {{ background: #dcfce7; }}
+          .copy-btn.error   {{ background: #fee2e2; }}
+          a {{ text-decoration: none; }}
+          a:hover {{ text-decoration: underline; }}
+        </style>
+      </head>
+      <body>
+        <ul class="link-list">
+          {items_html}
+        </ul>
+        <script>
+          (function() {{
+            const btns = Array.from(document.querySelectorAll('.copy-btn'));
+            btns.forEach(btn => {{
+              btn.addEventListener('click', async (e) => {{
+                const text = btn.getAttribute('data-copy') || '';
+                try {{
+                  await navigator.clipboard.writeText(text);
+                  const prev = btn.textContent;
+                  btn.textContent = '✓';
+                  btn.classList.remove('error');
+                  btn.classList.add('success');
+                  setTimeout(() => {{
+                    btn.textContent = prev;
+                    btn.classList.remove('success');
+                  }}, 900);
+                }} catch (err) {{
+                  const prev = btn.textContent;
+                  btn.textContent = '×';
+                  btn.classList.remove('success');
+                  btn.classList.add('error');
+                  setTimeout(() => {{
+                    btn.textContent = prev;
+                    btn.classList.remove('error');
+                  }}, 900);
+                }}
+              }});
+            }});
+          }})();
+        </script>
+      </body>
+    </html>
+    """
+    # Estimate height: 42px per row + small headroom
+    est_h = max(80, min(42 * max(1, len(li_html)) + 20, 1000))
+    components.html(html, height=est_h, scrolling=False)
+
+# ----------------------------
 # Render helper
 # ----------------------------
 def _render_results_and_downloads(results: List[Dict[str, Any]]):
-    # Results list
+    # Results list (with copy buttons)
     st.markdown("#### Results")
-    items = [f'<li><a href="{r["zillow_url"]}" target="_blank" rel="noopener">{r["zillow_url"]}</a></li>'
-             for r in results if r.get("zillow_url")]
-    st.markdown("<ul class='link-list'>" + "\n".join(items) + "</ul>", unsafe_allow_html=True)
+    results_list_with_copy(results)
 
     # Export
     fmt_options = ["txt","csv","md","html"]
@@ -727,10 +810,8 @@ def _render_results_and_downloads(results: List[Dict[str, Any]]):
         cols = st.columns(3)
         for i, (r, img) in enumerate(imgs):
             with cols[i % 3]:
-                # show image
                 st.image(img, use_container_width=True)
 
-                # build label (MLS + Address) and link
                 mls_id = (r.get("mls_id") or "").strip()
                 addr = (r.get("input_address") or "Listing").strip()
                 url = r.get("zillow_url") or "#"
@@ -780,7 +861,6 @@ if clicked:
             if not lines:
                 st.error("Please paste at least one address or upload a CSV.")
                 st.stop()
-            # for pasted input, no csv_photo available
             rows_in = [{"address": ln} for ln in lines]
 
         defaults = {"city":"", "state":"", "zip":""}
