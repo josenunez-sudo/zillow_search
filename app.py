@@ -30,7 +30,7 @@ except Exception:
 
 def _page_icon_from_avif(path: str):
     if not os.path.exists(path):
-        return "⚗️"  # fallback emoji
+        return "🏡"  # fallback emoji
     try:
         im = Image.open(path)
         im.load()
@@ -40,7 +40,7 @@ def _page_icon_from_avif(path: str):
         im.save(buf, format="PNG")
         return buf.getvalue()
     except Exception:
-        return "🏡"
+        return "🏠"
 
 # ----------------------------
 # Page setup & styles
