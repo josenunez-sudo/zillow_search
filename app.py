@@ -6,6 +6,7 @@
 # - Images section shows if ANY item has an image
 # - Image selection priority: CSV Photo > Zillow hero > og:image > Street View
 # - Image Log includes CSV presence, chosen stage, errors
+# - Images now labeled per house: **MLS#**, Address, and "Open Zillow" link
 # - Safe rerender with remembered format and filenames
 
 import os, csv, io, re, time, json
@@ -131,6 +132,12 @@ ul.link-list li { margin: 0.2rem 0; }
 textarea { border-radius: 10px !important; }
 textarea:focus { outline: 3px solid #93c5fd !important; outline-offset: 2px; }
 [data-testid="stFileUploadClearButton"] { display: none !important; }
+
+/* Image labels under thumbnails */
+.img-label { font-size: 0.9rem; margin-top: 6px; }
+.img-label strong { font-weight: 700; }
+.img-label a { text-decoration: none; }
+.img-label a:hover { text-decoration: underline; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -720,8 +727,26 @@ def _render_results_and_downloads(results: List[Dict[str, Any]]):
         cols = st.columns(3)
         for i, (r, img) in enumerate(imgs):
             with cols[i % 3]:
-                st.image(img, use_column_width=True)
-                st.caption(r.get("input_address") or "Listing")
+                # show image
+                st.image(img, use_container_width=True)
+
+                # build label (MLS + Address) and link
+                mls_id = (r.get("mls_id") or "").strip()
+                addr = (r.get("input_address") or "Listing").strip()
+                url = r.get("zillow_url") or "#"
+
+                label_bits = []
+                if mls_id:
+                    label_bits.append(f"<strong>MLS#: {escape(mls_id)}</strong>")
+                if addr:
+                    label_bits.append(escape(addr))
+                label_html = " — ".join(label_bits) if label_bits else "Listing"
+
+                st.markdown(
+                    f"<div class='img-label'>{label_html}<br/>"
+                    f"<a href='{escape(url)}' target='_blank' rel='noopener'>Open Zillow</a></div>",
+                    unsafe_allow_html=True
+                )
 
     # Image Log (always shown)
     st.markdown("#### Image Log")
