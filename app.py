@@ -965,7 +965,8 @@ def _render_results_and_downloads(results: List[Dict[str, Any]], client_tag: str
     # Optional table view
     if st.session_state.get("table_view", True):
         import pandas as pd
-        cols = ["display_url","zillow_url","status","price","beds","baths","sqft","mls_id","input_address","already_sent"]
+        
+        cols = ["already_sent","display_url","zillow_url","status","price","beds","baths","sqft","mls_id","input_address"]
         df = pd.DataFrame([{c: r.get(c) for c in cols} for r in results])
         st.dataframe(df, use_container_width=True, hide_index=True)
 
@@ -1066,9 +1067,12 @@ if clicked:
             else:
                 r["display_url"] = display or base
 
-        # Mark duplicates for this client
+
         sent_canon, sent_zpids = get_already_sent_sets(client_tag)
         results = mark_duplicates(results, sent_canon, sent_zpids)
+
+        # Always exclude listings that were already sent
+        results = [r for r in results if not r.get("already_sent")]
 
         # Optionally filter UI to only show new rows
         if show_only_new:
