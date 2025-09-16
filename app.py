@@ -1,6 +1,7 @@
 # Address Alchemist — paste addresses AND arbitrary listing links → Zillow
 # Includes: per-client tags, Bitly short links (optional), enrichment (status/price/remarks),
-# images section, hover copy-all, USPS normalization (addresses only), and now URL resolving.
+# images section, hover copy-all, USPS normalization (addresses only), URL resolving,
+# and Supabase logging of each result (client/campaign/url/canonical/zpid/mls_id/address).
 
 import os, csv, io, re, time, json, asyncio
 from datetime import datetime
@@ -22,6 +23,22 @@ try:
     import usaddress
 except Exception:
     usaddress = None
+
+# ---- Supabase client (server-side) ----
+from supabase import create_client, Client
+
+@st.cache_resource
+def get_supabase() -> Optional[Client]:
+    try:
+        url = os.getenv("SUPABASE_URL", st.secrets.get("SUPABASE_URL", ""))
+        key = os.getenv("SUPABASE_SERVICE_ROLE", st.secrets.get("SUPABASE_SERVICE_ROLE", ""))
+        if not url or not key:
+            return None
+        return create_client(url, key)
+    except Exception:
+        return None
+
+SUPABASE = get_supabase()
 
 # ----------------------------
 # Favicon (AVIF → PNG bytes)
@@ -190,6 +207,20 @@ def extract_title_or_desc(html: str) -> str:
         m = re.search(pat, html, re.I)
         if m: return re.sub(r'\s+', ' ', m.group(1)).strip()
     return ""
+
+# ---- Zillow canonicalization ----
+ZPID_RE = re.compile(r'(\d{6,})_zpid', re.I)
+
+def canonicalize_zillow(url: str) -> Tuple[str, Optional[str]]:
+    """Return (canonical_url_without_query/fragment, zpid)."""
+    if not url:
+        return "", None
+    base = re.sub(r'[#?].*$', '', url)
+    m_full = re.search(r'^(https?://[^?#]*/homedetails/[^/]+/\d{6,}_zpid/)', url, re.I)
+    canon = m_full.group(1) if m_full else base
+    m_z = ZPID_RE.search(url)
+    zpid = m_z.group(1) if m_z else None
+    return canon, zpid
 
 # ----------------------------
 # Address parsing & variants (existing)
@@ -474,10 +505,9 @@ def resolve_from_source_url(source_url: str, defaults: Dict[str,str]) -> Tuple[s
                 u = it.get("url") or ""
                 if "/homedetails/" in u: return u, title
     # 4) Give up → return original URL (or a Zillow search from whatever we have)
-    # If any city/state, construct a Zillow search deeplink:
     if city or state or street:
         return construct_deeplink_from_parts(street or title or "", city, state, zipc, defaults), compose_query_address(street or title or "", city, state, zipc, defaults)
-    return final_url, ""  # least-bad fallback
+    return final_url, ""
 
 # ----------------------------
 # Primary single-row (address/MLS) resolver (existing)
@@ -689,6 +719,47 @@ def build_output(rows: List[Dict[str, Any]], fmt: str, use_display: bool = True,
     return ("\n".join(lines) + "\n"), "text/plain"
 
 # ----------------------------
+# Supabase logger
+# ----------------------------
+def log_sent_rows(results: List[Dict[str, Any]], client_tag: str, campaign_tag: str):
+    if not SUPABASE or not results:
+        return False, "Supabase not configured or no results."
+
+    rows = []
+    for r in results:
+        raw_url = (r.get("display_url") or r.get("zillow_url") or "").strip()
+        if not raw_url:
+            continue
+        canonical, zpid = canonicalize_zillow(raw_url)
+        rows.append({
+            "client":    (client_tag or "").strip(),
+            "campaign":  (campaign_tag or "").strip(),
+            "url":       raw_url,
+            "canonical": canonical,
+            "zpid":      zpid,
+            "mls_id":    (r.get("mls_id") or "").strip() or None,
+            "address":   (r.get("input_address") or "").strip() or None,
+            # sent_at defaults to now()
+        })
+
+    if not rows:
+        return False, "No valid rows to log."
+
+    ok = True
+    err = None
+    CHUNK = 500
+    for i in range(0, len(rows), CHUNK):
+        chunk = rows[i:i+CHUNK]
+        try:
+            SUPABASE.table("sent").insert(chunk).execute()
+        except Exception as e:
+            ok = False
+            err = str(e)
+            break
+
+    return ok, err or "ok"
+
+# ----------------------------
 # UI
 # ----------------------------
 st.markdown('<h2 class="app-title">Address Alchemist</h2>', unsafe_allow_html=True)
@@ -726,6 +797,13 @@ with c2:
     enrich_details = st.checkbox("Enrich details (status/price/remarks)", value=True)
 with c3:
     show_details = st.checkbox("Show details under results", value=False)
+
+# NEW: toggle for logging to Supabase
+log_to_supabase = st.checkbox(
+    "Log results to Supabase (table: public.sent)",
+    value=bool(SUPABASE),
+    help="Uses SERVICE_ROLE on the server. Nothing is sent if not configured."
+)
 
 st.markdown('</div>', unsafe_allow_html=True)
 
@@ -940,6 +1018,14 @@ if clicked:
                 r["display_url"] = short or display
             else:
                 r["display_url"] = display or base
+
+        # Optional: persist to Supabase
+        if log_to_supabase:
+            ok_log, info_log = log_sent_rows(results, client_tag, campaign_tag)
+            if ok_log:
+                st.success("Logged to Supabase (public.sent).")
+            else:
+                st.warning(f"Supabase log skipped/failed: {info_log}")
 
         st.success(f"Processed {total} item(s)" + (f" — CSV: {csv_rows_count}, Pasted: {total - csv_rows_count}" if file is not None else ""))
 
