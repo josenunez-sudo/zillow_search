@@ -786,7 +786,7 @@ st.markdown("**Paste addresses or links** (one per line) _and/or_ **drop a CSV**
 paste = st.text_area(
     label="Paste addresses or links",
     label_visibility="collapsed",
-    placeholder="407 E Woodall St, Smithfield, NC 27577\nhttps://l.hms.pt/403/340/10121588/74461375/1091612/B5\n123 US-301 S, Four Oaks, NC 27524",
+    placeholder="123 Main Street, Raleigh, NC 27577\nhttps://l.hms.pt/403/340/10121588/74461375/1091612/B5\n123,
     height=160,
     key="input_paste"
 )
