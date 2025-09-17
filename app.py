@@ -274,8 +274,8 @@ def extract_address_from_html(html: str) -> Dict[str, str]:
     m = re.search(r'"addressRegion"\\s*:\\s*"([A-Za-z]{2})"', html, re.I); out["state"] = m.group(1) if m else ""
     m = re.search(r'"postalCode"\\s*:\\s*"(\\d{5}(?:-\\d{4})?)"', html, re.I); out["zip"] = m.group(1) if m else ""
     if not out["street"]:
-        for pat in [r'<meta[^>]+property=["\\']og:title["\\'][^>]+content=["\\']([^"\\']+)["\\']',
-                    r'<title>\\s*([^<]+?)\\s*</title>']:
+        for pat in [r"<meta[^>]+property=['\"]og:title['\"][^>]+content=['\"]([^'\"]+)['\"]",
+            r'<title>\s*([^<]+?)\s*</title>']:
             m = re.search(pat, html, re.I)
             if m:
                 title = m.group(1)
