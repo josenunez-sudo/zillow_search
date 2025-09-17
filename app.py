@@ -1,6 +1,6 @@
 # Address Alchemist — paste addresses AND arbitrary listing links → Zillow
-# Now with: Clients tab, minimalist hover-only HTML action bar (✏︎ rename via prompt(), ↻ toggle, ⌫ delete+confirm),
-# per-client "already sent" filtering (show only NEW by default), enrichment, Bitly, Azure/Bing.
+# Includes: Clients tab with inline hover-only actions (✎ rename via prompt(), ○/● toggle, ⌫ delete+confirm),
+# per-client "already sent" dedupe (shows only NEW), enrichment (status/price/remarks), Bitly, Bing/Azure, images.
 
 import os, csv, io, re, time, json, asyncio
 from datetime import datetime
@@ -29,7 +29,7 @@ def _safe_rerun():
         st.rerun()
     except Exception:
         try:
-            st.experimental_rerun()  # for older Streamlit
+            st.experimental_rerun()
         except Exception:
             pass
 
@@ -71,7 +71,7 @@ st.markdown("""
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@700;800&display=swap');
 .block-container { max-width: 980px; }
-.app-title { font-family: 'Barlow Condensed', system-ui; font-weight: 800; font-size: 2.1rem; margin: 0 0 8px; color:#111827;}
+.app-title { font-family: 'Barlow Condensed', system-ui; font-weight: 800; font-size: 2.1rem; margin: 0 0 8px; }
 .app-sub { color:#6b7280; margin:0 0 12px; }
 .center-box { border:1px solid rgba(0,0,0,.08); border-radius:12px; padding:16px; }
 .small { color:#6b7280; font-size:12.5px; margin-top:6px; }
@@ -79,72 +79,65 @@ ul.link-list { margin:0 0 .5rem 1.2rem; padding:0; }
 textarea { border-radius:10px !important; }
 textarea:focus { outline:3px solid #93c5fd !important; outline-offset:2px; }
 [data-testid="stFileUploadClearButton"] { display:none !important; }
-.detail { color:#0f172a; font-size:14.5px; margin:8px 0 0 0; line-height:1.35; }
+.detail { font-size:14.5px; margin:8px 0 0 0; line-height:1.35; }
 .hl { display:inline-block; background:#f1f5f9; border-radius:8px; padding:2px 6px; margin-right:6px; font-size:12px; }
 .badge { display:inline-block; font-size:12px; font-weight:700; padding:2px 8px; border-radius:999px; margin-left:8px; background:#dcfce7; color:#166534; }
 
-/* minimalist clients list */
-.client-row {
-  border-bottom: 1px solid #f1f5f9;
-  padding: 18px 0;                 /* generous top/bottom spacing */
-  position: relative;
+/* --- Theme-aware colors --- */
+:root {
+  --text-strong: #0f172a;   /* slate-900 */
+  --text-muted:  #475569;   /* slate-600 */
+  --chip-active-bg:  #dcfce7; --chip-active-fg:#166534;
+  --chip-inactive-bg:#fee2e2; --chip-inactive-fg:#991b1b;
+  --row-border: #e2e8f0;    /* slate-200 */
+  --row-hover:  #f8fafc;    /* slate-50 */
 }
-.client-top {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 8px;
+html[data-theme="dark"], .stApp [data-theme="dark"] {
+  --text-strong: #f8fafc;   /* slate-50 */
+  --text-muted:  #cbd5e1;   /* slate-300 */
+  --chip-active-bg:  #064e3b; --chip-active-fg:#a7f3d0;
+  --chip-inactive-bg:#7f1d1d; --chip-inactive-fg:#fecaca;
+  --row-border: #0b1220;
+  --row-hover:  #0f172a;
+}
+
+/* --- Clients list, minimalist --- */
+.client-row {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 16px 10px; border-bottom: 1px solid var(--row-border);
+}
+.client-main {
+  display:flex; align-items:center; gap:10px; min-width: 0;
 }
 .client-name {
-  font-weight: 600;
-  color: #0f172a;
-  letter-spacing: 0.1px;
-  line-height: 1.35;
-  padding: 4px 0;
+  color: var(--text-strong);
+  font-weight: 600; letter-spacing: .1px; line-height: 1.35;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
 .client-status {
-  font-size: 12px;
-  padding: 2px 8px;
-  border-radius: 999px;
-  background: #e2e8f0;
-  color: #0f172a;
+  font-size: 12px; padding: 2px 8px; border-radius: 999px;
+  background: #e2e8f0; color: var(--text-strong);
 }
-.client-status.active   { background:#dcfce7; color:#166534; }
-.client-status.inactive { background:#fee2e2; color:#991b1b; }
+.client-status.active   { background: var(--chip-active-bg);   color: var(--chip-active-fg); }
+.client-status.inactive { background: var(--chip-inactive-bg); color: var(--chip-inactive-fg); }
 
-/* hover-only HTML action bar (right aligned) */
-.action-bar { 
-  position: absolute; right: 0; top: 50%; transform: translateY(-50%);
-  display: inline-flex; align-items: center; gap: 6px;
-  opacity: 0; pointer-events: none; transition: opacity .12s ease;
+/* Hover-only inline action bar */
+.action-bar {
+  display: inline-flex; gap: 6px; align-items: center;
+  opacity: 0; visibility: hidden; transition: opacity .12s ease, visibility .12s ease;
 }
-.client-row:hover .action-bar { opacity: 1; pointer-events: auto; }
+.client-row:hover .action-bar { opacity: 1; visibility: visible; }
 
-/* icon "buttons" (anchors) */
-.icon-btn { 
-  border: 0; background: transparent; padding: 2px 6px; border-radius: 8px;
+/* Tiny, unobtrusive icon buttons */
+.icon-btn {
+  border: 0; background: transparent; padding: 4px 6px; border-radius: 8px;
   font-size: 12px; color:#64748b; cursor: pointer; text-decoration: none;
 }
-.icon-btn:hover { background:#f8fafc; color:#0f172a; }
-.icon-btn.danger:hover { background:#fef2f2; color:#991b1b; }
+.icon-btn:hover { background: var(--row-hover); color: var(--text-strong); }
+.icon-btn.danger:hover { background: #fee2e2; color: #991b1b; }
 
-/* compact dialog */
-.dialog-card {
-  border: 1px solid #e5e7eb;
-  border-radius: 12px;
-  padding: 14px;
-  background: #fff;
-}
-.dialog-actions {
-  display: flex;
-  gap: 8px;
-  justify-content: flex-end;
-  margin-top: 10px;
-}
-.btn { padding: 8px 12px; border-radius: 10px; border: 1px solid #e5e7eb; background: #fff; }
-.btn.primary { background:#1d4ed8; color:#fff; border-color:#1d4ed8; }
-.btn.danger  { background:#dc2626; color:#fff; border-color:#dc2626; }
-.btn:hover   { filter: brightness(1.05); }
+/* section headings */
+.clients-h3 { color: var(--text-muted); font-weight: 700; margin: 8px 0 6px; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -245,7 +238,7 @@ def extract_address_from_html(html: str) -> Dict[str, str]:
 
 def extract_title_or_desc(html: str) -> str:
     for pat in [r'<meta[^>]+property=["\']og:title["\'][^>]+content=["\']([^"\']+)["\']',
-                r'<title>\s*([^<]+?)\s*</title>',
+                r'<title>\s*([^<]+)</title>',
                 r'<meta[^>]+name=["\']description["\'][^>]+content=["\']([^"\']+)["\']']:
         m = re.search(pat, html, re.I)
         if m: return re.sub(r'\s+', ' ', m.group(1)).strip()
@@ -588,7 +581,7 @@ KEY_HL = [("new roof","roof"),("hvac","hvac"),("ac unit","ac"),("furnace","furna
           ("primary on main","primary on main"),("finished basement","finished basement")]
 def _tidy_txt(s: str) -> str: return re.sub(r'\s+', ' ', (s or '')).strip()
 def summarize_remarks(text: str, max_sent: int = 2) -> str:
-    text = _tidy_txt(text); 
+    text = _tidy_txt(text)
     if not text: return ""
     sents = re.split(r'(?<=[\.\!\?])\s+', text)
     if len(sents) <= max_sent: return text
@@ -906,7 +899,7 @@ tab_run, tab_clients = st.tabs(["Run", "Clients"])
 
 # ---------- RUN TAB ----------
 with tab_run:
-    # Top row: Client dropdown (active only) + Campaign tag
+    # Top: Client dropdown (active only) + Campaign tag
     colC, colK = st.columns([1.2, 1])
     with colC:
         active_clients = fetch_clients(include_inactive=False)
@@ -917,7 +910,7 @@ with tab_run:
         sel_idx = st.selectbox("Client", list(range(len(options))), format_func=lambda i: options[i], index=idx_default if idx_default is not None else 0)
         selected_client = None if sel_idx is None else (None if options[sel_idx] == ADD_SENTINEL else active_clients[sel_idx])
 
-        # Inline add (allowed here)
+        # Inline add
         if sel_idx is not None and options[sel_idx] == ADD_SENTINEL:
             new_cli = st.text_input("New client name", key="__add_client_name__")
             if st.button("Add client", use_container_width=True, key="__add_client_btn__"):
@@ -933,7 +926,7 @@ with tab_run:
     with colK:
         campaign_tag_raw = st.text_input("Campaign tag", value=datetime.utcnow().strftime("%Y%m%d"))
 
-    # Options row
+    # Options
     c1, c2, c3 = st.columns([1,1,1.2])
     with c1:
         use_shortlinks = st.checkbox("Use short links (Bitly)", value=False, help="Requires BITLY_TOKEN")
@@ -1001,7 +994,7 @@ with tab_run:
 
     clicked = st.button("Run", use_container_width=True)
 
-    # UI helpers
+    # Results HTML list with copy-all
     def results_list_with_copy_all(results: List[Dict[str, Any]]):
         li_html = []
         for r in results:
@@ -1060,8 +1053,7 @@ with tab_run:
           </script>
         </body></html>"""
         est_h = max(120, min(52 * max(1, len(li_html)) + (60 if show_details else 24), 1400))
-        # NOTE: removed key= parameter for compatibility with older Streamlit versions
-        components.html(html, height=est_h, scrolling=False)
+        components.html(html, height=est_h, scrolling=False)  # no key= (compat)
 
     def _render_results_and_downloads(results: List[Dict[str, Any]], client_tag: str, campaign_tag: str, include_notes: bool):
         st.markdown("#### Results")
@@ -1208,95 +1200,94 @@ with tab_clients:
 
     colA, colB = st.columns(2)
 
-    # ---- Active list ----
+    # Active list
     with colA:
-        st.markdown("### Active")
+        st.markdown("### Active", unsafe_allow_html=True)
         if not active:
             st.write("_No active clients_")
         else:
             for c in active:
                 cid = c["id"]; cname = c["name"]
-                st.markdown("<div class='client-row'>", unsafe_allow_html=True)
-                top_cols = st.columns([0.80, 0.20])
-                with top_cols[0]:
-                    st.markdown(f"<div class='client-top'><span class='client-name'>{escape(cname)}</span><span class='client-status active'>active</span></div>", unsafe_allow_html=True)
-                with top_cols[1]:
-                    # Hover-only HTML icon bar (prompt() rename, toggle, delete)
-                    st.markdown(
-                        f"""
-                        <div class="action-bar" id="ab_{cid}">
-                          <a class="icon-btn" title="Rename" href="javascript:void(0)" onclick="
-                            const newName = prompt('Rename client: {escape(cname)}','{escape(cname)}');
-                            if (newName && newName.trim()) {{
-                              const u = new URL(window.location.href);
-                              u.searchParams.set('act','rename');
-                              u.searchParams.set('id','{cid}');
-                              u.searchParams.set('arg', newName.trim());
-                              window.location.href = u.toString();
-                            }}
-                          ">✏︎</a>
-                          <a class="icon-btn" title="Deactivate" href="javascript:void(0)" onclick="
+                st.markdown(
+                    f"""
+                    <div class="client-row">
+                      <div class="client-main">
+                        <span class="client-name">{escape(cname)}</span>
+                        <span class="client-status active">active</span>
+                      </div>
+                      <div class="action-bar">
+                        <a class="icon-btn" title="Rename" href="javascript:void(0)" onclick="
+                          const newName = prompt('Rename client: {escape(cname)}','{escape(cname)}');
+                          if (newName && newName.trim()) {{
                             const u = new URL(window.location.href);
-                            u.searchParams.set('act','toggle');
+                            u.searchParams.set('act','rename');
+                            u.searchParams.set('id','{cid}');
+                            u.searchParams.set('arg', newName.trim());
+                            window.location.href = u.toString();
+                          }}
+                        ">✎</a>
+                        <a class="icon-btn" title="Deactivate" href="javascript:void(0)" onclick="
+                          const u = new URL(window.location.href);
+                          u.searchParams.set('act','toggle');
+                          u.searchParams.set('id','{cid}');
+                          window.location.href = u.toString();
+                        ">○</a>
+                        <a class="icon-btn danger" title="Delete" href="javascript:void(0)" onclick="
+                          if (confirm('Delete {escape(cname)}? This cannot be undone.')) {{
+                            const u = new URL(window.location.href);
+                            u.searchParams.set('act','delete');
                             u.searchParams.set('id','{cid}');
                             window.location.href = u.toString();
-                          ">↻</a>
-                          <a class="icon-btn danger" title="Delete" href="javascript:void(0)" onclick="
-                            if (confirm('Delete {escape(cname)}? This cannot be undone.')) {{
-                              const u = new URL(window.location.href);
-                              u.searchParams.set('act','delete');
-                              u.searchParams.set('id','{cid}');
-                              window.location.href = u.toString();
-                            }}
-                          ">⌫</a>
-                        </div>
-                        """,
-                        unsafe_allow_html=True
-                    )
-                st.markdown("</div>", unsafe_allow_html=True)
+                          }}
+                        ">⌫</a>
+                      </div>
+                    </div>
+                    """,
+                    unsafe_allow_html=True
+                )
 
-    # ---- Inactive list ----
+    # Inactive list
     with colB:
-        st.markdown("### Inactive")
+        st.markdown("### Inactive", unsafe_allow_html=True)
         if not inactive:
             st.write("_No inactive clients_")
         else:
             for c in inactive:
                 cid = c["id"]; cname = c["name"]
-                st.markdown("<div class='client-row'>", unsafe_allow_html=True)
-                top_cols = st.columns([0.80, 0.20])
-                with top_cols[0]:
-                    st.markdown(f"<div class='client-top'><span class='client-name'>{escape(cname)}</span><span class='client-status inactive'>inactive</span></div>", unsafe_allow_html=True)
-                with top_cols[1]:
-                    st.markdown(
-                        f"""
-                        <div class="action-bar" id="abi_{cid}">
-                          <a class="icon-btn" title="Rename" href="javascript:void(0)" onclick="
-                            const newName = prompt('Rename client: {escape(cname)}','{escape(cname)}');
-                            if (newName && newName.trim()) {{
-                              const u = new URL(window.location.href);
-                              u.searchParams.set('act','rename');
-                              u.searchParams.set('id','{cid}');
-                              u.searchParams.set('arg', newName.trim());
-                              window.location.href = u.toString();
-                            }}
-                          ">✏︎</a>
-                          <a class="icon-btn" title="Activate" href="javascript:void(0)" onclick="
+                st.markdown(
+                    f"""
+                    <div class="client-row">
+                      <div class="client-main">
+                        <span class="client-name">{escape(cname)}</span>
+                        <span class="client-status inactive">inactive</span>
+                      </div>
+                      <div class="action-bar">
+                        <a class="icon-btn" title="Rename" href="javascript:void(0)" onclick="
+                          const newName = prompt('Rename client: {escape(cname)}','{escape(cname)}');
+                          if (newName && newName.trim()) {{
                             const u = new URL(window.location.href);
-                            u.searchParams.set('act','toggle');
+                            u.searchParams.set('act','rename');
+                            u.searchParams.set('id','{cid}');
+                            u.searchParams.set('arg', newName.trim());
+                            window.location.href = u.toString();
+                          }}
+                        ">✎</a>
+                        <a class="icon-btn" title="Activate" href="javascript:void(0)" onclick="
+                          const u = new URL(window.location.href);
+                          u.searchParams.set('act','toggle');
+                          u.searchParams.set('id','{cid}');
+                          window.location.href = u.toString();
+                        ">●</a>
+                        <a class="icon-btn danger" title="Delete" href="javascript:void(0)" onclick="
+                          if (confirm('Delete {escape(cname)}? This cannot be undone.')) {{
+                            const u = new URL(window.location.href);
+                            u.searchParams.set('act','delete');
                             u.searchParams.set('id','{cid}');
                             window.location.href = u.toString();
-                          ">↻</a>
-                          <a class="icon-btn danger" title="Delete" href="javascript:void(0)" onclick="
-                            if (confirm('Delete {escape(cname)}? This cannot be undone.')) {{
-                              const u = new URL(window.location.href);
-                              u.searchParams.set('act','delete');
-                              u.searchParams.set('id','{cid}');
-                              window.location.href = u.toString();
-                            }}
-                          ">⌫</a>
-                        </div>
-                        """,
-                        unsafe_allow_html=True
-                    )
-                st.markdown("</div>", unsafe_allow_html=True)
+                          }}
+                        ">⌫</a>
+                      </div>
+                    </div>
+                    """,
+                    unsafe_allow_html=True
+                )
