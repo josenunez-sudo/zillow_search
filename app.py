@@ -1,7 +1,8 @@
 # Address Alchemist — paste addresses AND arbitrary listing links → Zillow
-# Adds: Clients tab (active/inactive lists, inline rename ✏️, activate/deactivate),
+# Adds: Clients tab with sleek icon actions (✏️ rename, 🔁 toggle, 🗑️ delete w/ confirm),
+# action buttons emphasize on row hover, delete confirmation dialog,
 # client dropdown (active only, excludes "test test") + "➕ Add new client…" inline,
-# per-client dedupe via public.sent (shows ONLY new), enrichment, Bitly, Azure/Bing.
+# per-client dedupe (show only NEW), enrichment, Bitly, Azure/Bing.
 
 import os, csv, io, re, time, json, asyncio
 from datetime import datetime
@@ -23,6 +24,16 @@ try:
     import usaddress
 except Exception:
     usaddress = None
+
+# ---------- Rerun helper ----------
+def _safe_rerun():
+    try:
+        st.rerun()
+    except Exception:
+        try:
+            st.experimental_rerun()  # pragma: no cover (older Streamlit)
+        except Exception:
+            pass
 
 # ---------- Supabase ----------
 from supabase import create_client, Client
@@ -73,15 +84,27 @@ textarea:focus { outline:3px solid #93c5fd !important; outline-offset:2px; }
 .detail { color:#0f172a; font-size:14.5px; margin:8px 0 0 0; line-height:1.35; }
 .hl { display:inline-block; background:#f1f5f9; border-radius:8px; padding:2px 6px; margin-right:6px; font-size:12px; }
 .badge { display:inline-block; font-size:12px; font-weight:700; padding:2px 8px; border-radius:999px; margin-left:8px; background:#dcfce7; color:#166534; }
-.stButton>button, .stDownloadButton>button { width:100%; height:48px; border-radius:12px; font-weight:700; }
-.row { padding:8px 10px; border-bottom:1px solid #e5e7eb; }
-.row:last-child { border-bottom:none; }
-.name { font-weight:600; }
-.icon-btn { padding:4px 8px; border-radius:8px; border:1px solid #e5e7eb; background:#fff; }
+
+.client-row { border-bottom:1px solid #e5e7eb; padding:10px 0; }
+.client-top { display:flex; align-items:center; justify-content:space-between; gap:8px; }
+.client-name { font-weight:600; }
+.client-status { font-size:12px; padding:2px 8px; border-radius:999px; background:#e2e8f0; color:#0f172a; }
+.client-status.active { background:#dcfce7; color:#166534; }
+.client-status.inactive { background:#fee2e2; color:#991b1b; }
+
+.action-bar { display:flex; gap:6px; opacity:.38; transition:opacity .15s ease; }
+.client-row:hover .action-bar { opacity:1; }
+.icon-btn { border:1px solid #e5e7eb; background:#fff; padding:6px 8px; border-radius:10px; font-size:13px; }
 .icon-btn:hover { background:#f8fafc; }
-.status-pill { font-size:12px; padding:2px 8px; border-radius:999px; background:#e2e8f0; color:#0f172a; }
-.status-pill.active { background:#dcfce7; color:#166534; }
-.status-pill.inactive { background:#fee2e2; color:#991b1b; }
+.icon-btn.danger { border-color:#fecaca; }
+.icon-btn.danger:hover { background:#fef2f2; }
+
+.dialog-card { border:1px solid #e5e7eb; border-radius:12px; padding:16px; background:#fff; }
+.dialog-actions { display:flex; gap:8px; justify-content:flex-end; margin-top:12px; }
+.btn { padding:8px 12px; border-radius:10px; border:1px solid #e5e7eb; background:#fff; }
+.btn.primary { background:#1d4ed8; color:#fff; border-color:#1d4ed8; }
+.btn.danger { background:#dc2626; color:#fff; border-color:#dc2626; }
+.btn:hover { filter:brightness(1.05); }
 </style>
 """, unsafe_allow_html=True)
 
@@ -714,17 +737,13 @@ def log_sent_rows(results: List[Dict[str, Any]], client_tag: str, campaign_tag: 
 # ---------- Clients registry ----------
 @st.cache_data(ttl=60, show_spinner=False)
 def fetch_clients(include_inactive: bool = False):
-    """Return [{id,name,name_norm,active}]; always exclude 'test test' by normalized name."""
+    """Return [{id,name,name_norm,active}] excluding 'test test'."""
     if not _sb_ok():
         return []
     try:
-        q = SUPABASE.table("clients").select("id,name,name_norm,active").order("name", desc=False)
-        # fetch all and split in UI; we still exclude 'test test'
-        rows = q.execute().data or []
+        rows = SUPABASE.table("clients").select("id,name,name_norm,active").order("name", desc=False).execute().data or []
         rows = [r for r in rows if r.get("name_norm") != _norm_tag("test test")]
-        if include_inactive:
-            return rows
-        return [r for r in rows if r.get("active")]
+        return rows if include_inactive else [r for r in rows if r.get("active")]
     except Exception:
         return []
 
@@ -764,6 +783,16 @@ def rename_client(client_id: int, new_name: str):
         if existing and existing[0]["id"] != client_id:
             return False, "A client with that (normalized) name already exists."
         SUPABASE.table("clients").update({"name": new_name.strip(), "name_norm": new_norm}).eq("id", client_id).execute()
+        invalidate_clients_cache()
+        return True, "ok"
+    except Exception as e:
+        return False, str(e)
+
+def delete_client(client_id: int):
+    if not _sb_ok() or not client_id:
+        return False, "Not configured"
+    try:
+        SUPABASE.table("clients").delete().eq("id", client_id).execute()
         invalidate_clients_cache()
         return True, "ok"
     except Exception as e:
@@ -816,7 +845,7 @@ with tab_run:
                 if ok:
                     st.success("Client added.")
                     invalidate_clients_cache()
-                    st.experimental_rerun()
+                    _safe_rerun()
                 else:
                     st.error(f"Add failed: {msg}")
 
@@ -1092,12 +1121,21 @@ with tab_clients:
     st.subheader("Clients")
     st.caption("Manage active and inactive clients. “test test” is always hidden.")
 
-    # Keep per-client edit mode in session
-    if "__edit_clients__" not in st.session_state:
-        st.session_state["__edit_clients__"] = {}
+    # Session state for row edit toggles and delete confirms
+    ss = st.session_state
+    ss.setdefault("__edit_clients__", {})
+    ss.setdefault("__confirm_delete__", None)  # holds {"id":..., "name":...} when active
 
     def _toggle_edit(cid: int, on: bool):
-        st.session_state["__edit_clients__"][cid] = on
+        ss["__edit_clients__"][cid] = on
+
+    def _open_confirm(cid: int, name: str):
+        ss["__confirm_delete__"] = {"id": cid, "name": name}
+        _safe_rerun()
+
+    def _close_confirm():
+        ss["__confirm_delete__"] = None
+        _safe_rerun()
 
     all_clients = fetch_clients(include_inactive=True)
     active = [c for c in all_clients if c.get("active")]
@@ -1105,80 +1143,125 @@ with tab_clients:
 
     colA, colB = st.columns(2)
 
+    # ---- Active list ----
     with colA:
         st.markdown("### Active")
         if not active:
             st.write("_No active clients_")
         else:
             for c in active:
-                cid = c["id"]
-                edit_on = st.session_state["__edit_clients__"].get(cid, False)
-                r1, r2, r3 = st.columns([0.60, 0.25, 0.15])
-                with r1:
+                cid = c["id"]; cname = c["name"]
+                edit_on = ss["__edit_clients__"].get(cid, False)
+
+                st.markdown("<div class='client-row'>", unsafe_allow_html=True)
+                top_cols = st.columns([0.70, 0.30])
+                with top_cols[0]:
                     if edit_on:
-                        new_name = st.text_input(" ", value=c["name"], label_visibility="collapsed", key=f"rn_{cid}")
+                        new_name = st.text_input(" ", value=cname, label_visibility="collapsed", key=f"rn_{cid}")
                     else:
-                        st.markdown(f"<div class='row name'>{escape(c['name'])} <span class='status-pill active'>active</span></div>", unsafe_allow_html=True)
-                with r2:
+                        st.markdown(f"<div class='client-top'><span class='client-name'>{escape(cname)}</span><span class='client-status active'>active</span></div>", unsafe_allow_html=True)
+                with top_cols[1]:
+                    # Action bar (sleek icons)
+                    st.markdown("<div class='action-bar'>", unsafe_allow_html=True)
                     if edit_on:
-                        if st.button("💾 Save", key=f"save_{cid}", use_container_width=True):
+                        if st.button("💾 Save", key=f"save_{cid}", help="Save rename", use_container_width=False):
                             proposed = st.session_state.get(f"rn_{cid}", "").strip()
                             ok, msg = rename_client(cid, proposed)
                             if ok:
                                 st.success("Renamed")
                                 invalidate_clients_cache()
                                 _toggle_edit(cid, False)
-                                st.experimental_rerun()
+                                _safe_rerun()
                             else:
                                 st.error(msg)
+                        if st.button("↩️ Cancel", key=f"cancel_{cid}", help="Cancel edit", use_container_width=False):
+                            _toggle_edit(cid, False)
+                            _safe_rerun()
                     else:
-                        if st.button("✏️ Edit", key=f"edit_{cid}", use_container_width=True):
+                        if st.button("✏️", key=f"edit_{cid}", help="Rename", use_container_width=False):
                             _toggle_edit(cid, True)
-                with r3:
-                    if st.button("Deactivate", key=f"deact_{cid}", use_container_width=True):
-                        ok, msg = toggle_client_active(cid, False)
-                        if ok:
-                            st.success("Deactivated")
-                            invalidate_clients_cache()
-                            st.experimental_rerun()
-                        else:
-                            st.error(msg)
+                        if st.button("🔁", key=f"deact_{cid}", help="Deactivate", use_container_width=False):
+                            ok, msg = toggle_client_active(cid, False)
+                            if ok:
+                                st.success("Deactivated")
+                                invalidate_clients_cache()
+                                _safe_rerun()
+                            else:
+                                st.error(msg)
+                        if st.button("🗑️", key=f"del_{cid}", help="Delete", use_container_width=False):
+                            _open_confirm(cid, cname)
+                    st.markdown("</div>", unsafe_allow_html=True)
+                st.markdown("</div>", unsafe_allow_html=True)
 
+    # ---- Inactive list ----
     with colB:
         st.markdown("### Inactive")
         if not inactive:
             st.write("_No inactive clients_")
         else:
             for c in inactive:
-                cid = c["id"]
-                edit_on = st.session_state["__edit_clients__"].get(cid, False)
-                r1, r2, r3 = st.columns([0.60, 0.25, 0.15])
-                with r1:
+                cid = c["id"]; cname = c["name"]
+                edit_on = ss["__edit_clients__"].get(cid, False)
+
+                st.markdown("<div class='client-row'>", unsafe_allow_html=True)
+                top_cols = st.columns([0.70, 0.30])
+                with top_cols[0]:
                     if edit_on:
-                        new_name = st.text_input(" ", value=c["name"], label_visibility="collapsed", key=f"rn_{cid}")
+                        new_name = st.text_input(" ", value=cname, label_visibility="collapsed", key=f"rn_{cid}")
                     else:
-                        st.markdown(f"<div class='row name'>{escape(c['name'])} <span class='status-pill inactive'>inactive</span></div>", unsafe_allow_html=True)
-                with r2:
+                        st.markdown(f"<div class='client-top'><span class='client-name'>{escape(cname)}</span><span class='client-status inactive'>inactive</span></div>", unsafe_allow_html=True)
+                with top_cols[1]:
+                    st.markdown("<div class='action-bar'>", unsafe_allow_html=True)
                     if edit_on:
-                        if st.button("💾 Save", key=f"save_{cid}", use_container_width=True):
+                        if st.button("💾 Save", key=f"savei_{cid}", help="Save rename", use_container_width=False):
                             proposed = st.session_state.get(f"rn_{cid}", "").strip()
                             ok, msg = rename_client(cid, proposed)
                             if ok:
                                 st.success("Renamed")
                                 invalidate_clients_cache()
                                 _toggle_edit(cid, False)
-                                st.experimental_rerun()
+                                _safe_rerun()
                             else:
                                 st.error(msg)
+                        if st.button("↩️ Cancel", key=f"canceli_{cid}", help="Cancel edit", use_container_width=False):
+                            _toggle_edit(cid, False)
+                            _safe_rerun()
                     else:
-                        if st.button("✏️ Edit", key=f"edit_{cid}", use_container_width=True):
+                        if st.button("✏️", key=f"editi_{cid}", help="Rename", use_container_width=False):
                             _toggle_edit(cid, True)
-                with r3:
-                    if st.button("Activate", key=f"act_{cid}", use_container_width=True):
-                        ok, msg = toggle_client_active(cid, True)
-                        if ok:
-                            st.success("Activated")
-                            invalidate_clients_cache()
-                            st.experimental_rerun()
-                        else:
-                            st.error(msg)
+                        if st.button("🔁", key=f"act_{cid}", help="Activate", use_container_width=False):
+                            ok, msg = toggle_client_active(cid, True)
+                            if ok:
+                                st.success("Activated")
+                                invalidate_clients_cache()
+                                _safe_rerun()
+                            else:
+                                st.error(msg)
+                        if st.button("🗑️", key=f"deli_{cid}", help="Delete", use_container_width=False):
+                            _open_confirm(cid, cname)
+                    st.markdown("</div>", unsafe_allow_html=True)
+                st.markdown("</div>", unsafe_allow_html=True)
+
+    # ---- Delete confirmation dialog (portable) ----
+    confirm = ss.get("__confirm_delete__")
+    if confirm:
+        # If your Streamlit supports st.dialog, you can swap this card into a dialog:
+        # with st.dialog("Confirm delete"):
+        st.markdown("<div class='dialog-card'>", unsafe_allow_html=True)
+        st.markdown(f"### Delete client\nAre you sure you want to delete **{escape(confirm['name'])}**? This cannot be undone.", unsafe_allow_html=True)
+        cA, cB = st.columns([1, 1])
+        with cA:
+            if st.button("Cancel", key="cancel_del", use_container_width=True):
+                _close_confirm()
+        with cB:
+            if st.button("Delete", key="confirm_del", use_container_width=True):
+                ok, msg = delete_client(confirm["id"])
+                if ok:
+                    st.success("Client deleted.")
+                    ss["__confirm_delete__"] = None
+                    invalidate_clients_cache()
+                    _safe_rerun()
+                else:
+                    st.error(msg)
+                    _close_confirm()
+        st.markdown("</div>", unsafe_allow_html=True)
