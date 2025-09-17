@@ -1,7 +1,6 @@
 # Address Alchemist — paste addresses AND arbitrary listing links → Zillow
-# Adds: Clients tab with minimalist icon actions (✏︎ rename, ↻ toggle, ⌫ delete w/ confirm),
-# actions hidden until row hover, generous spacing, client dropdown next to campaign,
-# per-client dedupe (only NEW), enrichment, Bitly, Azure/Bing.
+# Now with: Clients tab, minimalist hover-only HTML action bar (✏︎ rename via prompt(), ↻ toggle, ⌫ delete+confirm),
+# per-client "already sent" filtering (show only NEW by default), enrichment, Bitly, Azure/Bing.
 
 import os, csv, io, re, time, json, asyncio
 from datetime import datetime
@@ -113,37 +112,21 @@ textarea:focus { outline:3px solid #93c5fd !important; outline-offset:2px; }
 .client-status.active   { background:#dcfce7; color:#166534; }
 .client-status.inactive { background:#fee2e2; color:#991b1b; }
 
-/* action bar hidden by default, visible on row hover or when editing */
-.action-bar {
-  display: inline-flex;
-  gap: 4px;
-  opacity: 0;
-  pointer-events: none;
-  transition: opacity .12s ease;
+/* hover-only HTML action bar (right aligned) */
+.action-bar { 
+  position: absolute; right: 0; top: 50%; transform: translateY(-50%);
+  display: inline-flex; align-items: center; gap: 6px;
+  opacity: 0; pointer-events: none; transition: opacity .12s ease;
 }
-.client-row:hover .action-bar {
-  opacity: 1;
-  pointer-events: auto;
-}
-.action-bar.editing { opacity: 1; pointer-events: auto; }
+.client-row:hover .action-bar { opacity: 1; pointer-events: auto; }
 
-/* tiny, low-contrast icon buttons (✏︎, ↻, ⌫) */
-.icon-btn {
-  border: 0;
-  background: transparent;
-  padding: 2px 6px;
-  border-radius: 8px;
-  font-size: 12px;
-  color: #64748b;                 /* muted */
+/* icon "buttons" (anchors) */
+.icon-btn { 
+  border: 0; background: transparent; padding: 2px 6px; border-radius: 8px;
+  font-size: 12px; color:#64748b; cursor: pointer; text-decoration: none;
 }
-.icon-btn:hover {
-  background: #f8fafc;            /* faint hover */
-  color: #0f172a;
-}
-.icon-btn.danger:hover {
-  background: #fef2f2;            /* faint red hover */
-  color: #991b1b;
-}
+.icon-btn:hover { background:#f8fafc; color:#0f172a; }
+.icon-btn.danger:hover { background:#fef2f2; color:#991b1b; }
 
 /* compact dialog */
 .dialog-card {
@@ -855,6 +838,46 @@ def delete_client(client_id: int):
     except Exception as e:
         return False, str(e)
 
+# ---- Query-param action handler for client actions (HTML icon bar) ----
+def _qp_get(name, default=None):
+    try:
+        qp = st.query_params
+        val = qp.get(name, default)
+        if isinstance(val, list) and val:
+            return val[0]
+        return val
+    except Exception:
+        qp = st.experimental_get_query_params()
+        return (qp.get(name, [default]) or [default])[0]
+
+def _qp_set(**kwargs):
+    try:
+        st.query_params.update(kwargs)
+    except Exception:
+        st.experimental_set_query_params(**kwargs)
+
+act = _qp_get("act", "")
+cid = _qp_get("id", "")
+arg = _qp_get("arg", "")
+
+if act and cid:
+    try:
+        cid_int = int(cid)
+    except Exception:
+        cid_int = 0
+
+    if cid_int:
+        if act == "toggle":
+            rows = SUPABASE.table("clients").select("active").eq("id", cid_int).limit(1).execute().data or []
+            cur = rows[0]["active"] if rows else True
+            toggle_client_active(cid_int, (not cur))
+        elif act == "rename" and arg:
+            rename_client(cid_int, arg)
+        elif act == "delete":
+            delete_client(cid_int)
+    _qp_set()  # clear params
+    _safe_rerun()
+
 # ---------- Output builders ----------
 def build_output(rows: List[Dict[str, Any]], fmt: str, use_display: bool = True, include_notes: bool = False):
     url_key = "display_url" if use_display else "zillow_url"
@@ -1037,7 +1060,8 @@ with tab_run:
           </script>
         </body></html>"""
         est_h = max(120, min(52 * max(1, len(li_html)) + (60 if show_details else 24), 1400))
-        components.html(html, height=est_h, scrolling=False, key="results_copyall_v1")
+        # NOTE: removed key= parameter for compatibility with older Streamlit versions
+        components.html(html, height=est_h, scrolling=False)
 
     def _render_results_and_downloads(results: List[Dict[str, Any]], client_tag: str, campaign_tag: str, include_notes: bool):
         st.markdown("#### Results")
@@ -1178,22 +1202,6 @@ with tab_clients:
     st.subheader("Clients")
     st.caption("Manage active and inactive clients. “test test” is always hidden.")
 
-    # Session state for row edit toggles and delete confirms
-    ss = st.session_state
-    ss.setdefault("__edit_clients__", {})
-    ss.setdefault("__confirm_delete__", None)  # holds {"id":..., "name":...} when active
-
-    def _toggle_edit(cid: int, on: bool):
-        ss["__edit_clients__"][cid] = on
-
-    def _open_confirm(cid: int, name: str):
-        ss["__confirm_delete__"] = {"id": cid, "name": name}
-        _safe_rerun()
-
-    def _close_confirm():
-        ss["__confirm_delete__"] = None
-        _safe_rerun()
-
     all_clients = fetch_clients(include_inactive=True)
     active = [c for c in all_clients if c.get("active")]
     inactive = [c for c in all_clients if not c.get("active")]
@@ -1208,39 +1216,43 @@ with tab_clients:
         else:
             for c in active:
                 cid = c["id"]; cname = c["name"]
-                edit_on = ss["__edit_clients__"].get(cid, False)
-
                 st.markdown("<div class='client-row'>", unsafe_allow_html=True)
-                top_cols = st.columns([0.70, 0.30])
+                top_cols = st.columns([0.80, 0.20])
                 with top_cols[0]:
-                    if edit_on:
-                        st.text_input(" ", value=cname, label_visibility="collapsed", key=f"rn_{cid}")
-                    else:
-                        st.markdown(f"<div class='client-top'><span class='client-name'>{escape(cname)}</span><span class='client-status active'>active</span></div>", unsafe_allow_html=True)
+                    st.markdown(f"<div class='client-top'><span class='client-name'>{escape(cname)}</span><span class='client-status active'>active</span></div>", unsafe_allow_html=True)
                 with top_cols[1]:
-                    st.markdown(f"<div class='action-bar{' editing' if edit_on else ''}'>", unsafe_allow_html=True)
-                    if edit_on:
-                        if st.button("Save", key=f"save_{cid}", help="Save rename", use_container_width=False):
-                            proposed = st.session_state.get(f"rn_{cid}", "").strip()
-                            ok, msg = rename_client(cid, proposed)
-                            if ok:
-                                invalidate_clients_cache(); _toggle_edit(cid, False); _safe_rerun()
-                            else:
-                                st.error(msg)
-                        if st.button("Cancel", key=f"cancel_{cid}", help="Cancel edit", use_container_width=False):
-                            _toggle_edit(cid, False); _safe_rerun()
-                    else:
-                        if st.button("✏︎", key=f"edit_{cid}", help="Rename", use_container_width=False):
-                            _toggle_edit(cid, True)
-                        if st.button("↻", key=f"deact_{cid}", help="Deactivate", use_container_width=False):
-                            ok, msg = toggle_client_active(cid, False)
-                            if ok:
-                                invalidate_clients_cache(); _safe_rerun()
-                            else:
-                                st.error(msg)
-                        if st.button("⌫", key=f"del_{cid}", help="Delete", use_container_width=False):
-                            _open_confirm(cid, cname)
-                    st.markdown("</div>", unsafe_allow_html=True)
+                    # Hover-only HTML icon bar (prompt() rename, toggle, delete)
+                    st.markdown(
+                        f"""
+                        <div class="action-bar" id="ab_{cid}">
+                          <a class="icon-btn" title="Rename" href="javascript:void(0)" onclick="
+                            const newName = prompt('Rename client: {escape(cname)}','{escape(cname)}');
+                            if (newName && newName.trim()) {{
+                              const u = new URL(window.location.href);
+                              u.searchParams.set('act','rename');
+                              u.searchParams.set('id','{cid}');
+                              u.searchParams.set('arg', newName.trim());
+                              window.location.href = u.toString();
+                            }}
+                          ">✏︎</a>
+                          <a class="icon-btn" title="Deactivate" href="javascript:void(0)" onclick="
+                            const u = new URL(window.location.href);
+                            u.searchParams.set('act','toggle');
+                            u.searchParams.set('id','{cid}');
+                            window.location.href = u.toString();
+                          ">↻</a>
+                          <a class="icon-btn danger" title="Delete" href="javascript:void(0)" onclick="
+                            if (confirm('Delete {escape(cname)}? This cannot be undone.')) {{
+                              const u = new URL(window.location.href);
+                              u.searchParams.set('act','delete');
+                              u.searchParams.set('id','{cid}');
+                              window.location.href = u.toString();
+                            }}
+                          ">⌫</a>
+                        </div>
+                        """,
+                        unsafe_allow_html=True
+                    )
                 st.markdown("</div>", unsafe_allow_html=True)
 
     # ---- Inactive list ----
@@ -1251,59 +1263,40 @@ with tab_clients:
         else:
             for c in inactive:
                 cid = c["id"]; cname = c["name"]
-                edit_on = ss["__edit_clients__"].get(cid, False)
-
                 st.markdown("<div class='client-row'>", unsafe_allow_html=True)
-                top_cols = st.columns([0.70, 0.30])
+                top_cols = st.columns([0.80, 0.20])
                 with top_cols[0]:
-                    if edit_on:
-                        st.text_input(" ", value=cname, label_visibility="collapsed", key=f"rn_{cid}")
-                    else:
-                        st.markdown(f"<div class='client-top'><span class='client-name'>{escape(cname)}</span><span class='client-status inactive'>inactive</span></div>", unsafe_allow_html=True)
+                    st.markdown(f"<div class='client-top'><span class='client-name'>{escape(cname)}</span><span class='client-status inactive'>inactive</span></div>", unsafe_allow_html=True)
                 with top_cols[1]:
-                    st.markdown(f"<div class='action-bar{' editing' if edit_on else ''}'>", unsafe_allow_html=True)
-                    if edit_on:
-                        if st.button("Save", key=f"savei_{cid}", help="Save rename", use_container_width=False):
-                            proposed = st.session_state.get(f"rn_{cid}", "").strip()
-                            ok, msg = rename_client(cid, proposed)
-                            if ok:
-                                invalidate_clients_cache(); _toggle_edit(cid, False); _safe_rerun()
-                            else:
-                                st.error(msg)
-                        if st.button("Cancel", key=f"canceli_{cid}", help="Cancel edit", use_container_width=False):
-                            _toggle_edit(cid, False); _safe_rerun()
-                    else:
-                        if st.button("✏︎", key=f"editi_{cid}", help="Rename", use_container_width=False):
-                            _toggle_edit(cid, True)
-                        if st.button("↻", key=f"act_{cid}", help="Activate", use_container_width=False):
-                            ok, msg = toggle_client_active(cid, True)
-                            if ok:
-                                invalidate_clients_cache(); _safe_rerun()
-                            else:
-                                st.error(msg)
-                        if st.button("⌫", key=f"deli_{cid}", help="Delete", use_container_width=False):
-                            _open_confirm(cid, cname)
-                    st.markdown("</div>", unsafe_allow_html=True)
+                    st.markdown(
+                        f"""
+                        <div class="action-bar" id="abi_{cid}">
+                          <a class="icon-btn" title="Rename" href="javascript:void(0)" onclick="
+                            const newName = prompt('Rename client: {escape(cname)}','{escape(cname)}');
+                            if (newName && newName.trim()) {{
+                              const u = new URL(window.location.href);
+                              u.searchParams.set('act','rename');
+                              u.searchParams.set('id','{cid}');
+                              u.searchParams.set('arg', newName.trim());
+                              window.location.href = u.toString();
+                            }}
+                          ">✏︎</a>
+                          <a class="icon-btn" title="Activate" href="javascript:void(0)" onclick="
+                            const u = new URL(window.location.href);
+                            u.searchParams.set('act','toggle');
+                            u.searchParams.set('id','{cid}');
+                            window.location.href = u.toString();
+                          ">↻</a>
+                          <a class="icon-btn danger" title="Delete" href="javascript:void(0)" onclick="
+                            if (confirm('Delete {escape(cname)}? This cannot be undone.')) {{
+                              const u = new URL(window.location.href);
+                              u.searchParams.set('act','delete');
+                              u.searchParams.set('id','{cid}');
+                              window.location.href = u.toString();
+                            }}
+                          ">⌫</a>
+                        </div>
+                        """,
+                        unsafe_allow_html=True
+                    )
                 st.markdown("</div>", unsafe_allow_html=True)
-
-    # ---- Delete confirmation dialog (inline card, works everywhere) ----
-    confirm = ss.get("__confirm_delete__")
-    if confirm:
-        st.markdown("<div class='dialog-card'>", unsafe_allow_html=True)
-        st.markdown(f"### Delete client\nAre you sure you want to delete **{escape(confirm['name'])}**? This cannot be undone.", unsafe_allow_html=True)
-        cA, cB = st.columns(2)
-        with cA:
-            if st.button("Cancel", key="cancel_del", use_container_width=True):
-                _close_confirm()
-        with cB:
-            if st.button("Delete", key="confirm_del", use_container_width=True):
-                ok, msg = delete_client(confirm["id"])
-                if ok:
-                    st.success("Client deleted.")
-                    ss["__confirm_delete__"] = None
-                    invalidate_clients_cache()
-                    _safe_rerun()
-                else:
-                    st.error(msg)
-                    _close_confirm()
-        st.markdown("</div>", unsafe_allow_html=True)
