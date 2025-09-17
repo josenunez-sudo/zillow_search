@@ -1,6 +1,6 @@
 # Address Alchemist — paste addresses AND arbitrary listing links → Zillow
-# Adds: Supabase logging, "already sent" dedupe by client, clearer details (badges + table),
-# and auto-upgrade of search/_rb URLs to real /homedetails/ for enrichment.
+# Adds: Supabase logging, "already sent" dedupe by client (always hide sent),
+# clearer details (badges + table), and auto-upgrade of search/_rb URLs to /homedetails/.
 
 import os, csv, io, re, time, json, asyncio
 from datetime import datetime
@@ -786,7 +786,7 @@ st.markdown("**Paste addresses or links** (one per line) _and/or_ **drop a CSV**
 paste = st.text_area(
     label="Paste addresses or links",
     label_visibility="collapsed",
-    placeholder="123 Main Street, Raleigh, NC 27577\nhttps://l.hms.pt/403/340/10121588/74461375/1091612/B5\n"
+    placeholder="407 E Woodall St, Smithfield, NC 27577\nhttps://l.hms.pt/403/340/10121588/74461375/1091612/B5\n123 US-301 S, Four Oaks, NC 27524",
     height=160,
     key="input_paste"
 )
@@ -813,11 +813,11 @@ with c2:
 with c3:
     show_details = st.checkbox("Show details under results", value=False)
 
-dupe_col1, dupe_col2 = st.columns([1,1])
-with dupe_col1:
-    show_only_new = st.checkbox("Show only new (hide already sent)", value=False)
-with dupe_col2:
-    skip_logging_duplicates = st.checkbox("Skip logging duplicates", value=True, help="Prevents re-inserting the same listing for this client.")
+# Keep only the "skip logging duplicates" choice (no 'show only new' box)
+skip_logging_duplicates = st.checkbox(
+    "Skip logging duplicates", value=True,
+    help="Prevents re-inserting the same listing for this client."
+)
 
 # toggles
 log_to_supabase = st.checkbox(
@@ -883,11 +883,8 @@ def results_list_with_copy_all(results: List[Dict[str, Any]]):
         link = (r.get("display_url") or r.get("zillow_url") or "").strip()
         if not link: continue
         safe_url = escape(link)
-        badge_html = ""
-        if r.get("already_sent") is True:
-            badge_html = " <span class='badge dup'>Already sent</span>"
-        elif r.get("already_sent") is False:
-            badge_html = " <span class='badge new'>New</span>"
+        # badges won't show 'dup' since we filter them out, but keeping structure is fine
+        badge_html = " <span class='badge new'>New</span>"
         detail_html = ""
         if show_details:
             status = r.get("status") or "-"
@@ -917,7 +914,7 @@ def results_list_with_copy_all(results: List[Dict[str, Any]]):
           position:absolute; top:0; right:8px; z-index:5; padding:8px 12px; height:36px;
           border:0; border-radius:12px; color:#fff; font-weight:700; letter-spacing:.02em;
           background:linear-gradient(180deg, var(--blue1) 0%, var(--blue2) 100%);
-          box-shadow:0 8px 24px rgba(37,99,235,.35), 0 2px 6px rgba(0,0,0,.12);
+          box-shadow: 0 8px 24px rgba(37,99,235,.35), 0 2px 6px rgba(0,0,0,.12);
           cursor:pointer; opacity:0; transform:translateY(-2px);
           transition:opacity .18s ease, box-shadow .2s ease, filter .2s ease, transform .06s ease;
         }}
@@ -965,8 +962,10 @@ def _render_results_and_downloads(results: List[Dict[str, Any]], client_tag: str
     # Optional table view
     if st.session_state.get("table_view", True):
         import pandas as pd
-        
-        cols = ["already_sent","display_url","zillow_url","status","price","beds","baths","sqft","mls_id","input_address"]
+        cols = [
+            "already_sent",  # first column (will be False for all since we filter sent out)
+            "display_url","zillow_url","status","price","beds","baths","sqft","mls_id","input_address"
+        ]
         df = pd.DataFrame([{c: r.get(c) for c in cols} for r in results])
         st.dataframe(df, use_container_width=True, hide_index=True)
 
@@ -1067,18 +1066,17 @@ if clicked:
             else:
                 r["display_url"] = display or base
 
-
+        # Mark duplicates for this client
         sent_canon, sent_zpids = get_already_sent_sets(client_tag)
         results = mark_duplicates(results, sent_canon, sent_zpids)
 
-        # Always exclude listings that were already sent
+        # Always filter to ONLY new items; hide entire Results if none
         results = [r for r in results if not r.get("already_sent")]
+        if not results:
+            st.info("No new listings for this client — everything in your input has already been sent.")
+            st.stop()
 
-        # Optionally filter UI to only show new rows
-        if show_only_new:
-            results = [r for r in results if not r.get("already_sent")]
-
-        # Optional: persist to Supabase (respect skip dupes)
+        # Optional: persist to Supabase (respect skip dupes — though results are already new)
         to_log = results if not skip_logging_duplicates else [r for r in results if not r.get("already_sent")]
         if log_to_supabase and to_log:
             ok_log, info_log = log_sent_rows(to_log, client_tag, campaign_tag)
