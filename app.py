@@ -5,6 +5,8 @@
 # - Hover tooltips in Clients tab action buttons
 # - Theme-safe client name visibility in dark mode
 # - Regex strings fixed to avoid SyntaxError (double-quoted raw strings where needed)
+# - Links block ABOVE the results table
+# - Images section uses the ADDRESS as the hyperlink text instead of "Open Zillow"
 
 import os, csv, io, re, time, json, asyncio
 from datetime import datetime
@@ -1149,14 +1151,21 @@ with tab_run:
         est_h = max(120, min(52 * max(1, len(li_html)) + (60 if show_details else 24), 1400))
         components.html(html, height=est_h, scrolling=False)
 
+    # ---------- RENDER: links ABOVE table ----------
     def _render_results_and_downloads(results: List[Dict[str, Any]], client_tag: str, campaign_tag: str, include_notes: bool, client_selected: bool):
         st.markdown("#### Results")
+
+        # 1) LINKS FIRST
+        results_list_with_copy_all(results, client_selected=client_selected)
+
+        # 2) TABLE SECOND (optional)
         if table_view:
             import pandas as pd
             cols = ["already_sent","dup_reason","dup_sent_at","display_url","zillow_url","status","price","beds","baths","sqft","mls_id","input_address"]
             df = pd.DataFrame([{c: r.get(c) for c in cols} for r in results])
             st.dataframe(df, use_container_width=True, hide_index=True)
-        results_list_with_copy_all(results, client_selected=client_selected)
+
+        # 3) Download controls
         fmt_options = ["txt","csv","md","html"]
         prev_fmt = (st.session_state.get("__results__") or {}).get("fmt")
         default_idx = fmt_options.index(prev_fmt) if prev_fmt in fmt_options else 0
@@ -1167,7 +1176,7 @@ with tab_run:
         st.download_button("Export", data=payload, file_name=f"address_alchemist{tag}_{ts}.{fmt}", mime=mime, use_container_width=True)
         st.session_state["__results__"] = {"results": results, "fmt": fmt}
 
-        # Thumbnails
+        # 4) Thumbnails — link TEXT is the ADDRESS
         thumbs=[]
         for r in results:
             img = r.get("image_url")
@@ -1181,10 +1190,15 @@ with tab_run:
                 with cols[i%3]:
                     st.image(img, use_container_width=True)
                     mls_id = (r.get("mls_id") or "").strip()
-                    addr = (r.get("input_address") or "Listing").strip()
+                    addr = (r.get("input_address") or "").strip()
                     url = r.get("display_url") or r.get("zillow_url") or "#"
-                    label = " — ".join([x for x in [f"<strong>MLS#: {escape(mls_id)}</strong>" if mls_id else "", escape(addr) if addr else ""] if x])
-                    st.markdown(f"<div class='img-label'>{label}<br/><a href='{escape(url)}' target='_blank' rel='noopener'>Open Zillow</a></div>", unsafe_allow_html=True)
+                    # Label shows MLS only (if present); the clickable text is the ADDRESS
+                    mls_html = f"<strong>MLS#: {escape(mls_id)}</strong>" if mls_id else ""
+                    link_text = escape(addr) if addr else "View listing"
+                    st.markdown(
+                        f"<div class='img-label'>{mls_html}<br/><a href='{escape(url)}' target='_blank' rel='noopener'>{link_text}</a></div>",
+                        unsafe_allow_html=True
+                    )
 
     # ---------- Run pipeline ----------
     if clicked:
