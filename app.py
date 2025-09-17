@@ -141,6 +141,57 @@ html[data-theme="dark"], .stApp [data-theme="dark"] {
 </style>
 """, unsafe_allow_html=True)
 
+# ====== NEW THEME-SAFE OVERRIDES (fix dark client names) ======
+st.markdown("""
+<style>
+/* Strong, theme-safe text tokens */
+:root {
+  --aa-text-strong: #0b1220;
+  --aa-text-muted:  #475569;
+  --aa-chip-active-bg:  #dcfce7; --aa-chip-active-fg:#166534;
+  --aa-chip-inactive-bg:#fee2e2; --aa-chip-inactive-fg:#991b1b;
+}
+
+/* Dark mode overrides (handle both data-theme and OS preference) */
+html[data-theme="dark"], .stApp [data-theme="dark"] {
+  --aa-text-strong: #f8fafc;
+  --aa-text-muted:  #cbd5e1;
+  --aa-chip-active-bg:  #064e3b; --aa-chip-active-fg:#a7f3d0;
+  --aa-chip-inactive-bg:#7f1d1d; --aa-chip-inactive-fg:#fecaca;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --aa-text-strong: #f8fafc;
+    --aa-text-muted:  #cbd5e1;
+  }
+}
+
+/* Apply to client rows explicitly, with !important to beat base styles */
+.client-name {
+  color: var(--aa-text-strong) !important;
+  font-weight: 700;
+  letter-spacing: .1px;
+  line-height: 1.35;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+
+.client-status {
+  color: var(--aa-text-strong) !important;
+  background: #e2e8f0;
+}
+.client-status.active   { background: var(--aa-chip-active-bg) !important;   color: var(--aa-chip-active-fg) !important; }
+.client-status.inactive { background: var(--aa-chip-inactive-bg) !important; color: var(--aa-chip-inactive-fg) !important; }
+
+/* Optional: make the whole row text readable too */
+.client-row { color: var(--aa-text-strong) !important; }
+
+/* Keep action buttons subtle but legible on hover */
+.icon-btn { color:#7c8aa3; }
+.icon-btn:hover { color: var(--aa-text-strong) !important; }
+</style>
+""", unsafe_allow_html=True)
+# ====== /NEW THEME-SAFE OVERRIDES ======
+
 # ---------- Debug toggle ----------
 def _get_debug_mode() -> bool:
     try:
