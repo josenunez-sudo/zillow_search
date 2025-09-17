@@ -1,8 +1,7 @@
 # Address Alchemist — paste addresses AND arbitrary listing links → Zillow
-# Adds: Clients tab with sleek icon actions (✏️ rename, 🔁 toggle, 🗑️ delete w/ confirm),
-# action buttons emphasize on row hover, delete confirmation dialog,
-# client dropdown (active only, excludes "test test") + "➕ Add new client…" inline,
-# per-client dedupe (show only NEW), enrichment, Bitly, Azure/Bing.
+# Adds: Clients tab with minimalist icon actions (✏︎ rename, ↻ toggle, ⌫ delete w/ confirm),
+# actions hidden until row hover, generous spacing, client dropdown next to campaign,
+# per-client dedupe (only NEW), enrichment, Bitly, Azure/Bing.
 
 import os, csv, io, re, time, json, asyncio
 from datetime import datetime
@@ -31,7 +30,7 @@ def _safe_rerun():
         st.rerun()
     except Exception:
         try:
-            st.experimental_rerun()  # pragma: no cover (older Streamlit)
+            st.experimental_rerun()  # for older Streamlit
         except Exception:
             pass
 
@@ -51,7 +50,7 @@ def get_supabase() -> Optional[Client]:
 
 SUPABASE = get_supabase()
 
-# ---------- Page & styles ----------
+# ---------- Page & global styles ----------
 def _page_icon_from_avif(path: str):
     if not os.path.exists(path):
         return "⚗️"
@@ -85,26 +84,84 @@ textarea:focus { outline:3px solid #93c5fd !important; outline-offset:2px; }
 .hl { display:inline-block; background:#f1f5f9; border-radius:8px; padding:2px 6px; margin-right:6px; font-size:12px; }
 .badge { display:inline-block; font-size:12px; font-weight:700; padding:2px 8px; border-radius:999px; margin-left:8px; background:#dcfce7; color:#166534; }
 
-.client-row { border-bottom:1px solid #e5e7eb; padding:10px 0; }
-.client-top { display:flex; align-items:center; justify-content:space-between; gap:8px; }
-.client-name { font-weight:600; }
-.client-status { font-size:12px; padding:2px 8px; border-radius:999px; background:#e2e8f0; color:#0f172a; }
-.client-status.active { background:#dcfce7; color:#166534; }
+/* minimalist clients list */
+.client-row {
+  border-bottom: 1px solid #f1f5f9;
+  padding: 18px 0;                 /* generous top/bottom spacing */
+  position: relative;
+}
+.client-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+.client-name {
+  font-weight: 600;
+  color: #0f172a;
+  letter-spacing: 0.1px;
+  line-height: 1.35;
+  padding: 4px 0;
+}
+.client-status {
+  font-size: 12px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: #e2e8f0;
+  color: #0f172a;
+}
+.client-status.active   { background:#dcfce7; color:#166534; }
 .client-status.inactive { background:#fee2e2; color:#991b1b; }
 
-.action-bar { display:flex; gap:6px; opacity:.38; transition:opacity .15s ease; }
-.client-row:hover .action-bar { opacity:1; }
-.icon-btn { border:1px solid #e5e7eb; background:#fff; padding:6px 8px; border-radius:10px; font-size:13px; }
-.icon-btn:hover { background:#f8fafc; }
-.icon-btn.danger { border-color:#fecaca; }
-.icon-btn.danger:hover { background:#fef2f2; }
+/* action bar hidden by default, visible on row hover or when editing */
+.action-bar {
+  display: inline-flex;
+  gap: 4px;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity .12s ease;
+}
+.client-row:hover .action-bar {
+  opacity: 1;
+  pointer-events: auto;
+}
+.action-bar.editing { opacity: 1; pointer-events: auto; }
 
-.dialog-card { border:1px solid #e5e7eb; border-radius:12px; padding:16px; background:#fff; }
-.dialog-actions { display:flex; gap:8px; justify-content:flex-end; margin-top:12px; }
-.btn { padding:8px 12px; border-radius:10px; border:1px solid #e5e7eb; background:#fff; }
+/* tiny, low-contrast icon buttons (✏︎, ↻, ⌫) */
+.icon-btn {
+  border: 0;
+  background: transparent;
+  padding: 2px 6px;
+  border-radius: 8px;
+  font-size: 12px;
+  color: #64748b;                 /* muted */
+}
+.icon-btn:hover {
+  background: #f8fafc;            /* faint hover */
+  color: #0f172a;
+}
+.icon-btn.danger:hover {
+  background: #fef2f2;            /* faint red hover */
+  color: #991b1b;
+}
+
+/* compact dialog */
+.dialog-card {
+  border: 1px solid #e5e7eb;
+  border-radius: 12px;
+  padding: 14px;
+  background: #fff;
+}
+.dialog-actions {
+  display: flex;
+  gap: 8px;
+  justify-content: flex-end;
+  margin-top: 10px;
+}
+.btn { padding: 8px 12px; border-radius: 10px; border: 1px solid #e5e7eb; background: #fff; }
 .btn.primary { background:#1d4ed8; color:#fff; border-color:#1d4ed8; }
-.btn.danger { background:#dc2626; color:#fff; border-color:#dc2626; }
-.btn:hover { filter:brightness(1.05); }
+.btn.danger  { background:#dc2626; color:#fff; border-color:#dc2626; }
+.btn:hover   { filter: brightness(1.05); }
 </style>
 """, unsafe_allow_html=True)
 
@@ -837,7 +894,7 @@ with tab_run:
         sel_idx = st.selectbox("Client", list(range(len(options))), format_func=lambda i: options[i], index=idx_default if idx_default is not None else 0)
         selected_client = None if sel_idx is None else (None if options[sel_idx] == ADD_SENTINEL else active_clients[sel_idx])
 
-        # Inline add (only thing allowed here)
+        # Inline add (allowed here)
         if sel_idx is not None and options[sel_idx] == ADD_SENTINEL:
             new_cli = st.text_input("New client name", key="__add_client_name__")
             if st.button("Add client", use_container_width=True, key="__add_client_btn__"):
@@ -1157,38 +1214,31 @@ with tab_clients:
                 top_cols = st.columns([0.70, 0.30])
                 with top_cols[0]:
                     if edit_on:
-                        new_name = st.text_input(" ", value=cname, label_visibility="collapsed", key=f"rn_{cid}")
+                        st.text_input(" ", value=cname, label_visibility="collapsed", key=f"rn_{cid}")
                     else:
                         st.markdown(f"<div class='client-top'><span class='client-name'>{escape(cname)}</span><span class='client-status active'>active</span></div>", unsafe_allow_html=True)
                 with top_cols[1]:
-                    # Action bar (sleek icons)
-                    st.markdown("<div class='action-bar'>", unsafe_allow_html=True)
+                    st.markdown(f"<div class='action-bar{' editing' if edit_on else ''}'>", unsafe_allow_html=True)
                     if edit_on:
-                        if st.button("💾 Save", key=f"save_{cid}", help="Save rename", use_container_width=False):
+                        if st.button("Save", key=f"save_{cid}", help="Save rename", use_container_width=False):
                             proposed = st.session_state.get(f"rn_{cid}", "").strip()
                             ok, msg = rename_client(cid, proposed)
                             if ok:
-                                st.success("Renamed")
-                                invalidate_clients_cache()
-                                _toggle_edit(cid, False)
-                                _safe_rerun()
+                                invalidate_clients_cache(); _toggle_edit(cid, False); _safe_rerun()
                             else:
                                 st.error(msg)
-                        if st.button("↩️ Cancel", key=f"cancel_{cid}", help="Cancel edit", use_container_width=False):
-                            _toggle_edit(cid, False)
-                            _safe_rerun()
+                        if st.button("Cancel", key=f"cancel_{cid}", help="Cancel edit", use_container_width=False):
+                            _toggle_edit(cid, False); _safe_rerun()
                     else:
-                        if st.button("✏️", key=f"edit_{cid}", help="Rename", use_container_width=False):
+                        if st.button("✏︎", key=f"edit_{cid}", help="Rename", use_container_width=False):
                             _toggle_edit(cid, True)
-                        if st.button("🔁", key=f"deact_{cid}", help="Deactivate", use_container_width=False):
+                        if st.button("↻", key=f"deact_{cid}", help="Deactivate", use_container_width=False):
                             ok, msg = toggle_client_active(cid, False)
                             if ok:
-                                st.success("Deactivated")
-                                invalidate_clients_cache()
-                                _safe_rerun()
+                                invalidate_clients_cache(); _safe_rerun()
                             else:
                                 st.error(msg)
-                        if st.button("🗑️", key=f"del_{cid}", help="Delete", use_container_width=False):
+                        if st.button("⌫", key=f"del_{cid}", help="Delete", use_container_width=False):
                             _open_confirm(cid, cname)
                     st.markdown("</div>", unsafe_allow_html=True)
                 st.markdown("</div>", unsafe_allow_html=True)
@@ -1207,49 +1257,41 @@ with tab_clients:
                 top_cols = st.columns([0.70, 0.30])
                 with top_cols[0]:
                     if edit_on:
-                        new_name = st.text_input(" ", value=cname, label_visibility="collapsed", key=f"rn_{cid}")
+                        st.text_input(" ", value=cname, label_visibility="collapsed", key=f"rn_{cid}")
                     else:
                         st.markdown(f"<div class='client-top'><span class='client-name'>{escape(cname)}</span><span class='client-status inactive'>inactive</span></div>", unsafe_allow_html=True)
                 with top_cols[1]:
-                    st.markdown("<div class='action-bar'>", unsafe_allow_html=True)
+                    st.markdown(f"<div class='action-bar{' editing' if edit_on else ''}'>", unsafe_allow_html=True)
                     if edit_on:
-                        if st.button("💾 Save", key=f"savei_{cid}", help="Save rename", use_container_width=False):
+                        if st.button("Save", key=f"savei_{cid}", help="Save rename", use_container_width=False):
                             proposed = st.session_state.get(f"rn_{cid}", "").strip()
                             ok, msg = rename_client(cid, proposed)
                             if ok:
-                                st.success("Renamed")
-                                invalidate_clients_cache()
-                                _toggle_edit(cid, False)
-                                _safe_rerun()
+                                invalidate_clients_cache(); _toggle_edit(cid, False); _safe_rerun()
                             else:
                                 st.error(msg)
-                        if st.button("↩️ Cancel", key=f"canceli_{cid}", help="Cancel edit", use_container_width=False):
-                            _toggle_edit(cid, False)
-                            _safe_rerun()
+                        if st.button("Cancel", key=f"canceli_{cid}", help="Cancel edit", use_container_width=False):
+                            _toggle_edit(cid, False); _safe_rerun()
                     else:
-                        if st.button("✏️", key=f"editi_{cid}", help="Rename", use_container_width=False):
+                        if st.button("✏︎", key=f"editi_{cid}", help="Rename", use_container_width=False):
                             _toggle_edit(cid, True)
-                        if st.button("🔁", key=f"act_{cid}", help="Activate", use_container_width=False):
+                        if st.button("↻", key=f"act_{cid}", help="Activate", use_container_width=False):
                             ok, msg = toggle_client_active(cid, True)
                             if ok:
-                                st.success("Activated")
-                                invalidate_clients_cache()
-                                _safe_rerun()
+                                invalidate_clients_cache(); _safe_rerun()
                             else:
                                 st.error(msg)
-                        if st.button("🗑️", key=f"deli_{cid}", help="Delete", use_container_width=False):
+                        if st.button("⌫", key=f"deli_{cid}", help="Delete", use_container_width=False):
                             _open_confirm(cid, cname)
                     st.markdown("</div>", unsafe_allow_html=True)
                 st.markdown("</div>", unsafe_allow_html=True)
 
-    # ---- Delete confirmation dialog (portable) ----
+    # ---- Delete confirmation dialog (inline card, works everywhere) ----
     confirm = ss.get("__confirm_delete__")
     if confirm:
-        # If your Streamlit supports st.dialog, you can swap this card into a dialog:
-        # with st.dialog("Confirm delete"):
         st.markdown("<div class='dialog-card'>", unsafe_allow_html=True)
         st.markdown(f"### Delete client\nAre you sure you want to delete **{escape(confirm['name'])}**? This cannot be undone.", unsafe_allow_html=True)
-        cA, cB = st.columns([1, 1])
+        cA, cB = st.columns(2)
         with cA:
             if st.button("Cancel", key="cancel_del", use_container_width=True):
                 _close_confirm()
