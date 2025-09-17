@@ -1,6 +1,6 @@
 # Address Alchemist — paste addresses AND arbitrary listing links → Zillow
 # Adds: Supabase logging, "already sent" dedupe by client (always hide sent),
-# clearer details (badges + table), and auto-upgrade of search/_rb URLs to /homedetails/.
+# clearer details (badges + table), tag normalization, and auto-upgrade of search/_rb URLs to /homedetails/.
 
 import os, csv, io, re, time, json, asyncio
 from datetime import datetime
@@ -720,7 +720,7 @@ def _supabase_available():
 
 @st.cache_data(ttl=300, show_spinner=False)
 def get_already_sent_sets(client_tag: str):
-    """Return (canonicals_set, zpids_set) previously sent for this client."""
+    """Return (canonicals_set, zpids_set) previously sent for this normalized client tag."""
     if not (_supabase_available() and client_tag.strip()):
         return set(), set()
     try:
@@ -802,9 +802,9 @@ file = st.file_uploader("Upload CSV", type=["csv"], label_visibility="collapsed"
 
 t1, t2 = st.columns(2)
 with t1:
-    client_tag = st.text_input("Client tag (for tracking)", value="")
+    client_tag_raw = st.text_input("Client tag (for tracking)", value="")
 with t2:
-    campaign_tag = st.text_input("Campaign tag", value=datetime.utcnow().strftime("%Y%m%d"))
+    campaign_tag_raw = st.text_input("Campaign tag", value=datetime.utcnow().strftime("%Y%m%d"))
 c1, c2, c3 = st.columns([1,1,1.2])
 with c1:
     use_shortlinks = st.checkbox("Use short links (Bitly)", value=False, help="Requires BITLY_TOKEN in secrets")
@@ -813,13 +813,18 @@ with c2:
 with c3:
     show_details = st.checkbox("Show details under results", value=False)
 
-# Keep only the "skip logging duplicates" choice (no 'show only new' box)
+# --- Normalize tags so casing/spacing doesn't matter ---
+def _norm_tag(s: str) -> str:
+    return re.sub(r"\s+", " ", (s or "").strip()).lower()
+
+client_tag = _norm_tag(client_tag_raw)
+campaign_tag = _norm_tag(campaign_tag_raw)
+
+# toggles
 skip_logging_duplicates = st.checkbox(
     "Skip logging duplicates", value=True,
     help="Prevents re-inserting the same listing for this client."
 )
-
-# toggles
 log_to_supabase = st.checkbox(
     "Log results to Supabase (table: public.sent)",
     value=bool(SUPABASE),
@@ -883,7 +888,6 @@ def results_list_with_copy_all(results: List[Dict[str, Any]]):
         link = (r.get("display_url") or r.get("zillow_url") or "").strip()
         if not link: continue
         safe_url = escape(link)
-        # badges won't show 'dup' since we filter them out, but keeping structure is fine
         badge_html = " <span class='badge new'>New</span>"
         detail_html = ""
         if show_details:
@@ -901,7 +905,7 @@ def results_list_with_copy_all(results: List[Dict[str, Any]]):
                 hlt = " ".join([f"<span class='hl'>{escape(h)}</span>" for h in (r.get("highlights") or [])])
                 detail_html += f"<div class='detail'>{escape(r.get('summary') or '')} {hlt}</div>"
         li_html.append(f'<li><a href="{safe_url}" target="_blank" rel="noopener">{safe_url}</a>{badge_html}{detail_html}</li>')
-    items_html = "\n".join(li_html) if li_html else "<li>(no results)</li>"
+    items_html = "\n"."join(li_html) if li_html else "<li>(no results)</li>"
     html = f"""
     <html><head><meta charset="utf-8" />
       <style>
@@ -963,7 +967,7 @@ def _render_results_and_downloads(results: List[Dict[str, Any]], client_tag: str
     if st.session_state.get("table_view", True):
         import pandas as pd
         cols = [
-            "already_sent",  # first column (will be False for all since we filter sent out)
+            "already_sent",  # first column (False for all shown, since sent were filtered out)
             "display_url","zillow_url","status","price","beds","baths","sqft","mls_id","input_address"
         ]
         df = pd.DataFrame([{c: r.get(c) for c in cols} for r in results])
@@ -1066,7 +1070,7 @@ if clicked:
             else:
                 r["display_url"] = display or base
 
-        # Mark duplicates for this client
+        # Mark duplicates for this normalized client
         sent_canon, sent_zpids = get_already_sent_sets(client_tag)
         results = mark_duplicates(results, sent_canon, sent_zpids)
 
@@ -1076,7 +1080,7 @@ if clicked:
             st.info("No new listings for this client — everything in your input has already been sent.")
             st.stop()
 
-        # Optional: persist to Supabase (respect skip dupes — though results are already new)
+        # Optional: persist to Supabase (results are already new; skip dupes toggle harmless)
         to_log = results if not skip_logging_duplicates else [r for r in results if not r.get("already_sent")]
         if log_to_supabase and to_log:
             ok_log, info_log = log_sent_rows(to_log, client_tag, campaign_tag)
