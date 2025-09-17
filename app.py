@@ -1,12 +1,6 @@
 # Address Alchemist — paste addresses AND arbitrary listing links → Zillow
-# Includes:
-# - "No client (show ALL, no logging)" first option in Client dropdown
-# - Per-row duplicate feedback (badge + tooltip + table columns) when a client is selected
-# - Hover tooltips in Clients tab action buttons
-# - Theme-safe client name visibility in dark mode
-# - Regex strings fixed to avoid SyntaxError (double-quoted raw strings where needed)
-# - Links block ABOVE the results table
-# - Images section uses the ADDRESS as the hyperlink text instead of "Open Zillow"
+# Preview-first sharing + optional tracking + always log sent_at
+# See feature list in the message above.
 
 import os, csv, io, re, time, json, asyncio
 from datetime import datetime
@@ -307,6 +301,17 @@ def canonicalize_zillow(url: str) -> Tuple[str, Optional[str]]:
     canon = m_full.group(1) if m_full else base
     m_z = ZPID_RE.search(url)
     return canon, (m_z.group(1) if m_z else None)
+
+def make_preview_url(url: str) -> str:
+    """
+    Returns the clean, preview-friendly Zillow homedetails URL (no query/fragment).
+    Falls back to input if not a homedetails link.
+    """
+    if not url:
+        return ""
+    base = re.sub(r'[?#].*$', '', url.strip())
+    canon, _ = canonicalize_zillow(base)
+    return canon if "/homedetails/" in canon else base
 
 # Address parsing & variants
 ADDR_PRIMARY = {"full_address","address","property address","property_address","site address","site_address",
@@ -803,7 +808,7 @@ def get_already_sent_maps(client_tag: str):
 
 def mark_duplicates(results, canon_set, zpid_set, canon_info, zpid_info):
     for r in results:
-        url = (r.get("display_url") or r.get("zillow_url") or "").strip()
+        url = (r.get("preview_url") or r.get("zillow_url") or r.get("display_url") or "").strip()
         if not url:
             r["already_sent"] = False; continue
         canon, zpid = canonicalize_zillow(url)
@@ -826,21 +831,24 @@ def log_sent_rows(results: List[Dict[str, Any]], client_tag: str, campaign_tag: 
     if not SUPABASE or not results:
         return False, "Supabase not configured or no results."
     rows = []
+    now_iso = datetime.utcnow().isoformat(timespec="seconds") + "Z"
     for r in results:
-        raw_url = (r.get("display_url") or r.get("zillow_url") or "").strip()
-        if not raw_url: continue
+        raw_url = (r.get("preview_url") or r.get("zillow_url") or r.get("display_url") or "").strip()
+        if not raw_url:
+            continue
         canon = r.get("canonical"); zpid = r.get("zpid")
         if not (canon and zpid):
             canon2, zpid2 = canonicalize_zillow(raw_url)
             canon = canon or canon2; zpid = zpid or zpid2
         rows.append({
-            "client":   (client_tag or "").strip(),
-            "campaign": (campaign_tag or "").strip(),
-            "url":       raw_url,
-            "canonical": canon,
-            "zpid":      zpid,
-            "mls_id":    (r.get("mls_id") or "").strip() or None,
-            "address":   (r.get("input_address") or "").strip() or None,
+            "client":     (client_tag or "").strip(),
+            "campaign":   (campaign_tag or "").strip(),
+            "url":        raw_url,               # log previewable link
+            "canonical":  canon,
+            "zpid":       zpid,
+            "mls_id":     (r.get("mls_id") or "").strip() or None,
+            "address":    (r.get("input_address") or "").strip() or None,
+            "sent_at":    now_iso,               # always set
         })
     if not rows: return False, "No valid rows to log."
     try:
@@ -953,22 +961,36 @@ if act and cid:
 
 # ---------- Output builders ----------
 def build_output(rows: List[Dict[str, Any]], fmt: str, use_display: bool = True, include_notes: bool = False):
-    url_key = "display_url" if use_display else "zillow_url"
+    def pick_url(r):
+        # Always prefer preview URL for sharing/exporting
+        return r.get("preview_url") or r.get("zillow_url") or r.get("display_url") or ""
+
     if fmt == "csv":
-        fields = ["input_address","mls_id",url_key,"status","price","beds","baths","sqft","already_sent","dup_reason","dup_sent_at"]
-        if include_notes: fields += ["summary","highlights","remarks"]
+        fields = ["input_address","mls_id","url","status","price","beds","baths","sqft","already_sent","dup_reason","dup_sent_at"]
+        if include_notes:
+            fields += ["summary","highlights","remarks"]
         s = io.StringIO(); w = csv.DictWriter(s, fieldnames=fields); w.writeheader()
-        for r in rows: w.writerow({k: r.get(k) for k in fields})
+        for r in rows:
+            row = {k: r.get(k) for k in fields if k != "url"}
+            row["url"] = pick_url(r)
+            w.writerow(row)
         return s.getvalue(), "text/csv"
-    if fmt == "md":
-        lines = [f"- {r.get(url_key) or r.get('zillow_url')}" for r in rows if r.get("zillow_url")]
-        return ("\n".join(lines) + "\n"), "text/markdown"
+
     if fmt == "html":
-        items = [f'<li><a href="{escape(r.get(url_key) or r.get("zillow_url"))}" target="_blank" rel="noopener">{escape(r.get(url_key) or r.get("zillow_url"))}</a></li>'
-                 for r in rows if r.get("zillow_url")]
+        items = []
+        for r in rows:
+            u = pick_url(r)
+            if not u: continue
+            items.append(f'<li><a href="{escape(u)}" target="_blank" rel="noopener">{escape(u)}</a></li>')
         return "<ul>\n" + "\n".join(items) + "\n</ul>\n", "text/html"
-    lines = [f"- {r.get(url_key) or r.get('zillow_url')}" for r in rows if r.get("zillow_url")]
-    return ("\n".join(lines) + "\n"), "text/plain"
+
+    # txt / md => bare URLs, one per line (best for unfurling)
+    lines = []
+    for r in rows:
+        u = pick_url(r)
+        if u: lines.append(u)
+    payload = "\n".join(lines) + ("\n" if lines else "")
+    return payload, ("text/markdown" if fmt == "md" else "text/plain")
 
 # ---------- Header ----------
 st.markdown('<h2 class="app-title">Address Alchemist</h2>', unsafe_allow_html=True)
@@ -1009,7 +1031,7 @@ with tab_run:
     # Options
     c1, c2, c3, c4 = st.columns([1,1,1.25,1.45])
     with c1:
-        use_shortlinks = st.checkbox("Use short links (Bitly)", value=False, help="Requires BITLY_TOKEN")
+        use_shortlinks = st.checkbox("Use short links (Bitly)", value=False, help="Optional tracking; sharing uses clean Zillow links.")
     with c2:
         enrich_details = st.checkbox("Enrich details", value=True)
     with c3:
@@ -1083,13 +1105,14 @@ with tab_run:
 
     clicked = st.button("Run", use_container_width=True)
 
-    # Results HTML list with copy-all
+    # Results HTML list with copy-all (ALWAYS preview links for best unfurl)
     def results_list_with_copy_all(results: List[Dict[str, Any]], client_selected: bool):
         li_html = []
         for r in results:
-            link = (r.get("display_url") or r.get("zillow_url") or "").strip()
-            if not link: continue
-            safe_url = escape(link)
+            href = r.get("preview_url") or r.get("zillow_url") or r.get("display_url") or ""
+            if not href: continue
+            safe_href = escape(href)
+
             # Badge logic
             badge_html = ""
             if client_selected:
@@ -1098,6 +1121,7 @@ with tab_run:
                     badge_html = f' <span class="badge dup" title="{tip}">Duplicate</span>'
                 else:
                     badge_html = ' <span class="badge" title="New for this client">New</span>'
+
             detail_html = ""
             if show_details:
                 status = r.get("status") or "-"
@@ -1111,8 +1135,18 @@ with tab_run:
                 if r.get("summary") or r.get("highlights"):
                     hlt = " ".join([f"<span class='hl'>{escape(h)}</span>" for h in (r.get("highlights") or [])])
                     detail_html += f"<div class='detail'>{escape(r.get('summary') or '')} {hlt}</div>"
-            li_html.append(f'<li><a href="{safe_url}" target="_blank" rel="noopener">{safe_url}</a>{badge_html}{detail_html}</li>')
+
+            li_html.append(f'<li><a href="{safe_href}" target="_blank" rel="noopener">{safe_href}</a>{badge_html}{detail_html}</li>')
+
         items_html = "\n".join(li_html) if li_html else "<li>(no results)</li>"
+
+        # Copy payload: bare preview URLs, one per line (best for unfurling)
+        copy_lines = []
+        for r in results:
+            u = r.get("preview_url") or r.get("zillow_url") or r.get("display_url") or ""
+            if u: copy_lines.append(u.strip())
+        copy_text = "\\n".join(copy_lines) + ("\\n" if copy_lines else "")
+
         html = f"""
         <html><head><meta charset="utf-8" />
           <style>
@@ -1125,19 +1159,14 @@ with tab_run:
           </style>
         </head><body>
           <div class="results-wrap">
-            <button id="copyAll" class="copyall-btn" title="Copy all links" aria-label="Copy all links">Copy All</button>
+            <button id="copyAll" class="copyall-btn" title="Copy clean URLs" aria-label="Copy clean URLs">Copy All</button>
             <ul class="link-list" id="resultsList">{items_html}</ul>
           </div>
           <script>
             (function(){{
-              const btn=document.getElementById('copyAll'); const list=document.getElementById('resultsList');
-              function buildBulletedText(){{
-                const anchors=Array.from(list.querySelectorAll('li a'));
-                const lines=anchors.map(a => '- ' + (a.getAttribute('href')||a.textContent||'').trim());
-                return lines.join('\\n') + (lines.length?'\\n':'');
-              }}
+              const btn=document.getElementById('copyAll');
+              const text = "{copy_text}".replaceAll("\\\\n", "\\n");
               btn.addEventListener('click', async () => {{
-                const text=buildBulletedText();
                 try {{
                   await navigator.clipboard.writeText(text);
                   const prev=btn.textContent; btn.textContent='✓ Copied'; setTimeout(()=>{{ btn.textContent=prev; }}, 1000);
@@ -1161,11 +1190,11 @@ with tab_run:
         # 2) TABLE SECOND (optional)
         if table_view:
             import pandas as pd
-            cols = ["already_sent","dup_reason","dup_sent_at","display_url","zillow_url","status","price","beds","baths","sqft","mls_id","input_address"]
+            cols = ["already_sent","dup_reason","dup_sent_at","display_url","zillow_url","preview_url","status","price","beds","baths","sqft","mls_id","input_address"]
             df = pd.DataFrame([{c: r.get(c) for c in cols} for r in results])
             st.dataframe(df, use_container_width=True, hide_index=True)
 
-        # 3) Download controls
+        # 3) Download controls (always preview links)
         fmt_options = ["txt","csv","md","html"]
         prev_fmt = (st.session_state.get("__results__") or {}).get("fmt")
         default_idx = fmt_options.index(prev_fmt) if prev_fmt in fmt_options else 0
@@ -1176,12 +1205,12 @@ with tab_run:
         st.download_button("Export", data=payload, file_name=f"address_alchemist{tag}_{ts}.{fmt}", mime=mime, use_container_width=True)
         st.session_state["__results__"] = {"results": results, "fmt": fmt}
 
-        # 4) Thumbnails — link TEXT is the ADDRESS
+        # 4) Thumbnails — link TEXT is the ADDRESS, HREF is preview link
         thumbs=[]
         for r in results:
             img = r.get("image_url")
             if not img:
-                img, _ = get_thumbnail_and_log(r.get("input_address",""), r.get("display_url") or r.get("zillow_url",""), r.get("csv_photo"))
+                img, _ = get_thumbnail_and_log(r.get("input_address",""), r.get("preview_url") or r.get("zillow_url") or "", r.get("csv_photo"))
             if img: thumbs.append((r,img))
         if thumbs:
             st.markdown("#### Images")
@@ -1191,8 +1220,7 @@ with tab_run:
                     st.image(img, use_container_width=True)
                     mls_id = (r.get("mls_id") or "").strip()
                     addr = (r.get("input_address") or "").strip()
-                    url = r.get("display_url") or r.get("zillow_url") or "#"
-                    # Label shows MLS only (if present); the clickable text is the ADDRESS
+                    url = r.get("preview_url") or r.get("zillow_url") or r.get("display_url") or "#"
                     mls_html = f"<strong>MLS#: {escape(mls_id)}</strong>" if mls_id else ""
                     link_text = escape(addr) if addr else "View listing"
                     st.markdown(
@@ -1256,9 +1284,10 @@ with tab_run:
                 st.write("Enriching details (parallel)…")
                 results = asyncio.run(enrich_results_async(results))
 
-            # Tracking / shortlinks
+            # Tracking OPTIONAL; preview links ALWAYS computed
             for r in results:
                 base = r.get("zillow_url")
+                r["preview_url"] = make_preview_url(base) if base else ""
                 display = make_trackable_url(base, client_tag, campaign_tag) if base else base
                 if use_shortlinks and display:
                     short = bitly_shorten(display)
@@ -1271,17 +1300,12 @@ with tab_run:
             if client_selected:
                 canon_set, zpid_set, canon_info, zpid_info = get_already_sent_maps(client_tag)
                 results = mark_duplicates(results, canon_set, zpid_set, canon_info, zpid_info)
-
-                # Hide duplicates only if user asked
                 if only_show_new:
                     results = [r for r in results if not r.get("already_sent")]
-
-                # Log (log shown rows)
                 if SUPABASE and results:
                     ok_log, info_log = log_sent_rows(results, client_tag, campaign_tag)
                     st.success("Logged to Supabase.") if ok_log else st.warning(f"Supabase log skipped/failed: {info_log}")
             else:
-                # No client mode: never hide anything, never log
                 for r in results:
                     r["already_sent"] = False  # visually neutral
 
