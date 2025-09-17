@@ -905,7 +905,7 @@ def results_list_with_copy_all(results: List[Dict[str, Any]]):
                 hlt = " ".join([f"<span class='hl'>{escape(h)}</span>" for h in (r.get("highlights") or [])])
                 detail_html += f"<div class='detail'>{escape(r.get('summary') or '')} {hlt}</div>"
         li_html.append(f'<li><a href="{safe_url}" target="_blank" rel="noopener">{safe_url}</a>{badge_html}{detail_html}</li>')
-    items_html = "\n"."join(li_html) if li_html else "<li>(no results)</li>"
+    items_html = "\n".join(li_html) if li_html else "<li>(no results)</li>"
     html = f"""
     <html><head><meta charset="utf-8" />
       <style>
