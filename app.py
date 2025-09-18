@@ -255,50 +255,50 @@ def upgrade_to_homedetails_if_needed(url: str) -> str:
 # Content extractors
 def extract_any_mls_id(html: str) -> Optional[str]:
     if not html: return None
-    for pat in [r'"mlsId"\s*:\s*"([A-Za-z0-9\\-]{5,})"',
-                r'"mls"\s*:\s*"([A-Za-z0-9\\-]{5,})"',
-                r'"listingId"\s*:\s*"([A-Za-z0-9\\-]{5,})"']:
+    for pat in [r'"mlsId"\s*:\s*"([A-Za-z0-9\-]{5,})"',
+                r'"mls"\s*:\s*"([A-Za-z0-9\-]{5,})"',
+                r'"listingId"\s*:\s*"([A-Za-z0-9\-]{5,})"']:
         m = re.search(pat, html, re.I)
         if m: return m.group(1)
-    m = re.search(r'\\bMLS[^A-Za-z0-9]{0,5}#?\\s*([A-Za-z0-9\\-]{5,})\\b', html, re.I)
+    m = re.search(r'\bMLS[^A-Za-z0-9]{0,5}#?\s*([A-Za-z0-9\-]{5,})\b', html, re.I)
     return m.group(1) if m else None
 
 def extract_address_from_html(html: str) -> Dict[str, str]:
     out = {"street": "", "city": "", "state": "", "zip": ""}
     if not html: return out
-    m = re.search(r'"streetAddress"\\s*:\\s*"([^"]+)"', html, re.I); out["street"] = m.group(1) if m else ""
-    m = re.search(r'"addressLocality"\\s*:\\s*"([^"]+)"', html, re.I); out["city"] = m.group(1) if m else ""
-    m = re.search(r'"addressRegion"\\s*:\\s*"([A-Za-z]{2})"', html, re.I); out["state"] = m.group(1) if m else ""
-    m = re.search(r'"postalCode"\\s*:\\s*"(\\d{5}(?:-\\d{4})?)"', html, re.I); out["zip"] = m.group(1) if m else ""
+    m = re.search(r'"streetAddress"\s*:\s*"([^"]+)"', html, re.I); out["street"] = m.group(1) if m else ""
+    m = re.search(r'"addressLocality"\s*:\s*"([^"]+)"', html, re.I); out["city"] = m.group(1) if m else ""
+    m = re.search(r'"addressRegion"\s*:\s*"([A-Za-z]{2})"', html, re.I); out["state"] = m.group(1) if m else ""
+    m = re.search(r'"postalCode"\s*:\s*"(\d{5}(?:-\d{4})?)"', html, re.I); out["zip"] = m.group(1) if m else ""
     if not out["street"]:
         for pat in [
-            r"<meta[^>]+property=['\\\"]og:title['\\\"][^>]+content=['\\\"]([^'\\\"]+)['\\\"]",
-            r"<title>\\s*([^<]+?)\\s*</title>",
+            r"<meta[^>]+property=['\"]og:title['\"][^>]+content=['\"]([^'\"]+)['\"]",
+            r"<title>\s*([^<]+?)\s*</title>",
         ]:
             m = re.search(pat, html, re.I)
             if m:
                 title = m.group(1)
-                if re.search(r"\\b[A-Za-z]{2}\\b", title) and re.search(r"\\d{5}", title):
+                if re.search(r"\b[A-Za-z]{2}\b", title) and re.search(r"\d{5}", title):
                     out["street"] = title
                     break
     return out
 
 def extract_title_or_desc(html: str) -> str:
     for pat in [
-        r"<meta[^>]+property=['\\\"]og:title['\\\"][^>]+content=['\\\"]([^'\\\"]+)['\\\"]",
-        r"<title>\\s*([^<]+)</title>",
-        r"<meta[^>]+name=['\\\"]description['\\\"][^>]+content=['\\\"]([^'\\\"]+)['\\\"]",
+        r"<meta[^>]+property=['\"]og:title['\"][^>]+content=['\"]([^'\"]+)['\"]",
+        r"<title>\s*([^<]+)</title>",
+        r"<meta[^>]+name=['\"]description['\"][^>]+content=['\"]([^'\"]+)['\"]",
     ]:
         m = re.search(pat, html, re.I)
-        if m: return re.sub(r'\\s+', ' ', m.group(1)).strip()
+        if m: return re.sub(r'\s+', ' ', m.group(1)).strip()
     return ""
 
 # Zillow canonicalization
-ZPID_RE = re.compile(r'(\\d{6,})_zpid', re.I)
+ZPID_RE = re.compile(r'(\d{6,})_zpid', re.I)
 def canonicalize_zillow(url: str) -> Tuple[str, Optional[str]]:
     if not url: return "", None
     base = re.sub(r'[#?].*$', '', url)
-    m_full = re.search(r'^(https?://[^?#]*/homedetails/[^/]+/\\d{6,}_zpid/)', url, re.I)
+    m_full = re.search(r'^(https?://[^?#]*/homedetails/[^/]+/\d{6,}_zpid/)', url, re.I)
     canon = m_full.group(1) if m_full else base
     m_z = ZPID_RE.search(url)
     return canon, (m_z.group(1) if m_z else None)
@@ -325,7 +325,7 @@ MLS_ID_KEYS   = {"mls","mls id","mls_id","mls #","mls#","mls number","mlsnumber"
 MLS_NAME_KEYS = {"mls name","mls board","mls provider","source","source mls","mls source"}
 PHOTO_KEYS = {"photo","image","photo url","image url","picture","thumbnail","thumb","img","img url","img_url"}
 
-def norm_key(k:str) -> str: return re.sub(r"\\s+"," ", (k or "").strip().lower())
+def norm_key(k:str) -> str: return re.sub(r"\s+"," ", (k or "").strip().lower())
 def get_first_by_keys(row, keys):
     for k in row.keys():
         if norm_key(k) in keys:
@@ -351,21 +351,21 @@ def extract_components(row):
             "mls_id": get_first_by_keys(n, MLS_ID_KEYS), "mls_name": get_first_by_keys(n, MLS_NAME_KEYS)}
 
 LAND_LEAD_TOKENS = {"lot","lt","tract","parcel","blk","block","tbd"}
-HWY_EXPAND = {r"\\bhwy\\b":"highway", r"\\bus\\b":"US"}
+HWY_EXPAND = {r"\bhwy\b":"highway", r"\bus\b":"US"}
 DIR_MAP = {'s':'south','n':'north','e':'east','w':'west'}
-LOT_REGEX = re.compile(r'\\b(?:lot|lt)\\s*[-#:]?\\s*([A-Za-z0-9]+)\\b', re.I)
+LOT_REGEX = re.compile(r'\b(?:lot|lt)\s*[-#:]?\s*([A-Za-z0-9]+)\b', re.I)
 
 def clean_land_street(street:str) -> str:
     if not street: return street
     s = street.strip()
-    s = re.sub(r"^\\s*0[\\s\\-]+", "", s)
-    tokens = re.split(r"[\\s\\-]+", s)
+    s = re.sub(r"^\s*0[\s\-]+", "", s)
+    tokens = re.split(r"[\s\-]+", s)
     if tokens and tokens[0].lower() in LAND_LEAD_TOKENS:
         tokens = tokens[1:]; s = " ".join(tokens)
     s_lower = f" {s.lower()} "
     for pat,repl in HWY_EXPAND.items(): s_lower = re.sub(pat, f" {repl} ", s_lower)
-    s = re.sub(r"\\s+", " ", s_lower).strip()
-    s = re.sub(r"[^\\w\\s/-]", "", s)
+    s = re.sub(r"\s+", " ", s_lower).strip()
+    s = re.sub(r"[^\w\s/-]", "", s)
     return s
 
 def compose_query_address(street, city, state, zipc, defaults):
@@ -385,10 +385,10 @@ def generate_address_variants(street, city, state, zipc, defaults):
     base = (street or "").strip()
     lot_match = LOT_REGEX.search(base); lot_num = lot_match.group(1) if lot_match else None
     core = base
-    core = re.sub(r'\\bu\\.?s\\.?\\b', 'US', core, flags=re.I)
-    core = re.sub(r'\\bhwy\\b', 'highway', core, flags=re.I)
-    core = re.sub(r'\\b([NSEW])\\b', lambda m: DIR_MAP.get(m.group(1).lower(), m.group(1)), core, flags=re.I)
-    variants = {core, re.sub(r'\\bhighway\\b', 'hwy', core, flags=re.I)}
+    core = re.sub(r'\bu\.?s\.?\b', 'US', core, flags=re.I)
+    core = re.sub(r'\bhwy\b', 'highway', core, flags=re.I)
+    core = re.sub(r'\b([NSEW])\b', lambda m: DIR_MAP.get(m.group(1).lower(), m.group(1)), core, flags=re.I)
+    variants = {core, re.sub(r'\bhighway\b', 'hwy', core, flags=re.I)}
     lot_variants = set(variants)
     if lot_num:
         for v in list(variants):
@@ -435,11 +435,11 @@ def bing_search_items(query):
         return []
 
 MLS_HTML_PATTERNS = [
-    lambda mid: rf'\\bMLS[^A-Za-z0-9]{{0,5}}#?\\s*{re.escape(mid)}\\b',
-    lambda mid: rf'\\bMLS\\s*#?\\s*{re.escape(mid)}\\b',
-    lambda mid: rf'"mls"\\s*:\\s*"{re.escape(mid)}"',
-    lambda mid: rf'"mlsId"\\s*:\\s*"{re.escape(mid)}"',
-    lambda mid: rf'"mlsId"\\s*:\\s*{re.escape(mid)}',
+    lambda mid: rf'\bMLS[^A-Za-z0-9]{{0,5}}#?\s*{re.escape(mid)}\b',
+    lambda mid: rf'\bMLS\s*#?\s*{re.escape(mid)}\b',
+    lambda mid: rf'"mls"\s*:\s*"{re.escape(mid)}"',
+    lambda mid: rf'"mlsId"\s*:\s*"{re.escape(mid)}"',
+    lambda mid: rf'"mlsId"\s*:\s*{re.escape(mid)}',
 ]
 def page_contains_mls(html:str, mls_id:str) -> bool:
     for mk in MLS_HTML_PATTERNS:
@@ -449,7 +449,7 @@ def page_contains_mls(html:str, mls_id:str) -> bool:
 def page_contains_city_state(html:str, city:str=None, state:str=None) -> bool:
     ok = False
     if city and re.search(re.escape(city), html, re.I): ok = True
-    if state and re.search(rf'\\b{re.escape(state)}\\b', html, re.I): ok = True
+    if state and re.search(rf'\b{re.escape(state)}\b', html, re.I): ok = True
     return ok
 
 def confirm_or_resolve_on_page(url:str, mls_id:str=None, required_city:str=None, required_state:str=None):
@@ -460,7 +460,7 @@ def confirm_or_resolve_on_page(url:str, mls_id:str=None, required_city:str=None,
         if page_contains_city_state(html, required_city, required_state) and "/homedetails/" in url:
             return url, "city_state_match"
         if url.endswith("_rb/") and "/homedetails/" not in url:
-            cand = re.findall(r'href="(https://www\\.zillow\\.com/homedetails/[^"]+)"', html)[:8]
+            cand = re.findall(r'href="(https://www\.zillow\.com/homedetails/[^"]+)"', html)[:8]
             for u in cand:
                 try:
                     rr = requests.get(u, headers=UA_HEADERS, timeout=REQUEST_TIMEOUT); rr.raise_for_status()
@@ -558,7 +558,7 @@ def construct_deeplink_from_parts(street, city, state, zipc, defaults):
         if slug_parts: slug_parts[-1] = f"{slug_parts[-1]} {z}"
         else: slug_parts.append(z)
     slug = ", ".join(slug_parts)
-    a = slug.lower(); a = re.sub(r"[^\\w\\s,-]", "", a).replace(",", ""); a = re.sub(r"\\s+", "-", a.strip())
+    a = slug.lower(); a = re.sub(r"[^\w\s,-]", "", a).replace(",", ""); a = re.sub(r"\s+", "-", a.strip())
     return f"https://www.zillow.com/homes/{a}_rb/"
 
 # Resolve from arbitrary source URL
@@ -624,22 +624,23 @@ def process_single_row(row, *, delay=0.5, land_mode=True, defaults=None,
     time.sleep(min(delay, 0.4))
     return {"input_address": query_address, "mls_id": mls_id, "zillow_url": zurl, "status": status, "csv_photo": csv_photo}
 
-# Enrichment
-RE_PRICE  = re.compile(r'"(?:price|unformattedPrice|priceZestimate)"\\s*:\\s*"?\\$?([\\d,]+)"?', re.I)
-RE_STATUS = re.compile(r'"(?:homeStatus|statusText)"\\s*:\\s*"([^"]+)"', re.I)
-RE_BEDS   = re.compile(r'"(?:bedrooms|beds)"\\s*:\\s*(\\d+)', re.I)
-RE_BATHS  = re.compile(r'"(?:bathrooms|baths)"\\s*:\\s*([0-9.]+)', re.I)
-RE_SQFT   = re.compile(r'"(?:livingArea|livingAreaValue|area)"\\s*:\\s*([0-9,]+)', re.I)
-RE_DESC   = re.compile(r'"(?:description|homeDescription|marketingDescription)"\\s*:\\s*"([^"]+)"', re.I)
+# Enrichment (FIXED: regex raw strings use single backslashes)
+RE_PRICE  = re.compile(r'"(?:price|unformattedPrice|priceZestimate)"\s*:\s*"?\$?([\d,]+)"?', re.I)
+RE_STATUS = re.compile(r'"(?:homeStatus|statusText)"\s*:\s*"([^"]+)"', re.I)
+RE_BEDS   = re.compile(r'"(?:bedrooms|beds)"\s*:\s*(\d+)', re.I)
+RE_BATHS  = re.compile(r'"(?:bathrooms|baths)"\s*:\s*([0-9.]+)', re.I)
+RE_SQFT   = re.compile(r'"(?:livingArea|livingAreaValue|area)"\s*:\s*([0-9,]+)', re.I)
+RE_DESC   = re.compile(r'"(?:description|homeDescription|marketingDescription)"\s*:\s*"([^"]+)"', re.I)
+
 KEY_HL = [("new roof","roof"),("hvac","hvac"),("ac unit","ac"),("furnace","furnace"),("water heater","water heater"),
           ("renovated","renovated"),("updated","updated"),("remodeled","remodeled"),("open floor plan","open plan"),
           ("cul-de-sac","cul-de-sac"),("pool","pool"),("fenced","fenced"),("acre","acre"),("hoa","hoa"),
           ("primary on main","primary on main"),("finished basement","finished basement")]
-def _tidy_txt(s: str) -> str: return re.sub(r'\\s+', ' ', (s or '')).strip()
+def _tidy_txt(s: str) -> str: return re.sub(r'\s+', ' ', (s or '')).strip()
 def summarize_remarks(text: str, max_sent: int = 2) -> str:
     text = _tidy_txt(text)
     if not text: return ""
-    sents = re.split(r'(?<=[\\.\\!\\?])\\s+', text)
+    sents = re.split(r'(?<=[\.\!\?])\s+', text)
     if len(sents) <= max_sent: return text
     pref_kw = ["updated","renovated","new","roof","hvac","kitchen","bath","floor","windows","mechanicals","acres","acre","lot","school","zoned","hoa","no hoa"]
     scored = [(sum(1 for k in pref_kw if k in s.lower()), i, s) for i,s in enumerate(sents[:8])]
@@ -661,21 +662,21 @@ def extract_zillow_first_image(html: str) -> Optional[str]:
     if not html: return None
     for target_w in ("960","1152","768","1536"):
         m = re.search(
-            rf"<img[^>]+src=['\\\"](https://photos\\.zillowstatic\\.com/fp/[^'\\\" ]+-cc_ft_{target_w}\\.(?:jpg|webp))['\\\"]",
+            rf"<img[^>]+src=['\"](https://photos\.zillowstatic\.com/fp/[^'\" ]+-cc_ft_{target_w}\.(?:jpg|webp))['\"]",
             html, re.I
         )
         if m: return m.group(1)
-    m = re.search(r"srcset=['\\\"]([^'\\\"]*photos\\.zillowstatic\\.com[^'\\\"]+)['\\\"]", html, re.I)
+    m = re.search(r"srcset=['\"]([^'\"]*photos\.zillowstatic\.com[^'\"]+)['\"]", html, re.I)
     if m:
         cand=[]
         for part in m.group(1).split(","):
-            part=part.strip(); m2=re.match(r"(https://photos\\.zillowstatic\\.com/\\S+)\\s+(\\d+)w", part, re.I)
+            part=part.strip(); m2=re.match(r"(https://photos\.zillowstatic\.com/\S+)\s+(\d+)w", part, re.I)
             if m2: cand.append((int(m2.group(2)), m2.group(1)))
         if cand:
             up=[u for (w,u) in cand if w<=1152]
             return (sorted(((w,u) for (w,u) in cand if w<=1152), key=lambda x:x[0])[-1][1] if up
                     else sorted(cand, key=lambda x:x[0])[-1][1])
-    m = re.search(r"(https://photos\\.zillowstatic\\.com/fp/\\S+-cc_ft_\\d+\\.(?:jpg|webp))", html, re.I)
+    m = re.search(r"(https://photos\.zillowstatic\.com/fp/\S+-cc_ft_\d+\.(?:jpg|webp))", html, re.I)
     return m.group(1) if m else None
 def parse_listing_meta(html: str) -> Dict[str, Any]:
     meta = {}
@@ -687,12 +688,12 @@ def parse_listing_meta(html: str) -> Dict[str, Any]:
     m = RE_SQFT.search(html);    meta["sqft"]   = m.group(1) if m else None
     m = RE_DESC.search(html);    remark = m.group(1) if m else None
     if not remark:
-        m2 = re.search(r"<meta[^>]+name=['\\\"]description['\\\"][^>]+content=['\\\"]([^'\\\"]+)['\\\"]", html, re.I)
+        m2 = re.search(r"<meta[^>]+name=['\"]description['\"][^>]+content=['\"]([^'\"]+)['\"]", html, re.I)
         if m2: remark = m2.group(1)
     meta["remarks"] = remark
     img = extract_zillow_first_image(html)
     if not img:
-        m3 = re.search(r"<meta[^>]+property=['\\\"]og:image['\\\"][^>]+content=['\\\"]([^'\\\"]+)['\\\"]", html, re.I)
+        m3 = re.search(r"<meta[^>]+property=['\"]og:image['\"][^>]+content=['\"]([^'\"]+)['\"]", html, re.I)
         if m3: img = m3.group(1)
     meta["image_url"] = img
     meta["summary"] = summarize_remarks(remark or "")
@@ -728,10 +729,10 @@ def picture_for_result_with_log(query_address: str, zurl: str, csv_photo_url: Op
                 zfirst=extract_zillow_first_image(html)
                 if zfirst: log["stage"]="zillow_hero"; log["selected"]=zfirst; return zfirst, log
                 for pat in [
-                    r"<meta[^>]+property=['\\\"]og:image['\\\"][^>]+content=['\\\"]([^'\\\"]+)['\\\"]",
-                    r"<meta[^>]+property=['\\\"]og:image:secure_url['\\\"][^>]+content=['\\\"]([^'\\\"]+)['\\\"]",
-                    r"\\\"image\\\"\\s*:\\s*\\\"(https?://[^\\\"]+)\\\"",
-                    r"\\\"image\\\"\\s*:\\s*\\[\\s*\\\"(https?://[^\\\"]+)\\\"",
+                    r"<meta[^>]+property=['\"]og:image['\"][^>]+content=['\"]([^'\"]+)['\"]",
+                    r"<meta[^>]+property=['\"]og:image:secure_url['\"][^>]+content=['\"]([^'\"]+)['\"]",
+                    r"\"image\"\s*:\s*\"(https?://[^\"]+)\"",
+                    r"\"image\"\s*:\s*\[\s*\"(https?://[^\"]+)\"",
                 ]:
                     m = re.search(pat, html, re.I)
                     if m: log["stage"]="og_image"; log["selected"]=m.group(1); return m.group(1), log
@@ -756,8 +757,8 @@ def get_thumbnail_and_log(query_address: str, zurl: str, csv_photo_url: Optional
 
 # ---------- Tracking + Bitly ----------
 def make_trackable_url(url: str, client_tag: str, campaign_tag: str) -> str:
-    client_tag = re.sub(r'[^a-z0-9\\-]+','', (client_tag or "").lower().replace(" ","-"))
-    campaign_tag = re.sub(r'[^a-z0-9\\-]+','', (campaign_tag or "").lower().replace(" ","-"))
+    client_tag = re.sub(r'[^a-z0-9\-]+','', (client_tag or "").lower().replace(" ","-"))
+    campaign_tag = re.sub(r'[^a-z0-9\-]+','', (campaign_tag or "").lower().replace(" ","-"))
     frag = f"#aa={client_tag}.{campaign_tag}" if (client_tag or campaign_tag) else ""
     return (url or "") + (frag if url and frag else "")
 
@@ -979,13 +980,13 @@ def build_output(rows: List[Dict[str, Any]], fmt: str, use_display: bool = True,
             u = pick_url(r)
             if not u: continue
             items.append(f'<li><a href="{escape(u)}" target="_blank" rel="noopener">{escape(u)}</a></li>')
-        return "<ul>\\n" + "\\n".join(items) + "\\n</ul>\\n", "text/html"
+        return "<ul>\n" + "\n".join(items) + "\n</ul>\n", "text/html"
 
     lines = []
     for r in rows:
         u = pick_url(r)
         if u: lines.append(u)
-    payload = "\\n".join(lines) + ("\\n" if lines else "")
+    payload = "\n".join(lines) + ("\n" if lines else "")
     return payload, ("text/markdown" if fmt == "md" else "text/plain")
 
 # ---------- Header ----------
@@ -1045,7 +1046,7 @@ with tab_run:
 
     st.markdown('<div class="center-box">', unsafe_allow_html=True)
     st.markdown("**Paste addresses or links** (one per line) _and/or_ **drop a CSV**")
-    paste = st.text_area("Paste addresses or links", placeholder="407 E Woodall St, Smithfield, NC 27577\\nhttps://l.hms.pt/...\\n123 US-301 S, Four Oaks, NC 27524", height=160, label_visibility="collapsed")
+    paste = st.text_area("Paste addresses or links", placeholder="407 E Woodall St, Smithfield, NC 27577\nhttps://l.hms.pt/...\n123 US-301 S, Four Oaks, NC 27524", height=160, label_visibility="collapsed")
     opt1, opt2, opt3 = st.columns([1.15, 1, 1.2])
     with opt1:
         remove_dupes = st.checkbox("Remove duplicates (pasted)", value=True)
@@ -1073,7 +1074,7 @@ with tab_run:
                         " ".join([parts.get(k,"") for k in ["StreetNamePreDirectional","StreetName","StreetNamePostType","OccupancyType","OccupancyIdentifier"]]).strip())
                 cityst = ((", " + parts.get("PlaceName","") + ", " + parts.get("StateName","") +
                            (" " + parts.get("ZipCode","") if parts.get("ZipCode") else "")) if (parts.get("PlaceName") or parts.get("StateName")) else "")
-                lines_clean.append(re.sub(r"\\s+"," ", (norm + cityst).strip()))
+                lines_clean.append(re.sub(r"\s+"," ", (norm + cityst).strip()))
             else:
                 lines_clean.append(ln)
 
@@ -1093,7 +1094,7 @@ with tab_run:
 
     if show_preview and count_pasted:
         st.markdown("**Preview (pasted)** (first 5):")
-        st.markdown("<ul class='link-list'>" + "\\n".join([f"<li>{escape(p)}</li>" for p in lines_clean[:5]]) + ("<li>…</li>" if count_pasted > 5 else "") + "</ul>", unsafe_allow_html=True)
+        st.markdown("<ul class='link-list'>" + "\n".join([f"<li>{escape(p)}</li>" for p in lines_clean[:5]]) + ("<li>…</li>" if count_pasted > 5 else "") + "</ul>", unsafe_allow_html=True)
 
     clicked = st.button("Run", use_container_width=True)
 
@@ -1129,13 +1130,13 @@ with tab_run:
 
             li_html.append(f'<li><a href="{safe_href}" target="_blank" rel="noopener">{safe_href}</a>{badge_html}{detail_html}</li>')
 
-        items_html = "\\n".join(li_html) if li_html else "<li>(no results)</li>"
+        items_html = "\n".join(li_html) if li_html else "<li>(no results)</li>"
 
         copy_lines = []
         for r in results:
             u = r.get("preview_url") or r.get("zillow_url") or r.get("display_url") or ""
             if u: copy_lines.append(u.strip())
-        copy_text = "\\\\n".join(copy_lines) + ("\\\\n" if copy_lines else "")
+        copy_text = "\\n".join(copy_lines) + ("\\n" if copy_lines else "")
 
         html = f"""
         <html><head><meta charset="utf-8" />
@@ -1155,7 +1156,7 @@ with tab_run:
           <script>
             (function(){{
               const btn=document.getElementById('copyAll');
-              const text = "{copy_text}".replaceAll("\\\\n", "\\n");
+              const text = "{copy_text}".replaceAll("\\n", "\\n");
               btn.addEventListener('click', async () => {{
                 try {{
                   await navigator.clipboard.writeText(text);
@@ -1186,7 +1187,7 @@ with tab_run:
         fmt = st.selectbox("Download format", fmt_options, index=default_idx)
         payload, mime = build_output(results, fmt, use_display=True, include_notes=include_notes)
         ts = datetime.utcnow().strftime("%Y%m%d%H%M%S")
-        tag = ("_" + re.sub(r'[^a-z0-9\\-]+','', (client_tag or "").lower().replace(" ","-"))) if client_tag else ""
+        tag = ("_" + re.sub(r'[^a-z0-9\-]+','', (client_tag or "").lower().replace(" ","-"))) if client_tag else ""
         st.download_button("Export", data=payload, file_name=f"address_alchemist{tag}_{ts}.{fmt}", mime=mime, use_container_width=True)
         st.session_state["__results__"] = {"results": results, "fmt": fmt}
 
@@ -1387,7 +1388,7 @@ def _render_client_report_view(client_display_name: str, client_norm: str):
                   {chip}
                 </li>"""
         )
-    html = "<ul class='link-list'>" + "\\n".join(items_html) + "</ul>"
+    html = "<ul class='link-list'>" + "\n".join(items_html) + "</ul>"
     st.markdown(html, unsafe_allow_html=True)
 
     with st.expander("Export filtered report"):
@@ -1424,7 +1425,6 @@ def _client_row_html(name: str, norm: str, cid: int, active: bool):
     Uses JS to set parent URL search params and reload (no about:blank).
     """
     status = "active" if active else "inactive"
-    # Build the HTML block with tiny icon buttons
     html = f"""
     <div class="client-row">
       <div class="client-main">
@@ -1469,7 +1469,6 @@ def _client_row_html(name: str, norm: str, cid: int, active: bool):
       </div>
     </div>
     """
-    # Render via components.html so JS runs
     components.html(html, height=48, scrolling=False)
 
 # ---------- CLIENTS TAB ----------
@@ -1506,7 +1505,6 @@ with tab_clients:
                 _client_row_html(c["name"], c.get("name_norm",""), c["id"], active=False)
 
     # ---- REPORT SECTION BELOW THE TABLES ----
-    # Anchor to scroll to
     st.markdown('<div id="report_anchor"></div>', unsafe_allow_html=True)
 
     if report_norm_qp:
@@ -1514,8 +1512,6 @@ with tab_clients:
         st.markdown("---")
         _render_client_report_view(display_name, report_norm_qp)
 
-        # Smooth-scroll on demand
         if want_scroll:
             _scroll_to("report_anchor")
-            # Drop the scroll flag but keep the report param, to avoid repeated auto-scroll
             _qp_set(report=report_norm_qp)
