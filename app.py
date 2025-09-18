@@ -1435,10 +1435,10 @@ def _client_row_html(name: str, norm: str, cid: int, active: bool):
 
   /* Tiny inline icons — no button container */
   .icons {{
-    display:flex; align-items:center; gap:8px;
+    display:flex; align-items:center; gap:10px;
   }}
   .ic {{
-    font-size:12px; line-height:1; cursor:pointer; user-select:none;
+    font-size:14px; line-height:1; cursor:pointer; user-select:none;
     color: var(--muted);
     padding: 0; margin:0; border:none; background:transparent;
     display:inline-flex; align-items:center; justify-content:center;
@@ -1458,7 +1458,7 @@ def _client_row_html(name: str, norm: str, cid: int, active: bool):
 
     <!-- inline icons (no container around each) -->
     <div class="icons">
-      <!-- Report -->
+      <!-- Report (matching style) -->
       <span class="ic" role="button" tabindex="0" title="Open report"
         onclick="
           try {{
@@ -1470,7 +1470,7 @@ def _client_row_html(name: str, norm: str, cid: int, active: bool):
             parent.location.href = parent.location.href + (parent.location.search ? '&' : '?') + 'report={escape(norm)}&scroll=1';
           }}
           return false;
-        ">📄</span>
+        ">▦</span>
 
       <!-- Rename -->
       <span class="ic" role="button" tabindex="0" title="Rename"
@@ -1512,7 +1512,7 @@ def _client_row_html(name: str, norm: str, cid: int, active: bool):
 </body>
 </html>
 """
-    components.html(html, height=46, scrolling=False)
+    components.html(html, height=48, scrolling=False)
 
 # ---------- CLIENTS TAB ----------
 with tab_clients:
