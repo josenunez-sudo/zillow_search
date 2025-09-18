@@ -6,7 +6,6 @@ import os, csv, io, re, time, json, asyncio
 from datetime import datetime
 from typing import List, Dict, Any, Optional, Tuple
 from html import escape
-from urllib.parse import quote  # for safe query param links
 
 import requests
 import httpx
@@ -109,7 +108,7 @@ html[data-theme="dark"], .stApp [data-theme="dark"] {
 /* --- Clients list, minimalist --- */
 .client-row {
   display: flex; align-items: center; justify-content: space-between;
-  padding: 16px 10px; border-bottom: 1px solid var(--row-border);
+  padding: 12px 8px; border-bottom: 1px solid var(--row-border);
 }
 .client-main { display:flex; align-items:center; gap:10px; min-width: 0; }
 .client-name {
@@ -118,29 +117,46 @@ html[data-theme="dark"], .stApp [data-theme="dark"] {
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
 .client-status {
-  font-size: 12px; padding: 2px 8px; border-radius: 999px;
+  font-size: 11px; padding: 1px 6px; border-radius: 999px;
   background: #e2e8f0; color: var(--text-strong);
 }
-.client-status.active   { background: var(--chip-active-bg);   color: var(--chip-active-fg); }
-.client-status.inactive { background: var(--chip-inactive-bg); color: var(--chip-inactive-fg); }
 
-/* Hover-only inline action bar (kept for layout spacing) */
+/* Hover-only inline action bar — tiny, subtle */
 .action-bar {
-  display: inline-flex; gap: 6px; align-items: center;
-  opacity: 1; visibility: visible;
+  display: inline-flex; gap: 4px; align-items: center;
+  opacity: 0; visibility: hidden;
+  transition: opacity .12s ease, visibility .12s ease;
 }
+.client-row:hover .action-bar { opacity: 1; visibility: visible; }
 
-/* Tiny icon-ish buttons */
 .icon-btn {
-  border: 0; background: transparent; padding: 4px 6px; border-radius: 8px;
+  border: 0; background: transparent; padding: 2px 5px; border-radius: 6px;
   font-size: 12px; color:#64748b; cursor: pointer; text-decoration: none;
-  position: relative;
+  line-height: 1; display:inline-flex; align-items:center; justify-content:center;
 }
 .icon-btn:hover { background: var(--row-hover); color: var(--text-strong); }
 .icon-btn.danger:hover { background: #fee2e2; color: #991b1b; }
 
+/* Tooltips */
+.icon-btn[data-tip]{ position: relative; }
+.icon-btn[data-tip]:hover::after {
+  content: attr(data-tip);
+  position: absolute; top: -30px; right: 0;
+  background: var(--tooltip-bg); color: var(--tooltip-fg);
+  font-size: 10px; font-weight: 700;
+  padding: 4px 6px; border-radius: 6px; white-space: nowrap;
+  pointer-events: none; box-shadow: 0 6px 18px rgba(0,0,0,.18);
+}
+.icon-btn[data-tip]:hover::before {
+  content: ""; position: absolute; top: -6px; right: 8px;
+  border: 5px solid transparent; border-top-color: var(--tooltip-bg);
+}
+
 /* section headings */
 .clients-h3 { color: var(--text-muted); font-weight: 700; margin: 8px 0 6px; }
+
+/* Ensure the right column doesn't inflate button sizes */
+.right-actions { display:flex; gap:6px; justify-content:flex-end; align-items:center; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -163,7 +179,7 @@ html[data-theme="dark"], .stApp [data-theme="dark"] {
   :root { --aa-text-strong: #f8fafc; --aa-text-muted: #cbd5e1; }
 }
 .client-name { color: var(--aa-text-strong) !important; font-weight: 700; }
-.client-status { color: var(--aa-text-strong) !important; }
+.client-status { color: var(--aa-text-strong) !important; font-size:11px !important; }
 .client-status.active   { background: var(--aa-chip-active-bg) !important;   color: var(--aa-chip-active-fg) !important; }
 .client-status.inactive { background: var(--aa-chip-inactive-bg) !important; color: var(--aa-chip-inactive-fg) !important; }
 .client-row { color: var(--aa-text-strong) !important; }
@@ -239,50 +255,50 @@ def upgrade_to_homedetails_if_needed(url: str) -> str:
 # Content extractors
 def extract_any_mls_id(html: str) -> Optional[str]:
     if not html: return None
-    for pat in [r'"mlsId"\s*:\s*"([A-Za-z0-9\-]{5,})"',
-                r'"mls"\s*:\s*"([A-Za-z0-9\-]{5,})"',
-                r'"listingId"\s*:\s*"([A-Za-z0-9\-]{5,})"']:
+    for pat in [r'"mlsId"\s*:\s*"([A-Za-z0-9\\-]{5,})"',
+                r'"mls"\s*:\s*"([A-Za-z0-9\\-]{5,})"',
+                r'"listingId"\s*:\s*"([A-Za-z0-9\\-]{5,})"']:
         m = re.search(pat, html, re.I)
         if m: return m.group(1)
-    m = re.search(r'\bMLS[^A-Za-z0-9]{0,5}#?\s*([A-Za-z0-9\-]{5,})\b', html, re.I)
+    m = re.search(r'\\bMLS[^A-Za-z0-9]{0,5}#?\\s*([A-Za-z0-9\\-]{5,})\\b', html, re.I)
     return m.group(1) if m else None
 
 def extract_address_from_html(html: str) -> Dict[str, str]:
     out = {"street": "", "city": "", "state": "", "zip": ""}
     if not html: return out
-    m = re.search(r'"streetAddress"\s*:\s*"([^"]+)"', html, re.I); out["street"] = m.group(1) if m else ""
-    m = re.search(r'"addressLocality"\s*:\s*"([^"]+)"', html, re.I); out["city"] = m.group(1) if m else ""
-    m = re.search(r'"addressRegion"\s*:\s*"([A-Za-z]{2})"', html, re.I); out["state"] = m.group(1) if m else ""
-    m = re.search(r'"postalCode"\s*:\s*"(\d{5}(?:-\d{4})?)"', html, re.I); out["zip"] = m.group(1) if m else ""
+    m = re.search(r'"streetAddress"\\s*:\\s*"([^"]+)"', html, re.I); out["street"] = m.group(1) if m else ""
+    m = re.search(r'"addressLocality"\\s*:\\s*"([^"]+)"', html, re.I); out["city"] = m.group(1) if m else ""
+    m = re.search(r'"addressRegion"\\s*:\\s*"([A-Za-z]{2})"', html, re.I); out["state"] = m.group(1) if m else ""
+    m = re.search(r'"postalCode"\\s*:\\s*"(\\d{5}(?:-\\d{4})?)"', html, re.I); out["zip"] = m.group(1) if m else ""
     if not out["street"]:
         for pat in [
-            r"<meta[^>]+property=['\"]og:title['\"][^>]+content=['\"]([^'\"]+)['\"]",
-            r"<title>\s*([^<]+?)\s*</title>",
+            r"<meta[^>]+property=['\\\"]og:title['\\\"][^>]+content=['\\\"]([^'\\\"]+)['\\\"]",
+            r"<title>\\s*([^<]+?)\\s*</title>",
         ]:
             m = re.search(pat, html, re.I)
             if m:
                 title = m.group(1)
-                if re.search(r"\b[A-Za-z]{2}\b", title) and re.search(r"\d{5}", title):
+                if re.search(r"\\b[A-Za-z]{2}\\b", title) and re.search(r"\\d{5}", title):
                     out["street"] = title
                     break
     return out
 
 def extract_title_or_desc(html: str) -> str:
     for pat in [
-        r"<meta[^>]+property=['\"]og:title['\"][^>]+content=['\"]([^'\"]+)['\"]",
-        r"<title>\s*([^<]+)</title>",
-        r"<meta[^>]+name=['\"]description['\"][^>]+content=['\"]([^'\"]+)['\"]",
+        r"<meta[^>]+property=['\\\"]og:title['\\\"][^>]+content=['\\\"]([^'\\\"]+)['\\\"]",
+        r"<title>\\s*([^<]+)</title>",
+        r"<meta[^>]+name=['\\\"]description['\\\"][^>]+content=['\\\"]([^'\\\"]+)['\\\"]",
     ]:
         m = re.search(pat, html, re.I)
-        if m: return re.sub(r'\s+', ' ', m.group(1)).strip()
+        if m: return re.sub(r'\\s+', ' ', m.group(1)).strip()
     return ""
 
 # Zillow canonicalization
-ZPID_RE = re.compile(r'(\d{6,})_zpid', re.I)
+ZPID_RE = re.compile(r'(\\d{6,})_zpid', re.I)
 def canonicalize_zillow(url: str) -> Tuple[str, Optional[str]]:
     if not url: return "", None
     base = re.sub(r'[#?].*$', '', url)
-    m_full = re.search(r'^(https?://[^?#]*/homedetails/[^/]+/\d{6,}_zpid/)', url, re.I)
+    m_full = re.search(r'^(https?://[^?#]*/homedetails/[^/]+/\\d{6,}_zpid/)', url, re.I)
     canon = m_full.group(1) if m_full else base
     m_z = ZPID_RE.search(url)
     return canon, (m_z.group(1) if m_z else None)
@@ -309,7 +325,7 @@ MLS_ID_KEYS   = {"mls","mls id","mls_id","mls #","mls#","mls number","mlsnumber"
 MLS_NAME_KEYS = {"mls name","mls board","mls provider","source","source mls","mls source"}
 PHOTO_KEYS = {"photo","image","photo url","image url","picture","thumbnail","thumb","img","img url","img_url"}
 
-def norm_key(k:str) -> str: return re.sub(r"\s+"," ", (k or "").strip().lower())
+def norm_key(k:str) -> str: return re.sub(r"\\s+"," ", (k or "").strip().lower())
 def get_first_by_keys(row, keys):
     for k in row.keys():
         if norm_key(k) in keys:
@@ -335,21 +351,21 @@ def extract_components(row):
             "mls_id": get_first_by_keys(n, MLS_ID_KEYS), "mls_name": get_first_by_keys(n, MLS_NAME_KEYS)}
 
 LAND_LEAD_TOKENS = {"lot","lt","tract","parcel","blk","block","tbd"}
-HWY_EXPAND = {r"\bhwy\b":"highway", r"\bus\b":"US"}
+HWY_EXPAND = {r"\\bhwy\\b":"highway", r"\\bus\\b":"US"}
 DIR_MAP = {'s':'south','n':'north','e':'east','w':'west'}
-LOT_REGEX = re.compile(r'\b(?:lot|lt)\s*[-#:]?\s*([A-Za-z0-9]+)\b', re.I)
+LOT_REGEX = re.compile(r'\\b(?:lot|lt)\\s*[-#:]?\\s*([A-Za-z0-9]+)\\b', re.I)
 
 def clean_land_street(street:str) -> str:
     if not street: return street
     s = street.strip()
-    s = re.sub(r"^\s*0[\s\-]+", "", s)
-    tokens = re.split(r"[\s\-]+", s)
+    s = re.sub(r"^\\s*0[\\s\\-]+", "", s)
+    tokens = re.split(r"[\\s\\-]+", s)
     if tokens and tokens[0].lower() in LAND_LEAD_TOKENS:
         tokens = tokens[1:]; s = " ".join(tokens)
     s_lower = f" {s.lower()} "
     for pat,repl in HWY_EXPAND.items(): s_lower = re.sub(pat, f" {repl} ", s_lower)
-    s = re.sub(r"\s+", " ", s_lower).strip()
-    s = re.sub(r"[^\w\s/-]", "", s)
+    s = re.sub(r"\\s+", " ", s_lower).strip()
+    s = re.sub(r"[^\\w\\s/-]", "", s)
     return s
 
 def compose_query_address(street, city, state, zipc, defaults):
@@ -369,10 +385,10 @@ def generate_address_variants(street, city, state, zipc, defaults):
     base = (street or "").strip()
     lot_match = LOT_REGEX.search(base); lot_num = lot_match.group(1) if lot_match else None
     core = base
-    core = re.sub(r'\bu\.?s\.?\b', 'US', core, flags=re.I)
-    core = re.sub(r'\bhwy\b', 'highway', core, flags=re.I)
-    core = re.sub(r'\b([NSEW])\b', lambda m: DIR_MAP.get(m.group(1).lower(), m.group(1)), core, flags=re.I)
-    variants = {core, re.sub(r'\bhighway\b', 'hwy', core, flags=re.I)}
+    core = re.sub(r'\\bu\\.?s\\.?\\b', 'US', core, flags=re.I)
+    core = re.sub(r'\\bhwy\\b', 'highway', core, flags=re.I)
+    core = re.sub(r'\\b([NSEW])\\b', lambda m: DIR_MAP.get(m.group(1).lower(), m.group(1)), core, flags=re.I)
+    variants = {core, re.sub(r'\\bhighway\\b', 'hwy', core, flags=re.I)}
     lot_variants = set(variants)
     if lot_num:
         for v in list(variants):
@@ -419,11 +435,11 @@ def bing_search_items(query):
         return []
 
 MLS_HTML_PATTERNS = [
-    lambda mid: rf'\bMLS[^A-Za-z0-9]{{0,5}}#?\s*{re.escape(mid)}\b',
-    lambda mid: rf'\bMLS\s*#?\s*{re.escape(mid)}\b',
-    lambda mid: rf'"mls"\s*:\s*"{re.escape(mid)}"',
-    lambda mid: rf'"mlsId"\s*:\s*"{re.escape(mid)}"',
-    lambda mid: rf'"mlsId"\s*:\s*{re.escape(mid)}',
+    lambda mid: rf'\\bMLS[^A-Za-z0-9]{{0,5}}#?\\s*{re.escape(mid)}\\b',
+    lambda mid: rf'\\bMLS\\s*#?\\s*{re.escape(mid)}\\b',
+    lambda mid: rf'"mls"\\s*:\\s*"{re.escape(mid)}"',
+    lambda mid: rf'"mlsId"\\s*:\\s*"{re.escape(mid)}"',
+    lambda mid: rf'"mlsId"\\s*:\\s*{re.escape(mid)}',
 ]
 def page_contains_mls(html:str, mls_id:str) -> bool:
     for mk in MLS_HTML_PATTERNS:
@@ -433,7 +449,7 @@ def page_contains_mls(html:str, mls_id:str) -> bool:
 def page_contains_city_state(html:str, city:str=None, state:str=None) -> bool:
     ok = False
     if city and re.search(re.escape(city), html, re.I): ok = True
-    if state and re.search(rf'\b{re.escape(state)}\b', html, re.I): ok = True
+    if state and re.search(rf'\\b{re.escape(state)}\\b', html, re.I): ok = True
     return ok
 
 def confirm_or_resolve_on_page(url:str, mls_id:str=None, required_city:str=None, required_state:str=None):
@@ -444,7 +460,7 @@ def confirm_or_resolve_on_page(url:str, mls_id:str=None, required_city:str=None,
         if page_contains_city_state(html, required_city, required_state) and "/homedetails/" in url:
             return url, "city_state_match"
         if url.endswith("_rb/") and "/homedetails/" not in url:
-            cand = re.findall(r'href="(https://www\.zillow\.com/homedetails/[^"]+)"', html)[:8]
+            cand = re.findall(r'href="(https://www\\.zillow\\.com/homedetails/[^"]+)"', html)[:8]
             for u in cand:
                 try:
                     rr = requests.get(u, headers=UA_HEADERS, timeout=REQUEST_TIMEOUT); rr.raise_for_status()
@@ -542,7 +558,7 @@ def construct_deeplink_from_parts(street, city, state, zipc, defaults):
         if slug_parts: slug_parts[-1] = f"{slug_parts[-1]} {z}"
         else: slug_parts.append(z)
     slug = ", ".join(slug_parts)
-    a = slug.lower(); a = re.sub(r"[^\w\s,-]", "", a).replace(",", ""); a = re.sub(r"\s+", "-", a.strip())
+    a = slug.lower(); a = re.sub(r"[^\\w\\s,-]", "", a).replace(",", ""); a = re.sub(r"\\s+", "-", a.strip())
     return f"https://www.zillow.com/homes/{a}_rb/"
 
 # Resolve from arbitrary source URL
@@ -609,21 +625,21 @@ def process_single_row(row, *, delay=0.5, land_mode=True, defaults=None,
     return {"input_address": query_address, "mls_id": mls_id, "zillow_url": zurl, "status": status, "csv_photo": csv_photo}
 
 # Enrichment
-RE_PRICE  = re.compile(r'"(?:price|unformattedPrice|priceZestimate)"\s*:\s*"?\$?([\d,]+)"?', re.I)
-RE_STATUS = re.compile(r'"(?:homeStatus|statusText)"\s*:\s*"([^"]+)"', re.I)
-RE_BEDS   = re.compile(r'"(?:bedrooms|beds)"\s*:\s*(\d+)', re.I)
-RE_BATHS  = re.compile(r'"(?:bathrooms|baths)"\s*:\s*([0-9.]+)', re.I)
-RE_SQFT   = re.compile(r'"(?:livingArea|livingAreaValue|area)"\s*:\s*([0-9,]+)', re.I)
-RE_DESC   = re.compile(r'"(?:description|homeDescription|marketingDescription)"\s*:\s*"([^"]+)"', re.I)
+RE_PRICE  = re.compile(r'"(?:price|unformattedPrice|priceZestimate)"\\s*:\\s*"?\\$?([\\d,]+)"?', re.I)
+RE_STATUS = re.compile(r'"(?:homeStatus|statusText)"\\s*:\\s*"([^"]+)"', re.I)
+RE_BEDS   = re.compile(r'"(?:bedrooms|beds)"\\s*:\\s*(\\d+)', re.I)
+RE_BATHS  = re.compile(r'"(?:bathrooms|baths)"\\s*:\\s*([0-9.]+)', re.I)
+RE_SQFT   = re.compile(r'"(?:livingArea|livingAreaValue|area)"\\s*:\\s*([0-9,]+)', re.I)
+RE_DESC   = re.compile(r'"(?:description|homeDescription|marketingDescription)"\\s*:\\s*"([^"]+)"', re.I)
 KEY_HL = [("new roof","roof"),("hvac","hvac"),("ac unit","ac"),("furnace","furnace"),("water heater","water heater"),
           ("renovated","renovated"),("updated","updated"),("remodeled","remodeled"),("open floor plan","open plan"),
           ("cul-de-sac","cul-de-sac"),("pool","pool"),("fenced","fenced"),("acre","acre"),("hoa","hoa"),
           ("primary on main","primary on main"),("finished basement","finished basement")]
-def _tidy_txt(s: str) -> str: return re.sub(r'\s+', ' ', (s or '')).strip()
+def _tidy_txt(s: str) -> str: return re.sub(r'\\s+', ' ', (s or '')).strip()
 def summarize_remarks(text: str, max_sent: int = 2) -> str:
     text = _tidy_txt(text)
     if not text: return ""
-    sents = re.split(r'(?<=[\.\!\?])\s+', text)
+    sents = re.split(r'(?<=[\\.\\!\\?])\\s+', text)
     if len(sents) <= max_sent: return text
     pref_kw = ["updated","renovated","new","roof","hvac","kitchen","bath","floor","windows","mechanicals","acres","acre","lot","school","zoned","hoa","no hoa"]
     scored = [(sum(1 for k in pref_kw if k in s.lower()), i, s) for i,s in enumerate(sents[:8])]
@@ -645,21 +661,21 @@ def extract_zillow_first_image(html: str) -> Optional[str]:
     if not html: return None
     for target_w in ("960","1152","768","1536"):
         m = re.search(
-            rf"<img[^>]+src=['\"](https://photos\.zillowstatic\.com/fp/[^'\" ]+-cc_ft_{target_w}\.(?:jpg|webp))['\"]",
+            rf"<img[^>]+src=['\\\"](https://photos\\.zillowstatic\\.com/fp/[^'\\\" ]+-cc_ft_{target_w}\\.(?:jpg|webp))['\\\"]",
             html, re.I
         )
         if m: return m.group(1)
-    m = re.search(r"srcset=['\"]([^'\"]*photos\.zillowstatic\.com[^'\"]+)['\"]", html, re.I)
+    m = re.search(r"srcset=['\\\"]([^'\\\"]*photos\\.zillowstatic\\.com[^'\\\"]+)['\\\"]", html, re.I)
     if m:
         cand=[]
         for part in m.group(1).split(","):
-            part=part.strip(); m2=re.match(r"(https://photos\.zillowstatic\.com/\S+)\s+(\d+)w", part, re.I)
+            part=part.strip(); m2=re.match(r"(https://photos\\.zillowstatic\\.com/\\S+)\\s+(\\d+)w", part, re.I)
             if m2: cand.append((int(m2.group(2)), m2.group(1)))
         if cand:
             up=[u for (w,u) in cand if w<=1152]
             return (sorted(((w,u) for (w,u) in cand if w<=1152), key=lambda x:x[0])[-1][1] if up
                     else sorted(cand, key=lambda x:x[0])[-1][1])
-    m = re.search(r"(https://photos\.zillowstatic\.com/fp/\S+-cc_ft_\d+\.(?:jpg|webp))", html, re.I)
+    m = re.search(r"(https://photos\\.zillowstatic\\.com/fp/\\S+-cc_ft_\\d+\\.(?:jpg|webp))", html, re.I)
     return m.group(1) if m else None
 def parse_listing_meta(html: str) -> Dict[str, Any]:
     meta = {}
@@ -671,12 +687,12 @@ def parse_listing_meta(html: str) -> Dict[str, Any]:
     m = RE_SQFT.search(html);    meta["sqft"]   = m.group(1) if m else None
     m = RE_DESC.search(html);    remark = m.group(1) if m else None
     if not remark:
-        m2 = re.search(r"<meta[^>]+name=['\"]description['\"][^>]+content=['\"]([^'\"]+)['\"]", html, re.I)
+        m2 = re.search(r"<meta[^>]+name=['\\\"]description['\\\"][^>]+content=['\\\"]([^'\\\"]+)['\\\"]", html, re.I)
         if m2: remark = m2.group(1)
     meta["remarks"] = remark
     img = extract_zillow_first_image(html)
     if not img:
-        m3 = re.search(r"<meta[^>]+property=['\"]og:image['\"][^>]+content=['\"]([^'\"]+)['\"]", html, re.I)
+        m3 = re.search(r"<meta[^>]+property=['\\\"]og:image['\\\"][^>]+content=['\\\"]([^'\\\"]+)['\\\"]", html, re.I)
         if m3: img = m3.group(1)
     meta["image_url"] = img
     meta["summary"] = summarize_remarks(remark or "")
@@ -712,10 +728,10 @@ def picture_for_result_with_log(query_address: str, zurl: str, csv_photo_url: Op
                 zfirst=extract_zillow_first_image(html)
                 if zfirst: log["stage"]="zillow_hero"; log["selected"]=zfirst; return zfirst, log
                 for pat in [
-                    r"<meta[^>]+property=['\"]og:image['\"][^>]+content=['\"]([^'\"]+)['\"]",
-                    r"<meta[^>]+property=['\"]og:image:secure_url['\"][^>]+content=['\"]([^'\"]+)['\"]",
-                    r"\"image\"\s*:\s*\"(https?://[^\"]+)\"",
-                    r"\"image\"\s*:\s*\[\s*\"(https?://[^\"]+)\"",
+                    r"<meta[^>]+property=['\\\"]og:image['\\\"][^>]+content=['\\\"]([^'\\\"]+)['\\\"]",
+                    r"<meta[^>]+property=['\\\"]og:image:secure_url['\\\"][^>]+content=['\\\"]([^'\\\"]+)['\\\"]",
+                    r"\\\"image\\\"\\s*:\\s*\\\"(https?://[^\\\"]+)\\\"",
+                    r"\\\"image\\\"\\s*:\\s*\\[\\s*\\\"(https?://[^\\\"]+)\\\"",
                 ]:
                     m = re.search(pat, html, re.I)
                     if m: log["stage"]="og_image"; log["selected"]=m.group(1); return m.group(1), log
@@ -740,8 +756,8 @@ def get_thumbnail_and_log(query_address: str, zurl: str, csv_photo_url: Optional
 
 # ---------- Tracking + Bitly ----------
 def make_trackable_url(url: str, client_tag: str, campaign_tag: str) -> str:
-    client_tag = re.sub(r'[^a-z0-9\-]+','', (client_tag or "").lower().replace(" ","-"))
-    campaign_tag = re.sub(r'[^a-z0-9\-]+','', (campaign_tag or "").lower().replace(" ","-"))
+    client_tag = re.sub(r'[^a-z0-9\\-]+','', (client_tag or "").lower().replace(" ","-"))
+    campaign_tag = re.sub(r'[^a-z0-9\\-]+','', (campaign_tag or "").lower().replace(" ","-"))
     frag = f"#aa={client_tag}.{campaign_tag}" if (client_tag or campaign_tag) else ""
     return (url or "") + (frag if url and frag else "")
 
@@ -921,7 +937,7 @@ def _qp_set(**kwargs):
 act = _qp_get("act", "")
 cid = _qp_get("id", "")
 arg = _qp_get("arg", "")
-report_norm = _qp_get("report", "")  # <-- inline report flag
+report_norm = _qp_get("report", "")
 
 if act and cid:
     try:
@@ -963,13 +979,13 @@ def build_output(rows: List[Dict[str, Any]], fmt: str, use_display: bool = True,
             u = pick_url(r)
             if not u: continue
             items.append(f'<li><a href="{escape(u)}" target="_blank" rel="noopener">{escape(u)}</a></li>')
-        return "<ul>\n" + "\n".join(items) + "\n</ul>\n", "text/html"
+        return "<ul>\\n" + "\\n".join(items) + "\\n</ul>\\n", "text/html"
 
     lines = []
     for r in rows:
         u = pick_url(r)
         if u: lines.append(u)
-    payload = "\n".join(lines) + ("\n" if lines else "")
+    payload = "\\n".join(lines) + ("\\n" if lines else "")
     return payload, ("text/markdown" if fmt == "md" else "text/plain")
 
 # ---------- Header ----------
@@ -1029,7 +1045,7 @@ with tab_run:
 
     st.markdown('<div class="center-box">', unsafe_allow_html=True)
     st.markdown("**Paste addresses or links** (one per line) _and/or_ **drop a CSV**")
-    paste = st.text_area("Paste addresses or links", placeholder="407 E Woodall St, Smithfield, NC 27577\nhttps://l.hms.pt/...\n123 US-301 S, Four Oaks, NC 27524", height=160, label_visibility="collapsed")
+    paste = st.text_area("Paste addresses or links", placeholder="407 E Woodall St, Smithfield, NC 27577\\nhttps://l.hms.pt/...\\n123 US-301 S, Four Oaks, NC 27524", height=160, label_visibility="collapsed")
     opt1, opt2, opt3 = st.columns([1.15, 1, 1.2])
     with opt1:
         remove_dupes = st.checkbox("Remove duplicates (pasted)", value=True)
@@ -1057,7 +1073,7 @@ with tab_run:
                         " ".join([parts.get(k,"") for k in ["StreetNamePreDirectional","StreetName","StreetNamePostType","OccupancyType","OccupancyIdentifier"]]).strip())
                 cityst = ((", " + parts.get("PlaceName","") + ", " + parts.get("StateName","") +
                            (" " + parts.get("ZipCode","") if parts.get("ZipCode") else "")) if (parts.get("PlaceName") or parts.get("StateName")) else "")
-                lines_clean.append(re.sub(r"\s+"," ", (norm + cityst).strip()))
+                lines_clean.append(re.sub(r"\\s+"," ", (norm + cityst).strip()))
             else:
                 lines_clean.append(ln)
 
@@ -1077,7 +1093,7 @@ with tab_run:
 
     if show_preview and count_pasted:
         st.markdown("**Preview (pasted)** (first 5):")
-        st.markdown("<ul class='link-list'>" + "\n".join([f"<li>{escape(p)}</li>" for p in lines_clean[:5]]) + ("<li>…</li>" if count_pasted > 5 else "") + "</ul>", unsafe_allow_html=True)
+        st.markdown("<ul class='link-list'>" + "\\n".join([f"<li>{escape(p)}</li>" for p in lines_clean[:5]]) + ("<li>…</li>" if count_pasted > 5 else "") + "</ul>", unsafe_allow_html=True)
 
     clicked = st.button("Run", use_container_width=True)
 
@@ -1113,13 +1129,13 @@ with tab_run:
 
             li_html.append(f'<li><a href="{safe_href}" target="_blank" rel="noopener">{safe_href}</a>{badge_html}{detail_html}</li>')
 
-        items_html = "\n".join(li_html) if li_html else "<li>(no results)</li>"
+        items_html = "\\n".join(li_html) if li_html else "<li>(no results)</li>"
 
         copy_lines = []
         for r in results:
             u = r.get("preview_url") or r.get("zillow_url") or r.get("display_url") or ""
             if u: copy_lines.append(u.strip())
-        copy_text = "\\n".join(copy_lines) + ("\\n" if copy_lines else "")
+        copy_text = "\\\\n".join(copy_lines) + ("\\\\n" if copy_lines else "")
 
         html = f"""
         <html><head><meta charset="utf-8" />
@@ -1128,12 +1144,12 @@ with tab_run:
             .results-wrap {{ position:relative; box-sizing:border-box; padding:12px 132px 8px 0; }}
             ul.link-list {{ margin:0 0 .5rem 1.2rem; padding:0; list-style:disc; }}
             ul.link-list li {{ margin:0.45rem 0; }}
-            .copyall-btn {{ position:absolute; top:0; right:8px; z-index:5; padding:8px 12px; height:36px; border:0; border-radius:12px; color:#fff; font-weight:700; background:#1d4ed8; cursor:pointer; opacity:0; transform:translateY(-2px); transition:opacity .18s ease, transform .06s ease; }}
+            .copyall-btn {{ position:absolute; top:0; right:8px; z-index:5; padding:8px 12px; height:28px; border:0; border-radius:10px; color:#fff; font-weight:700; background:#1d4ed8; cursor:pointer; opacity:0; transform:translateY(-2px); transition:opacity .18s ease, transform .06s ease; }}
             .results-wrap:hover .copyall-btn {{ opacity:1; transform:translateY(0); }}
           </style>
         </head><body>
           <div class="results-wrap">
-            <button id="copyAll" class="copyall-btn" title="Copy clean URLs" aria-label="Copy clean URLs">Copy All</button>
+            <button id="copyAll" class="copyall-btn" title="Copy clean URLs" aria-label="Copy clean URLs">Copy</button>
             <ul class="link-list" id="resultsList">{items_html}</ul>
           </div>
           <script>
@@ -1143,9 +1159,9 @@ with tab_run:
               btn.addEventListener('click', async () => {{
                 try {{
                   await navigator.clipboard.writeText(text);
-                  const prev=btn.textContent; btn.textContent='✓ Copied'; setTimeout(()=>{{ btn.textContent=prev; }}, 1000);
+                  const prev=btn.textContent; btn.textContent='✓'; setTimeout(()=>{{ btn.textContent=prev; }}, 900);
                 }} catch(e) {{
-                  const prev=btn.textContent; btn.textContent='× Error'; setTimeout(()=>{{ btn.textContent=prev; }}, 1000);
+                  const prev=btn.textContent; btn.textContent='×'; setTimeout(()=>{{ btn.textContent=prev; }}, 900);
                 }}
               }});
             }})();
@@ -1170,7 +1186,7 @@ with tab_run:
         fmt = st.selectbox("Download format", fmt_options, index=default_idx)
         payload, mime = build_output(results, fmt, use_display=True, include_notes=include_notes)
         ts = datetime.utcnow().strftime("%Y%m%d%H%M%S")
-        tag = ("_" + re.sub(r'[^a-z0-9\-]+','', (client_tag or "").lower().replace(" ","-"))) if client_tag else ""
+        tag = ("_" + re.sub(r'[^a-z0-9\\-]+','', (client_tag or "").lower().replace(" ","-"))) if client_tag else ""
         st.download_button("Export", data=payload, file_name=f"address_alchemist{tag}_{ts}.{fmt}", mime=mime, use_container_width=True)
         st.session_state["__results__"] = {"results": results, "fmt": fmt}
 
@@ -1371,7 +1387,7 @@ def _render_client_report_view(client_display_name: str, client_norm: str):
                   {chip}
                 </li>"""
         )
-    html = "<ul class='link-list'>" + "\n".join(items_html) + "</ul>"
+    html = "<ul class='link-list'>" + "\\n".join(items_html) + "</ul>"
     st.markdown(html, unsafe_allow_html=True)
 
     with st.expander("Export filtered report"):
@@ -1387,24 +1403,83 @@ def _render_client_report_view(client_display_name: str, client_norm: str):
             use_container_width=False
         )
 
-# ---------- Clients tab helper: reliable “View report” ----------
-def _report_button(label: str, cnorm: str, key: str):
-    if st.button(label, key=key, help="Open inline report for this client"):
-        _qp_set(report=cnorm)  # sets ?report=<cnorm> in URL
-        _safe_rerun()          # rerun so the report renders
+# ---------- Smooth-scroll helper ----------
+def _scroll_to(element_id: str):
+    components.html(
+        f"""
+        <script>
+          const el = parent.document.getElementById("{element_id}");
+          if (el) {{
+            el.scrollIntoView({{behavior: "smooth", block: "start"}});
+          }}
+        </script>
+        """,
+        height=0,
+    )
+
+# ---------- Tiny icon row (safe, JS updates parent.location) ----------
+def _client_row_html(name: str, norm: str, cid: int, active: bool):
+    """
+    Renders a single client row with tiny hover-only icons.
+    Uses JS to set parent URL search params and reload (no about:blank).
+    """
+    status = "active" if active else "inactive"
+    # Build the HTML block with tiny icon buttons
+    html = f"""
+    <div class="client-row">
+      <div class="client-main">
+        <span class="client-name">{escape(name)}</span>
+        <span class="client-status {status}">{status}</span>
+      </div>
+      <div class="action-bar right-actions">
+        <button class="icon-btn" data-tip="View report" onclick="
+          const u = new URL(parent.location.href);
+          u.searchParams.set('report','{escape(norm)}');
+          u.searchParams.set('scroll','1');
+          parent.location.href = u.toString();
+          return false;
+        ">▦</button>
+        <button class="icon-btn" data-tip="Rename" onclick="
+          const newName = prompt('Rename client: {escape(name)}','{escape(name)}');
+          if (newName && newName.trim()) {{
+            const u = new URL(parent.location.href);
+            u.searchParams.set('act','rename');
+            u.searchParams.set('id','{cid}');
+            u.searchParams.set('arg', newName.trim());
+            parent.location.href = u.toString();
+          }}
+          return false;
+        ">✎</button>
+        <button class="icon-btn" data-tip="{('Deactivate' if active else 'Activate')}" onclick="
+          const u = new URL(parent.location.href);
+          u.searchParams.set('act','toggle');
+          u.searchParams.set('id','{cid}');
+          parent.location.href = u.toString();
+          return false;
+        ">{('○' if active else '●')}</button>
+        <button class="icon-btn danger" data-tip="Delete" onclick="
+          if (confirm('Delete {escape(name)}? This cannot be undone.')) {{
+            const u = new URL(parent.location.href);
+            u.searchParams.set('act','delete');
+            u.searchParams.set('id','{cid}');
+            parent.location.href = u.toString();
+          }}
+          return false;
+        ">⌫</button>
+      </div>
+    </div>
+    """
+    # Render via components.html so JS runs
+    components.html(html, height=48, scrolling=False)
 
 # ---------- CLIENTS TAB ----------
 with tab_clients:
     st.subheader("Clients")
     st.caption("Manage active and inactive clients. “test test” is always hidden.")
 
-    # If ?report=<client_norm> is present, show the report panel (lists remain visible below)
-    report_norm = _qp_get("report", "")
-    if report_norm:
-        all_clients_for_title = fetch_clients(include_inactive=True)
-        display_name = next((c["name"] for c in all_clients_for_title if c.get("name_norm")==report_norm), report_norm)
-        _render_client_report_view(display_name, report_norm)
-        st.markdown("---")
+    # Read query params (we'll render report AFTER the lists)
+    report_norm_qp = _qp_get("report", "")
+    want_scroll = _qp_get("scroll", "") in ("1","true","yes")
 
     all_clients = fetch_clients(include_inactive=True)
     active = [c for c in all_clients if c.get("active")]
@@ -1419,36 +1494,7 @@ with tab_clients:
             st.write("_No active clients_")
         else:
             for c in active:
-                cid = c["id"]; cname = c["name"]; cnorm = c.get("name_norm","")
-
-                left, right = st.columns([0.7, 0.3])
-                with left:
-                    st.markdown(
-                        f"<div class='client-row'><div class='client-main'>"
-                        f"<span class='client-name'>{escape(cname)}</span>"
-                        f"<span class='client-status active'>active</span>"
-                        f"</div></div>", unsafe_allow_html=True
-                    )
-                with right:
-                    _report_button("▦ View report", cnorm, key=f"view_{cid}")
-
-                    if st.button("✎ Rename", key=f"ren_{cid}"):
-                        new_name = st.text_input("Rename client", value=cname, key=f"ren_input_{cid}")
-                        if new_name and new_name.strip():
-                            ok, msg = rename_client(cid, new_name.strip())
-                            if not ok:
-                                st.error(msg)
-                            _safe_rerun()
-
-                    if st.button("○ Deactivate", key=f"deact_{cid}"):
-                        toggle_client_active(cid, False)
-                        _safe_rerun()
-
-                    if st.button("⌫ Delete", key=f"del_{cid}"):
-                        ok, msg = delete_client(cid)
-                        if not ok:
-                            st.error(msg)
-                        _safe_rerun()
+                _client_row_html(c["name"], c.get("name_norm",""), c["id"], active=True)
 
     # Inactive list
     with colB:
@@ -1457,33 +1503,19 @@ with tab_clients:
             st.write("_No inactive clients_")
         else:
             for c in inactive:
-                cid = c["id"]; cname = c["name"]; cnorm = c.get("name_norm","")
+                _client_row_html(c["name"], c.get("name_norm",""), c["id"], active=False)
 
-                left, right = st.columns([0.7, 0.3])
-                with left:
-                    st.markdown(
-                        f"<div class='client-row'><div class='client-main'>"
-                        f"<span class='client-name'>{escape(cname)}</span>"
-                        f"<span class='client-status inactive'>inactive</span>"
-                        f"</div></div>", unsafe_allow_html=True
-                    )
-                with right:
-                    _report_button("▦ View report", cnorm, key=f"view_in_{cid}")
+    # ---- REPORT SECTION BELOW THE TABLES ----
+    # Anchor to scroll to
+    st.markdown('<div id="report_anchor"></div>', unsafe_allow_html=True)
 
-                    if st.button("✎ Rename", key=f"ren_in_{cid}"):
-                        new_name = st.text_input("Rename client", value=cname, key=f"ren_in_input_{cid}")
-                        if new_name and new_name.strip():
-                            ok, msg = rename_client(cid, new_name.strip())
-                            if not ok:
-                                st.error(msg)
-                            _safe_rerun()
+    if report_norm_qp:
+        display_name = next((c["name"] for c in all_clients if c.get("name_norm")==report_norm_qp), report_norm_qp)
+        st.markdown("---")
+        _render_client_report_view(display_name, report_norm_qp)
 
-                    if st.button("● Activate", key=f"act_{cid}"):
-                        toggle_client_active(cid, True)
-                        _safe_rerun()
-
-                    if st.button("⌫ Delete", key=f"del_in_{cid}"):
-                        ok, msg = delete_client(cid)
-                        if not ok:
-                            st.error(msg)
-                        _safe_rerun()
+        # Smooth-scroll on demand
+        if want_scroll:
+            _scroll_to("report_anchor")
+            # Drop the scroll flag but keep the report param, to avoid repeated auto-scroll
+            _qp_set(report=report_norm_qp)
