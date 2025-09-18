@@ -85,32 +85,26 @@ textarea:focus { outline:3px solid #93c5fd !important; outline-offset:2px; }
 .badge { display:inline-block; font-size:12px; font-weight:700; padding:2px 8px; border-radius:999px; margin-left:8px; background:#dcfce7; color:#166534; }
 .badge.dup { background:#fee2e2; color:#991b1b; }
 
-/* Theme variables */
-:root {
-  --text-strong: #0f172a;
-  --text-muted:  #475569;
-  --chip-active-bg:  #dcfce7; --chip-active-fg:#166534;
-  --chip-inactive-bg:#fee2e2; --chip-inactive-fg:#991b1b;
-  --row-border: #e2e8f0;
-  --row-hover:  #f8fafc;
-}
-html[data-theme="dark"], .stApp [data-theme="dark"] {
-  --text-strong: #f8fafc;
-  --text-muted:  #cbd5e1;
-  --chip-active-bg:  #064e3b; --chip-active-fg:#a7f3d0;
-  --chip-inactive-bg:#7f1d1d; --chip-inactive-fg:#fecaca;
-  --row-border: #0b1220;
-  --row-hover:  #0f172a;
-}
+/* Clients tab UI (native Streamlit widgets, not iframe) */
+.clients-table .row { border-bottom:1px solid rgba(0,0,0,.08); padding:8px 4px; display:flex; align-items:center; }
+.clients-table .name { font-weight:700; color:#0f172a; }
+html[data-theme="dark"] .clients-table .name { color:#f8fafc; }
+.clients-table .status { font-size:11px; padding:1px 6px; border-radius:999px; margin-left:8px; }
+.clients-table .status.active   { background:#dcfce7; color:#166534; }
+.clients-table .status.inactive { background:#fee2e2; color:#991b1b; }
+.clients-table .actions { margin-left:auto; display:flex; gap:6px; align-items:center; }
 
-/* Section heading */
-.clients-h3 { color: var(--text-muted); font-weight: 700; margin: 8px 0 6px; }
+/* compact icon buttons */
+.clients-table .icon-btn [data-baseweb="button"] { padding:4px 8px; }
+.clients-table .icon-btn .st-emotion-cache-ue6h4q { font-size:12px; } /* small text */
+.clients-table .hint { color:#64748b; font-size:11px; margin-left:6px; opacity:.9; }
 
-/* For any non-iframe client rows you might render in the future */
-.client-row { padding: 12px 8px; border-bottom: 1px solid var(--row-border); }
-.client-name { color: var(--text-strong); font-weight: 700; }
-.client-status.active   { background: var(--chip-active-bg);   color: var(--chip-active-fg); }
-.client-status.inactive { background: var(--chip-inactive-bg); color: var(--chip-inactive-fg); }
+.icon-help { opacity:.0; transition:opacity .15s ease; font-size:11px; color:#64748b; }
+.clients-table .row:hover .icon-help { opacity:1; }
+
+/* rename/delete inline boxes */
+.inline-box { background: rgba(0,0,0,.04); border:1px solid rgba(0,0,0,.1); border-radius:8px; padding:8px; margin:6px 0 0; }
+html[data-theme="dark"] .inline-box { background:#0f172a; border-color:#0b1220; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -128,9 +122,6 @@ html[data-theme="dark"], .stApp [data-theme="dark"] {
   --aa-text-muted:  #cbd5e1;
   --aa-chip-active-bg:  #064e3b; --aa-chip-active-fg:#a7f3d0;
   --aa-chip-inactive-bg: #7f1d1d; --aa-chip-inactive-fg:#fecaca;
-}
-@media (prefers-color-scheme: dark) {
-  :root { --aa-text-strong: #f8fafc; --aa-text-muted: #cbd5e1; }
 }
 .client-name { color: var(--aa-text-strong) !important; font-weight: 700; }
 .client-status { color: var(--aa-text-strong) !important; font-size:11px !important; }
@@ -534,7 +525,7 @@ def resolve_from_source_url(source_url: str, defaults: Dict[str,str]) -> Tuple[s
                 u = it.get("url") or ""
                 if "/homedetails/" in u: return u, title
     if city or state or street:
-        return construct_deeplink_from_parts(street or title or "", city, state, zipc, defaults), compose_query_address(street or title or "", city, state, zipc, defaults)
+        return construct_deeplink_from_parts(street or title or "", city, state, zipc, defaults), compose_query_address(street, city, state, zipc, defaults)
     return final_url, ""
 
 # Primary resolver
@@ -891,55 +882,6 @@ cid = _qp_get("id", "")
 arg = _qp_get("arg", "")
 report_norm = _qp_get("report", "")
 
-if act and cid:
-    try:
-        cid_int = int(cid)
-    except Exception:
-        cid_int = 0
-
-    if cid_int:
-        if act == "toggle":
-            rows = SUPABASE.table("clients").select("active").eq("id", cid_int).limit(1).execute().data or []
-            cur = rows[0]["active"] if rows else True
-            toggle_client_active(cid_int, (not cur))
-        elif act == "rename" and arg:
-            rename_client(cid_int, arg)
-        elif act == "delete":
-            delete_client(cid_int)
-    _qp_set()  # clear params
-    _safe_rerun()
-
-# ---------- Output builders ----------
-def build_output(rows: List[Dict[str, Any]], fmt: str, use_display: bool = True, include_notes: bool = False):
-    def pick_url(r):
-        return r.get("preview_url") or r.get("zillow_url") or r.get("display_url") or ""
-
-    if fmt == "csv":
-        fields = ["input_address","mls_id","url","status","price","beds","baths","sqft","already_sent","dup_reason","dup_sent_at"]
-        if include_notes:
-            fields += ["summary","highlights","remarks"]
-        s = io.StringIO(); w = csv.DictWriter(s, fieldnames=fields); w.writeheader()
-        for r in rows:
-            row = {k: r.get(k) for k in fields if k != "url"}
-            row["url"] = pick_url(r)
-            w.writerow(row)
-        return s.getvalue(), "text/csv"
-
-    if fmt == "html":
-        items = []
-        for r in rows:
-            u = pick_url(r)
-            if not u: continue
-            items.append(f'<li><a href="{escape(u)}" target="_blank" rel="noopener">{escape(u)}</a></li>')
-        return "<ul>\n" + "\n".join(items) + "\n</ul>\n", "text/html"
-
-    lines = []
-    for r in rows:
-        u = pick_url(r)
-        if u: lines.append(u)
-    payload = "\n".join(lines) + ("\n" if lines else "")
-    return payload, ("text/markdown" if fmt == "md" else "text/plain")
-
 # ---------- Header ----------
 st.markdown('<h2 class="app-title">Address Alchemist</h2>', unsafe_allow_html=True)
 st.markdown('<p class="app-sub">Paste addresses or <em>any listing links</em> → verified Zillow links</p>', unsafe_allow_html=True)
@@ -1164,6 +1106,7 @@ with tab_run:
                         unsafe_allow_html=True
                     )
 
+    # run button handler
     if clicked:
         try:
             rows_in: List[Dict[str, Any]] = []
@@ -1355,7 +1298,10 @@ def _render_client_report_view(client_display_name: str, client_norm: str):
             use_container_width=False
         )
 
-# ---------- Smooth-scroll helper ----------
+# ---------- STATE for native client controls ----------
+if "__rename_id__" not in st.session_state: st.session_state["__rename_id__"] = None
+if "__delete_confirm__" not in st.session_state: st.session_state["__delete_confirm__"] = None
+
 def _scroll_to(element_id: str):
     components.html(
         f"""
@@ -1369,156 +1315,81 @@ def _scroll_to(element_id: str):
         height=0,
     )
 
-# ---------- Tiny client row (self-contained CSS in iframe) ----------
-def _client_row_html(name: str, norm: str, cid: int, active: bool):
-    """
-    Renders a single client row with tiny, hover-only icons INSIDE the component iframe.
-    This isolates styling so icons stay inline, subtle, and hidden until hover.
-
-    FIX: icon links now use real anchors with target="_top" so they work outside the iframe.
-         Added aria-labels, title tooltips, and a quick visual click feedback.
-    """
-    status = "active" if active else "inactive"
-    view_toggle_label = "Deactivate" if active else "Activate"
-    view_toggle_icon  = "○" if active else "●"
-
-    html = f"""
-<!DOCTYPE html>
-<html>
-<head>
-<meta charset="utf-8">
-<style>
-  :root {{
-    --text-strong:#0f172a;
-    --row-hover:#f8fafc;
-    --chip-active-bg:#dcfce7; --chip-active-fg:#166534;
-    --chip-inactive-bg:#fee2e2; --chip-inactive-fg:#991b1b;
-    --tooltip-bg:#0b1220; --tooltip-fg:#f8fafc;
-  }}
-  @media (prefers-color-scheme: dark) {{
-    :root {{
-      --text-strong:#f8fafc;
-      --row-hover:#0f172a;
-    }}
-  }}
-  html,body {{
-    margin:0; padding:0;
-    font-family:-apple-system, Segoe UI, Roboto, Arial, sans-serif;
-  }}
-  .client-row {{
-    display:flex; align-items:center; justify-content:space-between;
-    padding:10px 8px; border-bottom:1px solid rgba(0,0,0,.08);
-  }}
-  .client-main {{ display:flex; align-items:center; gap:8px; min-width:0; }}
-  .client-name {{
-    font-weight:700; color:var(--text-strong);
-    white-space:nowrap; overflow:hidden; text-overflow:ellipsis;
-  }}
-  .client-status {{
-    font-size:11px; padding:1px 6px; border-radius:999px;
-    background:#e2e8f0; color:var(--text-strong);
-  }}
-  .client-status.active   {{ background:var(--chip-active-bg);   color:var(--chip-active-fg); }}
-  .client-status.inactive {{ background:var(--chip-inactive-bg); color:var(--chip-inactive-fg); }}
-
-  /* HOVER-ONLY tiny action bar */
-  .action-bar {{
-    display:inline-flex; gap:4px; align-items:center;
-    opacity:0; visibility:hidden;
-    transition:opacity .12s ease, visibility .12s ease;
-  }}
-  .client-row:hover .action-bar {{ opacity:1; visibility:visible; }}
-
-  .icon-btn {{
-    border:0; background:transparent; padding:2px 5px; border-radius:6px;
-    font-size:12px; color:#64748b; cursor:pointer; line-height:1;
-    display:inline-flex; align-items:center; justify-content:center;
-    text-decoration:none;
-  }}
-  .icon-btn:hover {{ background:var(--row-hover); color:var(--text-strong); }}
-  .icon-btn.danger:hover {{ background:#fee2e2; color:#991b1b; }}
-
-  /* Tooltips within iframe */
-  .icon-btn[data-tip] {{ position:relative; }}
-  .icon-btn[data-tip]:hover::after {{
-    content: attr(data-tip);
-    position:absolute; top:-28px; right:0;
-    background:var(--tooltip-bg); color:var(--tooltip-fg);
-    font-size:10px; font-weight:700;
-    padding:4px 6px; border-radius:6px; white-space:nowrap;
-    box-shadow:0 6px 18px rgba(0,0,0,.18);
-    pointer-events:none;
-  }}
-  .icon-btn[data-tip]:hover::before {{
-    content:""; position:absolute; top:-6px; right:8px;
-    border:5px solid transparent; border-top-color:var(--tooltip-bg);
-  }}
-</style>
-</head>
-<body>
-  <div class="client-row">
-    <div class="client-main">
-      <span class="client-name">{escape(name)}</span>
-      <span class="client-status {status}">{status}</span>
-    </div>
-    <div class="action-bar">
-      <!-- VIEW REPORT: use a real link that escapes the iframe -->
-      <a class="icon-btn" role="button" aria-label="View report for {escape(name)}"
-         title="View report"
-         data-tip="View report"
-         href="?report={escape(norm)}&scroll=1"
-         target="_top"
-         onclick="this.textContent='• • •';">
-         ▦
-      </a>
-
-      <!-- RENAME: prompt then navigate (still gives visual feedback) -->
-      <a class="icon-btn" role="button" aria-label="Rename {escape(name)}"
-         title="Rename"
-         data-tip="Rename"
-         href="#"
-         onclick="
-           const newName = prompt('Rename client: {escape(name)}','{escape(name)}');
-           if (newName && newName.trim()) {{
-             this.textContent='• • •';
-             const qs = new URLSearchParams({{act:'rename', id:'{cid}', arg:newName.trim()}}).toString();
-             top.location.href = '?' + qs;
-           }}
-           return false;
-         ">
-         ✎
-      </a>
-
-      <!-- ACTIVATE/DEACTIVATE -->
-      <a class="icon-btn" role="button" aria-label="{view_toggle_label} {escape(name)}"
-         title="{view_toggle_label}"
-         data-tip="{view_toggle_label}"
-         href="?act=toggle&id={cid}"
-         target="_top"
-         onclick="this.textContent='• • •';">
-         {view_toggle_icon}
-      </a>
-
-      <!-- DELETE -->
-      <a class="icon-btn danger" role="button" aria-label="Delete {escape(name)}"
-         title="Delete"
-         data-tip="Delete"
-         href="#"
-         onclick="
-           if (confirm('Delete {escape(name)}? This cannot be undone.')) {{
-             this.textContent='• • •';
-             top.location.href='?act=delete&id={cid}';
-           }}
-           return false;
-         ">
-         ⌫
-      </a>
-    </div>
-  </div>
-</body>
-</html>
-"""
-    components.html(html, height=44, scrolling=False)
+# ---------- Native (non-iframe) client row ----------
+def client_row_native(c: Dict[str, Any]):
+    cid = c["id"]; name = c["name"]; norm = c.get("name_norm",""); active = bool(c.get("active"))
+    st.markdown('<div class="clients-table">', unsafe_allow_html=True)
+    col1, col2, col3 = st.columns([0.55, 0.25, 0.20])
+    with col1:
+        st.markdown(f"<div class='row'><span class='name'>{escape(name)}</span> "
+                    f"<span class='status {'active' if active else 'inactive'}'>{'active' if active else 'inactive'}</span></div>",
+                    unsafe_allow_html=True)
+    with col2:
+        st.markdown("<div class='actions'>", unsafe_allow_html=True)
+        # View report
+        if st.button("▦", key=f"view_{cid}", help="View report", use_container_width=False):
+            _qp_set(report=norm, scroll="1")
+            st.toast(f"Opening report for {name}")
+            _safe_rerun()
+        st.markdown("<span class='icon-help'>View</span>", unsafe_allow_html=True)
+        # Rename
+        if st.button("✎", key=f"ren_{cid}", help="Rename client", use_container_width=False):
+            st.session_state["__rename_id__"] = cid
+            st.toast(f"Rename {name}")
+            _safe_rerun()
+        st.markdown("<span class='icon-help'>Rename</span>", unsafe_allow_html=True)
+        # Toggle active
+        toggle_label = "Deactivate" if active else "Activate"
+        if st.button("○" if active else "●", key=f"tog_{cid}", help=toggle_label, use_container_width=False):
+            toggle_client_active(cid, (not active))
+            st.toast(f"{toggle_label}d {name}")
+            _safe_rerun()
+        st.markdown(f"<span class='icon-help'>{toggle_label}</span>", unsafe_allow_html=True)
+        # Delete
+        if st.button("⌫", key=f"del_{cid}", help="Delete client", use_container_width=False):
+            st.session_state["__delete_confirm__"] = cid
+            st.toast(f"Confirm delete {name}")
+            _safe_rerun()
+        st.markdown("<span class='icon-help'>Delete</span>", unsafe_allow_html=True)
+        st.markdown("</div>", unsafe_allow_html=True)
+    with col3:
+        # Inline rename or delete confirmations
+        if st.session_state["__rename_id__"] == cid:
+            with st.container(border=True):
+                new_name = st.text_input("New name", value=name, key=f"rn_in_{cid}")
+                cc1, cc2 = st.columns(2)
+                with cc1:
+                    if st.button("Save", key=f"rn_sv_{cid}"):
+                        ok, msg = rename_client(cid, new_name)
+                        if ok:
+                            st.toast("Renamed")
+                            st.session_state["__rename_id__"] = None
+                            _safe_rerun()
+                        else:
+                            st.error(msg)
+                with cc2:
+                    if st.button("Cancel", key=f"rn_ca_{cid}"):
+                        st.session_state["__rename_id__"] = None
+                        _safe_rerun()
+        if st.session_state["__delete_confirm__"] == cid:
+            with st.container():
+                st.markdown("<div class='inline-box'><b>Delete this client?</b>", unsafe_allow_html=True)
+                d1, d2 = st.columns(2)
+                with d1:
+                    if st.button("Yes, delete", key=f"del_yes_{cid}"):
+                        ok, msg = delete_client(cid)
+                        if ok:
+                            st.toast("Deleted")
+                            st.session_state["__delete_confirm__"] = None
+                            _safe_rerun()
+                        else:
+                            st.error(msg)
+                with d2:
+                    if st.button("Cancel", key=f"del_no_{cid}"):
+                        st.session_state["__delete_confirm__"] = None
+                        _safe_rerun()
+                st.markdown("</div>", unsafe_allow_html=True)
+    st.markdown('</div>', unsafe_allow_html=True)
 
 # ---------- CLIENTS TAB ----------
 with tab_clients:
@@ -1542,7 +1413,7 @@ with tab_clients:
             st.write("_No active clients_")
         else:
             for c in active:
-                _client_row_html(c["name"], c.get("name_norm",""), c["id"], active=True)
+                client_row_native(c)
 
     # Inactive list
     with colB:
@@ -1551,7 +1422,7 @@ with tab_clients:
             st.write("_No inactive clients_")
         else:
             for c in inactive:
-                _client_row_html(c["name"], c.get("name_norm",""), c["id"], active=False)
+                client_row_native(c)
 
     # ---- REPORT SECTION BELOW THE TABLES (hidden unless report=...) ----
     st.markdown('<div id="report_anchor"></div>', unsafe_allow_html=True)
