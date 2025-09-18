@@ -940,7 +940,7 @@ def _qp_set(**kwargs):
 act = _qp_get("act", "")
 cid = _qp_get("id", "")
 arg = _qp_get("arg", "")
-report_norm = _qp_get("report", "")  # <-- if set, we render inline report but still show lists
+report_norm = _qp_get("report", "")  # <-- inline report flag
 
 if act and cid:
     try:
@@ -1349,40 +1349,89 @@ def fetch_sent_for_client(client_norm: str, limit: int = 5000):
         return []
 
 def _render_client_report_view(client_display_name: str, client_norm: str):
-    """Render a simple report: address as hyperlink → Zillow."""
+    """Render a report: address as hyperlink → Zillow, with Campaign filter and Search box."""
     st.markdown(f"### Report: {escape(client_display_name)}", unsafe_allow_html=True)
-    rows = fetch_sent_for_client(client_norm)
-    count = len(rows)
-    st.caption(f"{count} listing{'s' if count!=1 else ''} sent")
 
-    if not rows:
-        st.info("No sent listings logged for this client yet.")
+    # Pull all rows for this client (cached)
+    rows = fetch_sent_for_client(client_norm)
+    total = len(rows)
+
+    # ---- Build filter controls (top bar)
+    seen = []
+    for r in rows:
+        c = (r.get("campaign") or "").strip()
+        if c not in seen:
+            seen.append(c)
+    campaign_labels = ["All campaigns"] + [("— no campaign —" if c == "" else c) for c in seen]
+    campaign_keys   = [None] + seen  # parallel to labels
+
+    colF1, colF2, colF3 = st.columns([1.2, 1.8, 1])
+    with colF1:
+        sel_idx = st.selectbox("Filter by campaign", list(range(len(campaign_labels))),
+                               format_func=lambda i: campaign_labels[i], index=0, key=f"__camp_{client_norm}")
+        sel_campaign = campaign_keys[sel_idx]  # None => all
+    with colF2:
+        q = st.text_input("Search address / MLS / URL", value="", placeholder="e.g. 407 Woodall, 2501234, /homedetails/", key=f"__q_{client_norm}")
+        q_norm = q.strip().lower()
+    with colF3:
+        st.caption(f"{total} total logged")
+
+    # ---- Apply filters
+    def _match(row) -> bool:
+        # campaign filter
+        if sel_campaign is not None:
+            if (row.get("campaign") or "").strip() != sel_campaign:
+                return False
+        # search filter
+        if not q_norm:
+            return True
+        addr = (row.get("address") or "").lower()
+        mls  = (row.get("mls_id") or "").lower()
+        url  = (row.get("url") or "").lower()
+        return (q_norm in addr) or (q_norm in mls) or (q_norm in url)
+
+    rows_f = [r for r in rows if _match(r)]
+    count = len(rows_f)
+
+    st.caption(f"{count} matching listing{'s' if count!=1 else ''}")
+
+    if not rows_f:
+        st.info("No results match the current filters.")
         return
 
-    # Build a simple list: address text → href = url
+    # ---- Render list: address text → Zillow URL (with sent date)
     items_html = []
-    for r in rows:
+    for r in rows_f:
         url = (r.get("url") or "").strip()
         addr = (r.get("address") or "").strip() or "View on Zillow"
         sent_at = r.get("sent_at") or ""
+        camp = (r.get("campaign") or "").strip()
+        chip = ""
+        if sel_campaign is None and camp:
+            chip = f"<span style='font-size:11px; font-weight:700; padding:2px 6px; border-radius:999px; background:#e2e8f0; margin-left:6px;'>{escape(camp)}</span>"
         items_html.append(
             f"""<li>
                   <a href="{escape(url)}" target="_blank" rel="noopener">{escape(addr)}</a>
                   <span style="color:#64748b; font-size:12px; margin-left:6px;">{escape(sent_at)}</span>
+                  {chip}
                 </li>"""
         )
     html = "<ul class='link-list'>" + "\n".join(items_html) + "</ul>"
     st.markdown(html, unsafe_allow_html=True)
 
-    # Optional: export CSV of this report
-    with st.expander("Export report"):
-        import pandas as pd
-        df = pd.DataFrame(rows)
+    # ---- Export filtered view as CSV
+    with st.expander("Export filtered report"):
+        import pandas as pd, io
+        df = pd.DataFrame(rows_f)
         csv_buf = io.StringIO()
         df.to_csv(csv_buf, index=False)
-        st.download_button("Download CSV", data=csv_buf.getvalue(),
-                           file_name=f"client_report_{client_norm}_{datetime.utcnow().strftime('%Y%m%d%H%M%S')}.csv",
-                           mime="text/csv", use_container_width=False)
+        st.download_button(
+            "Download CSV",
+            data=csv_buf.getvalue(),
+            file_name=f"client_report_{client_norm}_{datetime.utcnow().strftime('%Y%m%d%H%M%S')}.csv",
+            mime="text/csv",
+            use_container_width=False
+        )
 
 # ---------- CLIENTS TAB ----------
 with tab_clients:
@@ -1418,12 +1467,15 @@ with tab_clients:
                         <span class="client-status active">active</span>
                       </div>
                       <div class="action-bar">
-                        <a class="icon-btn" data-tip="View report" title="View report" href="javascript:void(0)" onclick="
+                        <a class="icon-btn" data-tip="View report" title="View report" href="#" onclick="
+                          event.preventDefault();
                           const u = new URL(window.location.href);
                           u.searchParams.set('report','{escape(cnorm)}');
                           window.location.href = u.toString();
+                          return false;
                         ">▦</a>
-                        <a class="icon-btn" data-tip="Rename client" title="Rename" href="javascript:void(0)" onclick="
+                        <a class="icon-btn" data-tip="Rename client" title="Rename" href="#" onclick="
+                          event.preventDefault();
                           const newName = prompt('Rename client: {escape(cname)}','{escape(cname)}');
                           if (newName && newName.trim()) {{
                             const u = new URL(window.location.href);
@@ -1432,20 +1484,25 @@ with tab_clients:
                             u.searchParams.set('arg', newName.trim());
                             window.location.href = u.toString();
                           }}
+                          return false;
                         ">✎</a>
-                        <a class="icon-btn" data-tip="Deactivate client" title="Deactivate" href="javascript:void(0)" onclick="
+                        <a class="icon-btn" data-tip="Deactivate client" title="Deactivate" href="#" onclick="
+                          event.preventDefault();
                           const u = new URL(window.location.href);
                           u.searchParams.set('act','toggle');
                           u.searchParams.set('id','{cid}');
                           window.location.href = u.toString();
+                          return false;
                         ">○</a>
-                        <a class="icon-btn danger" data-tip="Delete client" title="Delete" href="javascript:void(0)" onclick="
+                        <a class="icon-btn danger" data-tip="Delete client" title="Delete" href="#" onclick="
+                          event.preventDefault();
                           if (confirm('Delete {escape(cname)}? This cannot be undone.')) {{
                             const u = new URL(window.location.href);
                             u.searchParams.set('act','delete');
                             u.searchParams.set('id','{cid}');
                             window.location.href = u.toString();
                           }}
+                          return false;
                         ">⌫</a>
                       </div>
                     </div>
@@ -1469,12 +1526,15 @@ with tab_clients:
                         <span class="client-status inactive">inactive</span>
                       </div>
                       <div class="action-bar">
-                        <a class="icon-btn" data-tip="View report" title="View report" href="javascript:void(0)" onclick="
+                        <a class="icon-btn" data-tip="View report" title="View report" href="#" onclick="
+                          event.preventDefault();
                           const u = new URL(window.location.href);
                           u.searchParams.set('report','{escape(cnorm)}');
                           window.location.href = u.toString();
+                          return false;
                         ">▦</a>
-                        <a class="icon-btn" data-tip="Rename client" title="Rename" href="javascript:void(0)" onclick="
+                        <a class="icon-btn" data-tip="Rename client" title="Rename" href="#" onclick="
+                          event.preventDefault();
                           const newName = prompt('Rename client: {escape(cname)}','{escape(cname)}');
                           if (newName && newName.trim()) {{
                             const u = new URL(window.location.href);
@@ -1483,20 +1543,25 @@ with tab_clients:
                             u.searchParams.set('arg', newName.trim());
                             window.location.href = u.toString();
                           }}
+                          return false;
                         ">✎</a>
-                        <a class="icon-btn" data-tip="Activate client" title="Activate" href="javascript:void(0)" onclick="
+                        <a class="icon-btn" data-tip="Activate client" title="Activate" href="#" onclick="
+                          event.preventDefault();
                           const u = new URL(window.location.href);
                           u.searchParams.set('act','toggle');
                           u.searchParams.set('id','{cid}');
                           window.location.href = u.toString();
+                          return false;
                         ">●</a>
-                        <a class="icon-btn danger" data-tip="Delete client" title="Delete" href="javascript:void(0)" onclick="
+                        <a class="icon-btn danger" data-tip="Delete client" title="Delete" href="#" onclick="
+                          event.preventDefault();
                           if (confirm('Delete {escape(cname)}? This cannot be undone.')) {{
                             const u = new URL(window.location.href);
                             u.searchParams.set('act','delete');
                             u.searchParams.set('id','{cid}');
                             window.location.href = u.toString();
                           }}
+                          return false;
                         ">⌫</a>
                       </div>
                     </div>
