@@ -1,6 +1,6 @@
 # Address Alchemist — paste addresses AND arbitrary listing links → Zillow
 # Preview-first sharing + optional tracking + always log sent_at
-# See feature list in the message above.
+# Clients tab: always show lists; inline client report (addresses as hyperlinks).
 
 import os, csv, io, re, time, json, asyncio
 from datetime import datetime
@@ -940,6 +940,7 @@ def _qp_set(**kwargs):
 act = _qp_get("act", "")
 cid = _qp_get("id", "")
 arg = _qp_get("arg", "")
+report_norm = _qp_get("report", "")  # <-- if set, we render inline report but still show lists
 
 if act and cid:
     try:
@@ -1326,10 +1327,74 @@ with tab_run:
         if not clicked:
             st.info("Paste addresses or links (or upload CSV), then click **Run**.")
 
+# ---------- Sent reports ----------
+@st.cache_data(ttl=120, show_spinner=False)
+def fetch_sent_for_client(client_norm: str, limit: int = 5000):
+    """
+    Fetch sent rows for a given normalized client name from Supabase.
+    Returns list of dicts: [{url, address, sent_at, campaign, mls_id, canonical, zpid}, ...]
+    """
+    if not (_supabase_available() and client_norm.strip()):
+        return []
+    try:
+        cols = "url,address,sent_at,campaign,mls_id,canonical,zpid"
+        resp = SUPABASE.table("sent")\
+            .select(cols)\
+            .eq("client", client_norm.strip())\
+            .order("sent_at", desc=True)\
+            .limit(limit)\
+            .execute()
+        return resp.data or []
+    except Exception:
+        return []
+
+def _render_client_report_view(client_display_name: str, client_norm: str):
+    """Render a simple report: address as hyperlink → Zillow."""
+    st.markdown(f"### Report: {escape(client_display_name)}", unsafe_allow_html=True)
+    rows = fetch_sent_for_client(client_norm)
+    count = len(rows)
+    st.caption(f"{count} listing{'s' if count!=1 else ''} sent")
+
+    if not rows:
+        st.info("No sent listings logged for this client yet.")
+        return
+
+    # Build a simple list: address text → href = url
+    items_html = []
+    for r in rows:
+        url = (r.get("url") or "").strip()
+        addr = (r.get("address") or "").strip() or "View on Zillow"
+        sent_at = r.get("sent_at") or ""
+        items_html.append(
+            f"""<li>
+                  <a href="{escape(url)}" target="_blank" rel="noopener">{escape(addr)}</a>
+                  <span style="color:#64748b; font-size:12px; margin-left:6px;">{escape(sent_at)}</span>
+                </li>"""
+        )
+    html = "<ul class='link-list'>" + "\n".join(items_html) + "</ul>"
+    st.markdown(html, unsafe_allow_html=True)
+
+    # Optional: export CSV of this report
+    with st.expander("Export report"):
+        import pandas as pd
+        df = pd.DataFrame(rows)
+        csv_buf = io.StringIO()
+        df.to_csv(csv_buf, index=False)
+        st.download_button("Download CSV", data=csv_buf.getvalue(),
+                           file_name=f"client_report_{client_norm}_{datetime.utcnow().strftime('%Y%m%d%H%M%S')}.csv",
+                           mime="text/csv", use_container_width=False)
+
 # ---------- CLIENTS TAB ----------
 with tab_clients:
     st.subheader("Clients")
     st.caption("Manage active and inactive clients. “test test” is always hidden.")
+
+    # If ?report=<client_norm> is present, show the report panel (lists remain visible below)
+    if report_norm:
+        all_clients_for_title = fetch_clients(include_inactive=True)
+        display_name = next((c["name"] for c in all_clients_for_title if c.get("name_norm")==report_norm), report_norm)
+        _render_client_report_view(display_name, report_norm)
+        st.markdown("---")
 
     all_clients = fetch_clients(include_inactive=True)
     active = [c for c in all_clients if c.get("active")]
@@ -1344,7 +1409,7 @@ with tab_clients:
             st.write("_No active clients_")
         else:
             for c in active:
-                cid = c["id"]; cname = c["name"]
+                cid = c["id"]; cname = c["name"]; cnorm = c.get("name_norm","")
                 st.markdown(
                     f"""
                     <div class="client-row">
@@ -1353,6 +1418,11 @@ with tab_clients:
                         <span class="client-status active">active</span>
                       </div>
                       <div class="action-bar">
+                        <a class="icon-btn" data-tip="View report" title="View report" href="javascript:void(0)" onclick="
+                          const u = new URL(window.location.href);
+                          u.searchParams.set('report','{escape(cnorm)}');
+                          window.location.href = u.toString();
+                        ">▦</a>
                         <a class="icon-btn" data-tip="Rename client" title="Rename" href="javascript:void(0)" onclick="
                           const newName = prompt('Rename client: {escape(cname)}','{escape(cname)}');
                           if (newName && newName.trim()) {{
@@ -1390,7 +1460,7 @@ with tab_clients:
             st.write("_No inactive clients_")
         else:
             for c in inactive:
-                cid = c["id"]; cname = c["name"]
+                cid = c["id"]; cname = c["name"]; cnorm = c.get("name_norm","")
                 st.markdown(
                     f"""
                     <div class="client-row">
@@ -1399,6 +1469,11 @@ with tab_clients:
                         <span class="client-status inactive">inactive</span>
                       </div>
                       <div class="action-bar">
+                        <a class="icon-btn" data-tip="View report" title="View report" href="javascript:void(0)" onclick="
+                          const u = new URL(window.location.href);
+                          u.searchParams.set('report','{escape(cnorm)}');
+                          window.location.href = u.toString();
+                        ">▦</a>
                         <a class="icon-btn" data-tip="Rename client" title="Rename" href="javascript:void(0)" onclick="
                           const newName = prompt('Rename client: {escape(cname)}','{escape(cname)}');
                           if (newName && newName.trim()) {{
