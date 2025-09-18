@@ -93,6 +93,7 @@ textarea:focus { outline:3px solid #93c5fd !important; outline-offset:2px; }
   --chip-inactive-bg:#fee2e2; --chip-inactive-fg:#991b1b;
   --row-border: #e2e8f0;
   --row-hover:  #f8fafc;
+  --tooltip-bg:#0b1220; --tooltip-fg:#f8fafc;
 }
 html[data-theme="dark"], .stApp [data-theme="dark"] {
   --text-strong: #f8fafc;
@@ -101,16 +102,47 @@ html[data-theme="dark"], .stApp [data-theme="dark"] {
   --chip-inactive-bg:#7f1d1d; --chip-inactive-fg:#fecaca;
   --row-border: #0b1220;
   --row-hover:  #0f172a;
+  --tooltip-bg:#0b1220; --tooltip-fg:#f8fafc;
 }
 
 /* Section heading */
 .clients-h3 { color: var(--text-muted); font-weight: 700; margin: 8px 0 6px; }
 
 /* For any non-iframe client rows you might render in the future */
-.client-row { padding: 12px 8px; border-bottom: 1px solid var(--row-border); }
-.client-name { color: var(--text-strong); font-weight: 700; }
+.client-row { padding: 10px 8px; border-bottom: 1px solid var(--row-border); display:flex; align-items:center; justify-content:space-between; }
+.client-main { display:flex; align-items:center; gap:8px; min-width:0; }
+.client-name { color: var(--text-strong); font-weight:700; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.client-status { font-size:11px; padding:1px 6px; border-radius:999px; background:#e2e8f0; color:var(--text-strong); }
 .client-status.active   { background: var(--chip-active-bg);   color: var(--chip-active-fg); }
 .client-status.inactive { background: var(--chip-inactive-bg); color: var(--chip-inactive-fg); }
+
+/* Tiny inline icon buttons (no text) */
+.action-bar { display:inline-flex; gap:4px; align-items:center; }
+.icon-btn {
+  border:0; background:transparent; padding:2px 6px; border-radius:6px;
+  font-size:12px; line-height:1; cursor:pointer; color:#64748b;
+  text-decoration:none; display:inline-flex; align-items:center; justify-content:center;
+}
+.icon-btn:hover { background:var(--row-hover); color:var(--text-strong); }
+
+/* Tooltips for icon buttons */
+.icon-btn[data-tip] { position:relative; }
+.icon-btn[data-tip]:hover::after {
+  content: attr(data-tip);
+  position:absolute; top:-28px; right:0;
+  background:var(--tooltip-bg); color:var(--tooltip-fg);
+  font-size:10px; font-weight:700;
+  padding:4px 6px; border-radius:6px; white-space:nowrap;
+  box-shadow:0 6px 18px rgba(0,0,0,.18);
+  pointer-events:none;
+}
+.icon-btn[data-tip]:hover::before {
+  content:""; position:absolute; top:-6px; right:8px;
+  border:5px solid transparent; border-top-color:var(--tooltip-bg);
+}
+
+/* Danger hover color for delete */
+.icon-btn.danger:hover { background:#fee2e2; color:#991b1b; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -1369,169 +1401,97 @@ def _scroll_to(element_id: str):
         height=0,
     )
 
-# ---------- Tiny client row (self-contained CSS in iframe) ----------
-def _client_row_html(name: str, norm: str, cid: int, active: bool):
+# ---------- INLINE (non-iframe) client row with tiny icon buttons ----------
+def _client_row_html_inline(name: str, norm: str, cid: int, active: bool):
     """
-    Renders a single client row with tiny, hover-only icons INSIDE the component iframe.
-    Uses top-window navigation via anchors (target="_top") so actions always work.
+    Renders a client row directly in the page (NOT in an iframe) so clicks update the
+    parent URL query params reliably. Icons are tiny and show tooltip on hover.
     """
     status = "active" if active else "inactive"
     view_toggle_label = "Deactivate" if active else "Activate"
     view_toggle_icon  = "○" if active else "●"
 
-    # All actions are either anchors with target="_top" or a form that posts to _top.
+    # Links use GET params that the top-of-file handler processes.
+    # Report link sets ?report=<norm>&scroll=1 and jumps to the report anchor.
     html = f"""
-<!DOCTYPE html>
-<html>
-<head>
-<meta charset="utf-8">
-<style>
-  :root {{
-    --text-strong:#0f172a;
-    --row-hover:#f8fafc;
-    --chip-active-bg:#dcfce7; --chip-active-fg:#166534;
-    --chip-inactive-bg:#fee2e2; --chip-inactive-fg:#991b1b;
-    --tooltip-bg:#0b1220; --tooltip-fg:#f8fafc;
-  }}
-  @media (prefers-color-scheme: dark) {{
-    :root {{
-      --text-strong:#f8fafc;
-      --row-hover:#0f172a;
-    }}
-  }}
-  html,body {{ margin:0; padding:0; font-family:-apple-system, Segoe UI, Roboto, Arial, sans-serif; }}
-  .client-row {{ display:flex; align-items:center; justify-content:space-between; padding:10px 8px; border-bottom:1px solid rgba(0,0,0,.08); }}
-  .client-main {{ display:flex; align-items:center; gap:8px; min-width:0; }}
-  .client-name {{ font-weight:700; color:var(--text-strong); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }}
-  .client-status {{ font-size:11px; padding:1px 6px; border-radius:999px; background:#e2e8f0; color:var(--text-strong); }}
-  .client-status.active   {{ background:var(--chip-active-bg);   color:var(--chip-active-fg); }}
-  .client-status.inactive {{ background:var(--chip-inactive-bg); color:var(--chip-inactive-fg); }}
-
-  .action-bar {{ display:inline-flex; gap:4px; align-items:center; opacity:0; visibility:hidden; transition:opacity .12s ease, visibility .12s ease; }}
-  .client-row:hover .action-bar {{ opacity:1; visibility:visible; }}
-
-  .icon-btn {{
-    border:0; background:transparent; padding:2px 6px; border-radius:6px;
-    font-size:12px; color:#64748b; cursor:pointer; line-height:1;
-    display:inline-flex; align-items:center; justify-content:center; text-decoration:none;
-  }}
-  .icon-btn:hover, .icon-btn:focus {{ background:var(--row-hover); color:var(--text-strong); outline:none; }}
-  .icon-btn.danger:hover {{ background:#fee2e2; color:#991b1b; }}
-
-  /* Custom tooltips + also rely on native title attr */
-  .icon-btn[data-tip] {{ position:relative; }}
-  .icon-btn[data-tip]:hover::after, .icon-btn[data-tip]:focus::after {{
-    content: attr(data-tip);
-    position:absolute; top:-28px; right:0;
-    background:var(--tooltip-bg); color:var(--tooltip-fg);
-    font-size:10px; font-weight:700; padding:4px 6px; border-radius:6px; white-space:nowrap;
-    box-shadow:0 6px 18px rgba(0,0,0,.18); pointer-events:none;
-  }}
-  .icon-btn[data-tip]:hover::before, .icon-btn[data-tip]:focus::before {{
-    content:""; position:absolute; top:-6px; right:8px;
-    border:5px solid transparent; border-top-color:var(--tooltip-bg);
-  }}
-
-  /* Hidden rename form posted to _top */
-  form.rename {{ display:inline; margin:0; padding:0; }}
-  form.rename input[type=hidden] {{ display:none; }}
-</style>
-</head>
-<body>
-  <div class="client-row">
-    <div class="client-main">
-      <span class="client-name">{escape(name)}</span>
-      <span class="client-status {status}">{status}</span>
-    </div>
-    <div class="action-bar">
-      <!-- View report (works without JS) -->
-      <a class="icon-btn" href="?report={escape(norm)}&scroll=1" target="_top"
-         title="View report" aria-label="View report" data-tip="View report">▦</a>
-
-      <!-- Rename (prompt then submit to _top) -->
-      <form class="rename" method="get" target="_top" onsubmit="return true;">
-        <input type="hidden" name="act" value="rename" />
-        <input type="hidden" name="id" value="{cid}" />
-        <input type="hidden" name="arg" value="" />
-        <a href="#" class="icon-btn" title="Rename" aria-label="Rename" data-tip="Rename"
-           onclick="
-             const v = prompt('Rename client: {escape(name)}', '{escape(name)}');
-             if (!v || !v.trim()) return false;
-             this.previousElementSibling.value = v.trim(); // set arg
-             this.parentElement.submit();
-             return false;
-           ">✎</a>
-      </form>
-
-      <!-- Toggle active/inactive -->
-      <a class="icon-btn" href="?act=toggle&id={cid}" target="_top"
-         title="{view_toggle_label}" aria-label="{view_toggle_label}" data-tip="{view_toggle_label}">{view_toggle_icon}</a>
-
-      <!-- Delete (confirm then navigate) -->
-      <a class="icon-btn danger" href="?act=delete&id={cid}" target="_top"
-         title="Delete" aria-label="Delete" data-tip="Delete"
-         onclick="if(!confirm('Delete {escape(name)}? This cannot be undone.')) return false;">⌫</a>
-    </div>
+<div class="client-row">
+  <div class="client-main">
+    <span class="client-name">{escape(name)}</span>
+    <span class="client-status {status}">{status}</span>
   </div>
-</body>
-</html>
+  <div class="action-bar">
+    <a class="icon-btn" data-tip="View report"
+       href="?report={escape(norm)}&scroll=1#report_anchor">▦</a>
+    <a class="icon-btn" data-tip="Rename"
+       href="#"
+       onclick="
+         const newName = prompt('Rename client: {escape(name)}','{escape(name)}');
+         if (newName && newName.trim()) {{
+           const u = new URL(window.location.href);
+           u.searchParams.set('act','rename');
+           u.searchParams.set('id','{cid}');
+           u.searchParams.set('arg', newName.trim());
+           window.location.href = u.toString();
+         }}
+         return false;
+       ">✎</a>
+    <a class="icon-btn" data-tip="{view_toggle_label}"
+       href="?act=toggle&id={cid}">{view_toggle_icon}</a>
+    <a class="icon-btn danger" data-tip="Delete"
+       href="#"
+       onclick="
+         if (confirm('Delete {escape(name)}? This cannot be undone.')) {{
+           const u = new URL(window.location.href);
+           u.searchParams.set('act','delete');
+           u.searchParams.set('id','{cid}');
+           window.location.href = u.toString();
+         }}
+         return false;
+       ">⌫</a>
+  </div>
+</div>
 """
-    components.html(html, height=44, scrolling=False)
+    st.markdown(html, unsafe_allow_html=True)
 
 # ---------- CLIENTS TAB ----------
 with tab_clients:
     st.subheader("Clients")
     st.caption("Manage active and inactive clients. “test test” is always hidden.")
 
+    # Read query params (report will render only when present)
+    report_norm_qp = _qp_get("report", "")
+    want_scroll = _qp_get("scroll", "") in ("1","true","yes")
+
     all_clients = fetch_clients(include_inactive=True)
     active = [c for c in all_clients if c.get("active")]
     inactive = [c for c in all_clients if not c.get("active")]
 
-    def render_client_row(c):
-        col1, col2, col3, col4, col5 = st.columns([2,1,1,1,1])
-        with col1:
-            st.markdown(f"**{c['name']}**")
-            st.caption("active" if c["active"] else "inactive")
-        with col2:
-            if st.button("📑 Report", key=f"report_{c['id']}"):
-                st.session_state["report_client"] = c["name_norm"]
-        with col3:
-            if st.button("✎ Rename", key=f"rename_{c['id']}"):
-                new_name = st.text_input(f"Rename {c['name']}", value=c["name"], key=f"rename_input_{c['id']}")
-                if st.button(f"Confirm rename {c['id']}"):
-                    rename_client(c["id"], new_name)
-                    _safe_rerun()
-        with col4:
-            toggle_label = "Deactivate" if c["active"] else "Activate"
-            if st.button(toggle_label, key=f"toggle_{c['id']}"):
-                toggle_client_active(c["id"], not c["active"])
-                _safe_rerun()
-        with col5:
-            if st.button("⌫ Delete", key=f"delete_{c['id']}"):
-                delete_client(c["id"])
-                _safe_rerun()
-
     colA, colB = st.columns(2)
 
+    # Active list
     with colA:
-        st.markdown("### Active")
+        st.markdown("### Active", unsafe_allow_html=True)
         if not active:
             st.write("_No active clients_")
         else:
             for c in active:
-                render_client_row(c)
+                _client_row_html_inline(c["name"], c.get("name_norm",""), c["id"], active=True)
 
+    # Inactive list
     with colB:
-        st.markdown("### Inactive")
+        st.markdown("### Inactive", unsafe_allow_html=True)
         if not inactive:
             st.write("_No inactive clients_")
         else:
             for c in inactive:
-                render_client_row(c)
+                _client_row_html_inline(c["name"], c.get("name_norm",""), c["id"], active=False)
 
-    # ---- REPORT SECTION BELOW ----
-    if "report_client" in st.session_state and st.session_state["report_client"]:
-        client_norm = st.session_state["report_client"]
-        display_name = next((c["name"] for c in all_clients if c.get("name_norm")==client_norm), client_norm)
+    # ---- REPORT SECTION BELOW THE TABLES (hidden unless report=...) ----
+    st.markdown('<div id="report_anchor"></div>', unsafe_allow_html=True)
+    if report_norm_qp:
+        display_name = next((c["name"] for c in all_clients if c.get("name_norm")==report_norm_qp), report_norm_qp)
         st.markdown("---")
-        _render_client_report_view(display_name, client_norm)
+        _render_client_report_view(display_name, report_norm_qp)
+        if want_scroll:
+            _scroll_to("report_anchor")
+            _qp_set(report=report_norm_qp)
