@@ -670,7 +670,7 @@ def extract_zillow_first_image(html: str) -> Optional[str]:
         )
         if m: return m.group(1)
     m = re.search(r"srcset=['\"]([^'\"]*photos\.zillowstatic\.com[^'\"]+)['\"]", html, re.I)
-        # choose the largest <=1152w, else the largest overall
+    # choose the largest <=1152w, else the largest overall
     if m:
         cand=[]
         for part in m.group(1).split(","):
@@ -703,7 +703,7 @@ def parse_listing_meta(html: str) -> Dict[str, Any]:
     meta["summary"] = summarize_remarks(remark or "")
     meta["highlights"] = extract_highlights(remark or "")
     return meta
-async def enrich_results_async(results: List[Dict[str, Any]]) -> List[Dict[str, Any]]]:
+async def enrich_results_async(results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     targets = [(i, r["zillow_url"]) for i, r in enumerate(results) if "/homedetails/" in (r.get("zillow_url") or "")]
     if not targets: return results
     limits = min(12, max(4, len(targets)))
@@ -845,12 +845,12 @@ def log_sent_rows(results: List[Dict[str, Any]], client_tag: str, campaign_tag: 
         rows.append({
             "client":     (client_tag or "").strip(),
             "campaign":   (campaign_tag or "").strip(),
-            "url":        raw_url,
+            "url":        raw_url,               # log previewable link
             "canonical":  canon,
             "zpid":       zpid,
             "mls_id":     (r.get("mls_id") or "").strip() or None,
             "address":    (r.get("input_address") or "").strip() or None,
-            "sent_at":    now_iso,  # always set
+            "sent_at":    now_iso,               # always set
         })
     if not rows: return False, "No valid rows to log."
     try:
@@ -1083,7 +1083,7 @@ with tab_run:
                 norm = (parts.get("AddressNumber","") + " " +
                         " ".join([parts.get(k,"") for k in ["StreetNamePreDirectional","StreetName","StreetNamePostType","OccupancyType","OccupancyIdentifier"]]).strip())
                 cityst = ((", " + parts.get("PlaceName","") + ", " + parts.get("StateName","") +
-                           (" " + parts.get("ZipCode","") if parts.get("ZipCode") else "")) if (parts.get("PlaceName") or (parts.get("StateName"))) else "")
+                           (" " + parts.get("ZipCode","") if parts.get("ZipCode") else "")) if (parts.get("PlaceName") or parts.get("StateName")) else "")
                 lines_clean.append(re.sub(r"\s+"," ", (norm + cityst).strip()))
             else:
                 lines_clean.append(ln)
