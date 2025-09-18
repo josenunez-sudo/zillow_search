@@ -67,7 +67,7 @@ st.set_page_config(
     layout="centered",
 )
 
-# Base styles
+# Base styles (apply to Streamlit page)
 st.markdown("""
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@700;800&display=swap');
@@ -85,7 +85,7 @@ textarea:focus { outline:3px solid #93c5fd !important; outline-offset:2px; }
 .badge { display:inline-block; font-size:12px; font-weight:700; padding:2px 8px; border-radius:999px; margin-left:8px; background:#dcfce7; color:#166534; }
 .badge.dup { background:#fee2e2; color:#991b1b; }
 
-/* --- Theme-aware colors --- */
+/* Theme variables */
 :root {
   --text-strong: #0f172a;
   --text-muted:  #475569;
@@ -93,8 +93,6 @@ textarea:focus { outline:3px solid #93c5fd !important; outline-offset:2px; }
   --chip-inactive-bg:#fee2e2; --chip-inactive-fg:#991b1b;
   --row-border: #e2e8f0;
   --row-hover:  #f8fafc;
-  --tooltip-bg: #0b1220;
-  --tooltip-fg: #f8fafc;
 }
 html[data-theme="dark"], .stApp [data-theme="dark"] {
   --text-strong: #f8fafc;
@@ -105,58 +103,14 @@ html[data-theme="dark"], .stApp [data-theme="dark"] {
   --row-hover:  #0f172a;
 }
 
-/* --- Clients list, minimalist --- */
-.client-row {
-  display: flex; align-items: center; justify-content: space-between;
-  padding: 12px 8px; border-bottom: 1px solid var(--row-border);
-}
-.client-main { display:flex; align-items:center; gap:10px; min-width: 0; }
-.client-name {
-  color: var(--text-strong);
-  font-weight: 600; letter-spacing: .1px; line-height: 1.35;
-  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
-}
-.client-status {
-  font-size: 11px; padding: 1px 6px; border-radius: 999px;
-  background: #e2e8f0; color: var(--text-strong);
-}
-
-/* Hover-only inline action bar — tiny, subtle */
-.action-bar {
-  display: inline-flex; gap: 4px; align-items: center;
-  opacity: 0; visibility: hidden;
-  transition: opacity .12s ease, visibility .12s ease;
-}
-.client-row:hover .action-bar { opacity: 1; visibility: visible; }
-
-.icon-btn {
-  border: 0; background: transparent; padding: 2px 5px; border-radius: 6px;
-  font-size: 12px; color:#64748b; cursor: pointer; text-decoration: none;
-  line-height: 1; display:inline-flex; align-items:center; justify-content:center;
-}
-.icon-btn:hover { background: var(--row-hover); color: var(--text-strong); }
-.icon-btn.danger:hover { background: #fee2e2; color: #991b1b; }
-
-/* Tooltips */
-.icon-btn[data-tip]{ position: relative; }
-.icon-btn[data-tip]:hover::after {
-  content: attr(data-tip);
-  position: absolute; top: -30px; right: 0;
-  background: var(--tooltip-bg); color: var(--tooltip-fg);
-  font-size: 10px; font-weight: 700;
-  padding: 4px 6px; border-radius: 6px; white-space: nowrap;
-  pointer-events: none; box-shadow: 0 6px 18px rgba(0,0,0,.18);
-}
-.icon-btn[data-tip]:hover::before {
-  content: ""; position: absolute; top: -6px; right: 8px;
-  border: 5px solid transparent; border-top-color: var(--tooltip-bg);
-}
-
-/* section headings */
+/* Section heading */
 .clients-h3 { color: var(--text-muted); font-weight: 700; margin: 8px 0 6px; }
 
-/* Ensure the right column doesn't inflate button sizes */
-.right-actions { display:flex; gap:6px; justify-content:flex-end; align-items:center; }
+/* For any non-iframe client rows you might render in the future */
+.client-row { padding: 12px 8px; border-bottom: 1px solid var(--row-border); }
+.client-name { color: var(--text-strong); font-weight: 700; }
+.client-status.active   { background: var(--chip-active-bg);   color: var(--chip-active-fg); }
+.client-status.inactive { background: var(--chip-inactive-bg); color: var(--chip-inactive-fg); }
 </style>
 """, unsafe_allow_html=True)
 
@@ -180,9 +134,6 @@ html[data-theme="dark"], .stApp [data-theme="dark"] {
 }
 .client-name { color: var(--aa-text-strong) !important; font-weight: 700; }
 .client-status { color: var(--aa-text-strong) !important; font-size:11px !important; }
-.client-status.active   { background: var(--aa-chip-active-bg) !important;   color: var(--aa-chip-active-fg) !important; }
-.client-status.inactive { background: var(--aa-chip-inactive-bg) !important; color: var(--aa-chip-inactive-fg) !important; }
-.client-row { color: var(--aa-text-strong) !important; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -624,7 +575,7 @@ def process_single_row(row, *, delay=0.5, land_mode=True, defaults=None,
     time.sleep(min(delay, 0.4))
     return {"input_address": query_address, "mls_id": mls_id, "zillow_url": zurl, "status": status, "csv_photo": csv_photo}
 
-# Enrichment (FIXED: regex raw strings use single backslashes)
+# Enrichment (regex strings fixed)
 RE_PRICE  = re.compile(r'"(?:price|unformattedPrice|priceZestimate)"\s*:\s*"?\$?([\d,]+)"?', re.I)
 RE_STATUS = re.compile(r'"(?:homeStatus|statusText)"\s*:\s*"([^"]+)"', re.I)
 RE_BEDS   = re.compile(r'"(?:bedrooms|beds)"\s*:\s*(\d+)', re.I)
@@ -1418,65 +1369,142 @@ def _scroll_to(element_id: str):
         height=0,
     )
 
-# ---------- Tiny icon row (safe, JS updates parent.location) ----------
+# ---------- Tiny client row (self-contained CSS in iframe) ----------
 def _client_row_html(name: str, norm: str, cid: int, active: bool):
     """
-    Renders a single client row with tiny hover-only icons.
-    Uses JS to set parent URL search params and reload (no about:blank).
+    Renders a single client row with tiny, hover-only icons INSIDE the component iframe.
+    This isolates styling so icons stay inline, subtle, and hidden until hover.
     """
     status = "active" if active else "inactive"
+    view_toggle_label = "Deactivate" if active else "Activate"
+    view_toggle_icon  = "○" if active else "●"
+
     html = f"""
-    <div class="client-row">
-      <div class="client-main">
-        <span class="client-name">{escape(name)}</span>
-        <span class="client-status {status}">{status}</span>
-      </div>
-      <div class="action-bar right-actions">
-        <button class="icon-btn" data-tip="View report" onclick="
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  :root {{
+    --text-strong:#0f172a;
+    --row-hover:#f8fafc;
+    --chip-active-bg:#dcfce7; --chip-active-fg:#166534;
+    --chip-inactive-bg:#fee2e2; --chip-inactive-fg:#991b1b;
+    --tooltip-bg:#0b1220; --tooltip-fg:#f8fafc;
+  }}
+  @media (prefers-color-scheme: dark) {{
+    :root {{
+      --text-strong:#f8fafc;
+      --row-hover:#0f172a;
+    }}
+  }}
+  html,body {{
+    margin:0; padding:0;
+    font-family:-apple-system, Segoe UI, Roboto, Arial, sans-serif;
+  }}
+  .client-row {{
+    display:flex; align-items:center; justify-content:space-between;
+    padding:10px 8px; border-bottom:1px solid rgba(0,0,0,.08);
+  }}
+  .client-main {{ display:flex; align-items:center; gap:8px; min-width:0; }}
+  .client-name {{
+    font-weight:700; color:var(--text-strong);
+    white-space:nowrap; overflow:hidden; text-overflow:ellipsis;
+  }}
+  .client-status {{
+    font-size:11px; padding:1px 6px; border-radius:999px;
+    background:#e2e8f0; color:var(--text-strong);
+  }}
+  .client-status.active   {{ background:var(--chip-active-bg);   color:var(--chip-active-fg); }}
+  .client-status.inactive {{ background:var(--chip-inactive-bg); color:var(--chip-inactive-fg); }}
+
+  /* HOVER-ONLY tiny action bar */
+  .action-bar {{
+    display:inline-flex; gap:4px; align-items:center;
+    opacity:0; visibility:hidden;
+    transition:opacity .12s ease, visibility .12s ease;
+  }}
+  .client-row:hover .action-bar {{ opacity:1; visibility:visible; }}
+
+  .icon-btn {{
+    border:0; background:transparent; padding:2px 5px; border-radius:6px;
+    font-size:12px; color:#64748b; cursor:pointer; line-height:1;
+    display:inline-flex; align-items:center; justify-content:center;
+  }}
+  .icon-btn:hover {{ background:var(--row-hover); color:var(--text-strong); }}
+  .icon-btn.danger:hover {{ background:#fee2e2; color:#991b1b; }}
+
+  /* Tooltips within iframe */
+  .icon-btn[data-tip] {{ position:relative; }}
+  .icon-btn[data-tip]:hover::after {{
+    content: attr(data-tip);
+    position:absolute; top:-28px; right:0;
+    background:var(--tooltip-bg); color:var(--tooltip-fg);
+    font-size:10px; font-weight:700;
+    padding:4px 6px; border-radius:6px; white-space:nowrap;
+    box-shadow:0 6px 18px rgba(0,0,0,.18);
+    pointer-events:none;
+  }}
+  .icon-btn[data-tip]:hover::before {{
+    content:""; position:absolute; top:-6px; right:8px;
+    border:5px solid transparent; border-top-color:var(--tooltip-bg);
+  }}
+</style>
+</head>
+<body>
+  <div class="client-row">
+    <div class="client-main">
+      <span class="client-name">{escape(name)}</span>
+      <span class="client-status {status}">{status}</span>
+    </div>
+    <div class="action-bar">
+      <button class="icon-btn" data-tip="View report" onclick="
+        const u = new URL(parent.location.href);
+        u.searchParams.set('report','{escape(norm)}');
+        u.searchParams.set('scroll','1');
+        parent.location.href = u.toString();
+        return false;
+      ">▦</button>
+      <button class="icon-btn" data-tip="Rename" onclick="
+        const newName = prompt('Rename client: {escape(name)}','{escape(name)}');
+        if (newName && newName.trim()) {{
           const u = new URL(parent.location.href);
-          u.searchParams.set('report','{escape(norm)}');
-          u.searchParams.set('scroll','1');
+          u.searchParams.set('act','rename');
+          u.searchParams.set('id','{cid}');
+          u.searchParams.set('arg', newName.trim());
           parent.location.href = u.toString();
-          return false;
-        ">▦</button>
-        <button class="icon-btn" data-tip="Rename" onclick="
-          const newName = prompt('Rename client: {escape(name)}','{escape(name)}');
-          if (newName && newName.trim()) {{
-            const u = new URL(parent.location.href);
-            u.searchParams.set('act','rename');
-            u.searchParams.set('id','{cid}');
-            u.searchParams.set('arg', newName.trim());
-            parent.location.href = u.toString();
-          }}
-          return false;
-        ">✎</button>
-        <button class="icon-btn" data-tip="{('Deactivate' if active else 'Activate')}" onclick="
+        }}
+        return false;
+      ">✎</button>
+      <button class="icon-btn" data-tip="{view_toggle_label}" onclick="
+        const u = new URL(parent.location.href);
+        u.searchParams.set('act','toggle');
+        u.searchParams.set('id','{cid}');
+        parent.location.href = u.toString();
+        return false;
+      ">{view_toggle_icon}</button>
+      <button class="icon-btn danger" data-tip="Delete" onclick="
+        if (confirm('Delete {escape(name)}? This cannot be undone.')) {{
           const u = new URL(parent.location.href);
-          u.searchParams.set('act','toggle');
+          u.searchParams.set('act','delete');
           u.searchParams.set('id','{cid}');
           parent.location.href = u.toString();
-          return false;
-        ">{('○' if active else '●')}</button>
-        <button class="icon-btn danger" data-tip="Delete" onclick="
-          if (confirm('Delete {escape(name)}? This cannot be undone.')) {{
-            const u = new URL(parent.location.href);
-            u.searchParams.set('act','delete');
-            u.searchParams.set('id','{cid}');
-            parent.location.href = u.toString();
-          }}
-          return false;
-        ">⌫</button>
-      </div>
+        }}
+        return false;
+      ">⌫</button>
     </div>
-    """
-    components.html(html, height=48, scrolling=False)
+  </div>
+</body>
+</html>
+"""
+    components.html(html, height=44, scrolling=False)
 
 # ---------- CLIENTS TAB ----------
 with tab_clients:
     st.subheader("Clients")
     st.caption("Manage active and inactive clients. “test test” is always hidden.")
 
-    # Read query params (we'll render report AFTER the lists)
+    # Read query params (report will render only when present)
     report_norm_qp = _qp_get("report", "")
     want_scroll = _qp_get("scroll", "") in ("1","true","yes")
 
@@ -1504,14 +1532,12 @@ with tab_clients:
             for c in inactive:
                 _client_row_html(c["name"], c.get("name_norm",""), c["id"], active=False)
 
-    # ---- REPORT SECTION BELOW THE TABLES ----
+    # ---- REPORT SECTION BELOW THE TABLES (hidden unless report=...) ----
     st.markdown('<div id="report_anchor"></div>', unsafe_allow_html=True)
-
     if report_norm_qp:
         display_name = next((c["name"] for c in all_clients if c.get("name_norm")==report_norm_qp), report_norm_qp)
         st.markdown("---")
         _render_client_report_view(display_name, report_norm_qp)
-
         if want_scroll:
             _scroll_to("report_anchor")
             _qp_set(report=report_norm_qp)
