@@ -1,13 +1,12 @@
 # Address Alchemist — paste addresses AND arbitrary listing links → Zillow
 # Preview-first sharing + optional tracking + always log sent_at
 # Clients tab: always show lists; inline client report (addresses as hyperlinks).
-# FIX: removed inline JS; all client actions now use real links with query params.
 
 import os, csv, io, re, time, json, asyncio
 from datetime import datetime
 from typing import List, Dict, Any, Optional, Tuple
 from html import escape
-from urllib.parse import urlencode
+from urllib.parse import quote  # for safe query param links
 
 import requests
 import httpx
@@ -161,7 +160,7 @@ html[data-theme="dark"], .stApp [data-theme="dark"] {
 </style>
 """, unsafe_allow_html=True)
 
-# Extra legibility variables
+# Extra theme-safe overrides for legibility
 st.markdown("""
 <style>
 :root {
@@ -174,7 +173,7 @@ html[data-theme="dark"], .stApp [data-theme="dark"] {
   --aa-text-strong: #f8fafc;
   --aa-text-muted:  #cbd5e1;
   --aa-chip-active-bg:  #064e3b; --aa-chip-active-fg:#a7f3d0;
-  --aa-chip-inactive-bg:#7f1d1d; --aa-chip-inactive-fg:#fecaca;
+  --aa-chip-inactive-bg: #7f1d1d; --aa-chip-inactive-fg:#fecaca;
 }
 @media (prefers-color-scheme: dark) {
   :root { --aa-text-strong: #f8fafc; --aa-text-muted: #cbd5e1; }
@@ -222,12 +221,6 @@ def _norm_tag(s: str) -> str:
 def _sb_ok() -> bool:
     try: return bool(SUPABASE)
     except NameError: return False
-
-def build_href(**qs) -> str:
-    """Return a simple relative URL like '?key=val&...' for icon links."""
-    # Keep it simple: overwrite the whole query with just what we need.
-    q = urlencode({k: v for k, v in qs.items() if v is not None})
-    return "?" + q if q else "?"
 
 # URL helpers
 URL_KEYS = {"url","link","source url","source_url","listing url","listing_url","property url","property_url","href"}
@@ -311,8 +304,12 @@ def canonicalize_zillow(url: str) -> Tuple[str, Optional[str]]:
     return canon, (m_z.group(1) if m_z else None)
 
 def make_preview_url(url: str) -> str:
-    """Clean, preview-friendly Zillow homedetails URL (best for unfurl)."""
-    if not url: return ""
+    """
+    Returns the clean, preview-friendly Zillow homedetails URL (no query/fragment).
+    Falls back to input if not a homedetails link.
+    """
+    if not url:
+        return ""
     base = re.sub(r'[?#].*$', '', url.strip())
     canon, _ = canonicalize_zillow(base)
     return canon if "/homedetails/" in canon else base
@@ -673,6 +670,7 @@ def extract_zillow_first_image(html: str) -> Optional[str]:
         )
         if m: return m.group(1)
     m = re.search(r"srcset=['\"]([^'\"]*photos\.zillowstatic\.com[^'\"]+)['\"]", html, re.I)
+        # choose the largest <=1152w, else the largest overall
     if m:
         cand=[]
         for part in m.group(1).split(","):
@@ -705,7 +703,7 @@ def parse_listing_meta(html: str) -> Dict[str, Any]:
     meta["summary"] = summarize_remarks(remark or "")
     meta["highlights"] = extract_highlights(remark or "")
     return meta
-async def enrich_results_async(results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+async def enrich_results_async(results: List[Dict[str, Any]]) -> List[Dict[str, Any]]]:
     targets = [(i, r["zillow_url"]) for i, r in enumerate(results) if "/homedetails/" in (r.get("zillow_url") or "")]
     if not targets: return results
     limits = min(12, max(4, len(targets)))
@@ -847,12 +845,12 @@ def log_sent_rows(results: List[Dict[str, Any]], client_tag: str, campaign_tag: 
         rows.append({
             "client":     (client_tag or "").strip(),
             "campaign":   (campaign_tag or "").strip(),
-            "url":        raw_url,               # log previewable link
+            "url":        raw_url,
             "canonical":  canon,
             "zpid":       zpid,
             "mls_id":     (r.get("mls_id") or "").strip() or None,
             "address":    (r.get("input_address") or "").strip() or None,
-            "sent_at":    now_iso,               # always set
+            "sent_at":    now_iso,  # always set
         })
     if not rows: return False, "No valid rows to log."
     try:
@@ -923,7 +921,7 @@ def delete_client(client_id: int):
     except Exception as e:
         return False, str(e)
 
-# ---- Query-param helpers / actions ----
+# ---- Query-param action handler for client actions (HTML icon bar) ----
 def _qp_get(name, default=None):
     try:
         qp = st.query_params
@@ -944,26 +942,24 @@ def _qp_set(**kwargs):
 act = _qp_get("act", "")
 cid = _qp_get("id", "")
 arg = _qp_get("arg", "")
-report_norm = _qp_get("report", "")
-confirm_action = _qp_get("confirm", "")
-rename_id = _qp_get("rename", "")
+report_norm = _qp_get("report", "")  # <-- inline report flag
 
-# Perform toggle / delete immediately via act=id
 if act and cid:
     try:
         cid_int = int(cid)
     except Exception:
         cid_int = 0
+
     if cid_int:
         if act == "toggle":
             rows = SUPABASE.table("clients").select("active").eq("id", cid_int).limit(1).execute().data or []
             cur = rows[0]["active"] if rows else True
             toggle_client_active(cid_int, (not cur))
-        elif act == "delete":
-            delete_client(cid_int)
         elif act == "rename" and arg:
             rename_client(cid_int, arg)
-    _qp_set()  # clear params after action
+        elif act == "delete":
+            delete_client(cid_int)
+    _qp_set()  # clear params
     _safe_rerun()
 
 # ---------- Output builders ----------
@@ -1087,7 +1083,7 @@ with tab_run:
                 norm = (parts.get("AddressNumber","") + " " +
                         " ".join([parts.get(k,"") for k in ["StreetNamePreDirectional","StreetName","StreetNamePostType","OccupancyType","OccupancyIdentifier"]]).strip())
                 cityst = ((", " + parts.get("PlaceName","") + ", " + parts.get("StateName","") +
-                           (" " + parts.get("ZipCode","") if parts.get("ZipCode") else "")) if (parts.get("PlaceName") or parts.get("StateName")) else "")
+                           (" " + parts.get("ZipCode","") if parts.get("ZipCode") else "")) if (parts.get("PlaceName") or (parts.get("StateName"))) else "")
                 lines_clean.append(re.sub(r"\s+"," ", (norm + cityst).strip()))
             else:
                 lines_clean.append(ln)
@@ -1161,7 +1157,7 @@ with tab_run:
             .results-wrap {{ position:relative; box-sizing:border-box; padding:12px 132px 8px 0; }}
             ul.link-list {{ margin:0 0 .5rem 1.2rem; padding:0; list-style:disc; }}
             ul.link-list li {{ margin:0.45rem 0; }}
-            .copyall-btn {{ position:absolute; top:0; right:8px; z-index:5; padding:8px 12px; height:36px; border:0; border-radius:12px; color:#fff; font-weight:700; background:#1d4ed8; cursor:pointer; opacity:0; transform:translateY(-2px); transition:opacity .18s, transform .06s; }}
+            .copyall-btn {{ position:absolute; top:0; right:8px; z-index:5; padding:8px 12px; height:36px; border:0; border-radius:12px; color:#fff; font-weight:700; background:#1d4ed8; cursor:pointer; opacity:0; transform:translateY(-2px); transition:opacity .18s ease, transform .06s ease; }}
             .results-wrap:hover .copyall-btn {{ opacity:1; transform:translateY(0); }}
           </style>
         </head><body>
@@ -1355,36 +1351,42 @@ def fetch_sent_for_client(client_norm: str, limit: int = 5000):
         return []
 
 def _render_client_report_view(client_display_name: str, client_norm: str):
-    """Report: address hyperlink → Zillow, with Campaign filter and Search box."""
+    """Render a report: address as hyperlink → Zillow, with Campaign filter and Search box."""
     st.markdown(f"### Report: {escape(client_display_name)}", unsafe_allow_html=True)
 
+    # Pull all rows for this client (cached)
     rows = fetch_sent_for_client(client_norm)
     total = len(rows)
 
-    # Filters
+    # ---- Build filter controls (top bar)
     seen = []
     for r in rows:
         c = (r.get("campaign") or "").strip()
         if c not in seen:
             seen.append(c)
     campaign_labels = ["All campaigns"] + [("— no campaign —" if c == "" else c) for c in seen]
-    campaign_keys   = [None] + seen
+    campaign_keys   = [None] + seen  # parallel to labels
 
     colF1, colF2, colF3 = st.columns([1.2, 1.8, 1])
     with colF1:
         sel_idx = st.selectbox("Filter by campaign", list(range(len(campaign_labels))),
                                format_func=lambda i: campaign_labels[i], index=0, key=f"__camp_{client_norm}")
-        sel_campaign = campaign_keys[sel_idx]
+        sel_campaign = campaign_keys[sel_idx]  # None => all
     with colF2:
         q = st.text_input("Search address / MLS / URL", value="", placeholder="e.g. 407 Woodall, 2501234, /homedetails/", key=f"__q_{client_norm}")
         q_norm = q.strip().lower()
     with colF3:
         st.caption(f"{total} total logged")
 
+    # ---- Apply filters
     def _match(row) -> bool:
-        if sel_campaign is not None and (row.get("campaign") or "").strip() != sel_campaign:
-            return False
-        if not q_norm: return True
+        # campaign filter
+        if sel_campaign is not None:
+            if (row.get("campaign") or "").strip() != sel_campaign:
+                return False
+        # search filter
+        if not q_norm:
+            return True
         addr = (row.get("address") or "").lower()
         mls  = (row.get("mls_id") or "").lower()
         url  = (row.get("url") or "").lower()
@@ -1399,13 +1401,16 @@ def _render_client_report_view(client_display_name: str, client_norm: str):
         st.info("No results match the current filters.")
         return
 
+    # ---- Render list: address text → Zillow URL (with sent date)
     items_html = []
     for r in rows_f:
         url = (r.get("url") or "").strip()
         addr = (r.get("address") or "").strip() or "View on Zillow"
         sent_at = r.get("sent_at") or ""
         camp = (r.get("campaign") or "").strip()
-        chip = f"<span style='font-size:11px; font-weight:700; padding:2px 6px; border-radius:999px; background:#e2e8f0; margin-left:6px;'>{escape(camp)}</span>" if (sel_campaign is None and camp) else ""
+        chip = ""
+        if sel_campaign is None and camp:
+            chip = f"<span style='font-size:11px; font-weight:700; padding:2px 6px; border-radius:999px; background:#e2e8f0; margin-left:6px;'>{escape(camp)}</span>"
         items_html.append(
             f"""<li>
                   <a href="{escape(url)}" target="_blank" rel="noopener">{escape(addr)}</a>
@@ -1416,6 +1421,7 @@ def _render_client_report_view(client_display_name: str, client_norm: str):
     html = "<ul class='link-list'>" + "\n".join(items_html) + "</ul>"
     st.markdown(html, unsafe_allow_html=True)
 
+    # ---- Export filtered view as CSV
     with st.expander("Export filtered report"):
         import pandas as pd, io
         df = pd.DataFrame(rows_f)
@@ -1434,43 +1440,7 @@ with tab_clients:
     st.subheader("Clients")
     st.caption("Manage active and inactive clients. “test test” is always hidden.")
 
-    # Inline confirm / rename flows (no JS)
-    if confirm_action == "delete" and cid:
-        try: cid_int = int(cid)
-        except: cid_int = 0
-        if cid_int:
-            st.warning("Delete this client? This cannot be undone.")
-            colX, colY = st.columns([1,1])
-            with colX:
-                if st.button("✅ Confirm delete", use_container_width=True):
-                    _qp_set(act="delete", id=str(cid_int))
-                    _safe_rerun()
-            with colY:
-                if st.button("Cancel", use_container_width=True):
-                    _qp_set()  # clear
-                    _safe_rerun()
-        st.markdown("---")
-
-    if rename_id:
-        try: rid = int(rename_id)
-        except: rid = 0
-        if rid:
-            new_name = st.text_input("New client name", key="__rename_name__")
-            cols = st.columns([1,1])
-            with cols[0]:
-                if st.button("💾 Save name", use_container_width=True):
-                    if new_name.strip():
-                        _qp_set(act="rename", id=str(rid), arg=new_name.strip())
-                        _safe_rerun()
-                    else:
-                        st.error("Name cannot be empty.")
-            with cols[1]:
-                if st.button("Cancel", use_container_width=True):
-                    _qp_set()
-                    _safe_rerun()
-        st.markdown("---")
-
-    # Report panel (lists always shown too)
+    # If ?report=<client_norm> is present, show the report panel (lists remain visible below)
     if report_norm:
         all_clients_for_title = fetch_clients(include_inactive=True)
         display_name = next((c["name"] for c in all_clients_for_title if c.get("name_norm")==report_norm), report_norm)
@@ -1490,11 +1460,7 @@ with tab_clients:
             st.write("_No active clients_")
         else:
             for c in active:
-                cid_i = c["id"]; cname = c["name"]; cnorm = c.get("name_norm","")
-                href_report = build_href(report=cnorm)
-                href_rename = build_href(rename=str(cid_i))
-                href_toggle = build_href(act="toggle", id=str(cid_i))
-                href_delete = build_href(confirm="delete", id=str(cid_i))
+                cid = c["id"]; cname = c["name"]; cnorm = c.get("name_norm","")
                 st.markdown(
                     f"""
                     <div class="client-row">
@@ -1503,10 +1469,43 @@ with tab_clients:
                         <span class="client-status active">active</span>
                       </div>
                       <div class="action-bar">
-                        <a class="icon-btn" data-tip="View report" title="View report" href="{href_report}">▦</a>
-                        <a class="icon-btn" data-tip="Rename client" title="Rename" href="{href_rename}">✎</a>
-                        <a class="icon-btn" data-tip="Deactivate client" title="Deactivate" href="{href_toggle}">○</a>
-                        <a class="icon-btn danger" data-tip="Delete client" title="Delete" href="{href_delete}">⌫</a>
+                        <!-- View report: break out of any embedding -->
+                        <a class="icon-btn" data-tip="View report" title="View report"
+                           href="?report={quote(cnorm, safe='')}"
+                           target="_top" rel="noopener">▦</a>
+                        <!-- Rename -->
+                        <a class="icon-btn" data-tip="Rename client" title="Rename" href="#" onclick="
+                          event.preventDefault();
+                          const newName = prompt('Rename client: {escape(cname)}','{escape(cname)}');
+                          if (newName && newName.trim()) {{
+                            const u = new URL(window.top.location.href);
+                            u.searchParams.set('act','rename');
+                            u.searchParams.set('id','{cid}');
+                            u.searchParams.set('arg', newName.trim());
+                            window.top.location.href = u.toString();
+                          }}
+                          return false;
+                        ">✎</a>
+                        <!-- Deactivate -->
+                        <a class="icon-btn" data-tip="Deactivate client" title="Deactivate" href="#" onclick="
+                          event.preventDefault();
+                          const u = new URL(window.top.location.href);
+                          u.searchParams.set('act','toggle');
+                          u.searchParams.set('id','{cid}');
+                          window.top.location.href = u.toString();
+                          return false;
+                        ">○</a>
+                        <!-- Delete -->
+                        <a class="icon-btn danger" data-tip="Delete client" title="Delete" href="#" onclick="
+                          event.preventDefault();
+                          if (confirm('Delete {escape(cname)}? This cannot be undone.')) {{
+                            const u = new URL(window.top.location.href);
+                            u.searchParams.set('act','delete');
+                            u.searchParams.set('id','{cid}');
+                            window.top.location.href = u.toString();
+                          }}
+                          return false;
+                        ">⌫</a>
                       </div>
                     </div>
                     """,
@@ -1520,11 +1519,7 @@ with tab_clients:
             st.write("_No inactive clients_")
         else:
             for c in inactive:
-                cid_i = c["id"]; cname = c["name"]; cnorm = c.get("name_norm","")
-                href_report = build_href(report=cnorm)
-                href_rename = build_href(rename=str(cid_i))
-                href_toggle = build_href(act="toggle", id=str(cid_i))
-                href_delete = build_href(confirm="delete", id=str(cid_i))
+                cid = c["id"]; cname = c["name"]; cnorm = c.get("name_norm","")
                 st.markdown(
                     f"""
                     <div class="client-row">
@@ -1533,10 +1528,43 @@ with tab_clients:
                         <span class="client-status inactive">inactive</span>
                       </div>
                       <div class="action-bar">
-                        <a class="icon-btn" data-tip="View report" title="View report" href="{href_report}">▦</a>
-                        <a class="icon-btn" data-tip="Rename client" title="Rename" href="{href_rename}">✎</a>
-                        <a class="icon-btn" data-tip="Activate client" title="Activate" href="{href_toggle}">●</a>
-                        <a class="icon-btn danger" data-tip="Delete client" title="Delete" href="{href_delete}">⌫</a>
+                        <!-- View report: break out of any embedding -->
+                        <a class="icon-btn" data-tip="View report" title="View report"
+                           href="?report={quote(cnorm, safe='')}"
+                           target="_top" rel="noopener">▦</a>
+                        <!-- Rename -->
+                        <a class="icon-btn" data-tip="Rename client" title="Rename" href="#" onclick="
+                          event.preventDefault();
+                          const newName = prompt('Rename client: {escape(cname)}','{escape(cname)}');
+                          if (newName && newName.trim()) {{
+                            const u = new URL(window.top.location.href);
+                            u.searchParams.set('act','rename');
+                            u.searchParams.set('id','{cid}');
+                            u.searchParams.set('arg', newName.trim());
+                            window.top.location.href = u.toString();
+                          }}
+                          return false;
+                        ">✎</a>
+                        <!-- Activate -->
+                        <a class="icon-btn" data-tip="Activate client" title="Activate" href="#" onclick="
+                          event.preventDefault();
+                          const u = new URL(window.top.location.href);
+                          u.searchParams.set('act','toggle');
+                          u.searchParams.set('id','{cid}');
+                          window.top.location.href = u.toString();
+                          return false;
+                        ">●</a>
+                        <!-- Delete -->
+                        <a class="icon-btn danger" data-tip="Delete client" title="Delete" href="#" onclick="
+                          event.preventDefault();
+                          if (confirm('Delete {escape(cname)}? This cannot be undone.')) {{
+                            const u = new URL(window.top.location.href);
+                            u.searchParams.set('act','delete');
+                            u.searchParams.set('id','{cid}');
+                            window.top.location.href = u.toString();
+                          }}
+                          return false;
+                        ">⌫</a>
                       </div>
                     </div>
                     """,
