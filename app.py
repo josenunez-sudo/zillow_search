@@ -1279,7 +1279,6 @@ def fetch_sent_for_client(client_norm: str, limit: int = 5000):
 
 def _render_client_report_view(client_display_name: str, client_norm: str):
     """Render a report: address as hyperlink → Zillow, with Campaign filter and Search box."""
-    # Single header (de-duplicated)
     st.markdown(f"### Report for {escape(client_display_name)}", unsafe_allow_html=True)
 
     # Close report button
@@ -1381,8 +1380,8 @@ def _scroll_to(element_id: str):
 def _client_row_html(name: str, norm: str, cid: int, active: bool):
     """
     Renders a single client row with tiny inline icons (no per-icon button container).
-    Icons show a tooltip on hover; clicking updates parent query params so the
-    report renders inline below the tables.
+    Report + Activate/Deactivate are real links targeting the parent page (reliable).
+    Rename/Delete keep JS for prompt/confirm. Styles unchanged.
     """
     status = "active" if active else "inactive"
     toggle_label = "Deactivate" if active else "Activate"
@@ -1444,6 +1443,7 @@ def _client_row_html(name: str, norm: str, cid: int, active: bool):
     display:inline-flex; align-items:center; justify-content:center;
     transform: translateY(0);
     transition: transform .08s ease, color .08s ease;
+    text-decoration:none;
   }}
   .ic:hover {{ color: var(--text); transform: translateY(-1px); }}
   .ic:focus {{ outline: 2px solid #93c5fd; outline-offset: 2px; border-radius:6px; }}
@@ -1458,21 +1458,10 @@ def _client_row_html(name: str, norm: str, cid: int, active: bool):
 
     <!-- inline icons (no container around each) -->
     <div class="icons">
-      <!-- Report (matching style) -->
-      <span class="ic" role="button" tabindex="0" title="Open report"
-        onclick="
-          try {{
-            const u = new URL(parent.location.href);
-            u.searchParams.set('report', '{escape(norm)}');
-            u.searchParams.set('scroll', '1');
-            parent.location.search = u.search;
-          }} catch(e) {{
-            parent.location.href = parent.location.href + (parent.location.search ? '&' : '?') + 'report={escape(norm)}&scroll=1';
-          }}
-          return false;
-        ">▦</span>
+      <!-- Report (real link to parent) -->
+      <a class="ic" title="Open report" href="?report={escape(norm)}&scroll=1" target="_parent">▦</a>
 
-      <!-- Rename -->
+      <!-- Rename (JS prompt) -->
       <span class="ic" role="button" tabindex="0" title="Rename"
         onclick="
           const newName = prompt('Rename client:', '{escape(name)}');
@@ -1486,17 +1475,10 @@ def _client_row_html(name: str, norm: str, cid: int, active: bool):
           return false;
         ">✎</span>
 
-      <!-- Toggle active -->
-      <span class="ic" role="button" tabindex="0" title="{toggle_label}"
-        onclick="
-          const u = new URL(parent.location.href);
-          u.searchParams.set('act', 'toggle');
-          u.searchParams.set('id', '{cid}');
-          parent.location.search = u.search;
-          return false;
-        ">⟳</span>
+      <!-- Toggle active (real link to parent) -->
+      <a class="ic" title="{toggle_label}" href="?act=toggle&id={cid}" target="_parent">⟳</a>
 
-      <!-- Delete -->
+      <!-- Delete (JS confirm) -->
       <span class="ic" role="button" tabindex="0" title="Delete"
         onclick="
           if (confirm('Delete {escape(name)}? This cannot be undone.')) {{
