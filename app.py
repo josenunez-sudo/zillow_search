@@ -10,6 +10,7 @@ from html import escape
 import requests
 import httpx
 import streamlit as st
+import streamlit.components.v1 as components
 from PIL import Image
 
 # ---------- Optional deps ----------
@@ -867,7 +868,7 @@ def delete_client(client_id: int):
     except Exception as e:
         return False, str(e)
 
-# ---- Query-params helpers (kept for backward-compat; no longer used to open report) ----
+# ---- Query-params helpers ----
 def _qp_get(name, default=None):
     try:
         qp = st.query_params
@@ -888,7 +889,7 @@ def _qp_set(**kwargs):
 act = _qp_get("act", "")
 cid = _qp_get("id", "")
 arg = _qp_get("arg", "")
-report_norm = _qp_get("report", "")  # legacy
+report_norm = _qp_get("report", "")
 
 if act and cid:
     try:
@@ -1050,7 +1051,6 @@ with tab_run:
 
     # Results HTML list with copy-all (ALWAYS preview links for best unfurl)
     def results_list_with_copy_all(results: List[Dict[str, Any]], client_selected: bool):
-        import streamlit.components.v1 as components
         li_html = []
         for r in results:
             href = r.get("preview_url") or r.get("zillow_url") or r.get("display_url") or ""
@@ -1277,15 +1277,21 @@ def fetch_sent_for_client(client_norm: str, limit: int = 5000):
     except Exception:
         return []
 
-def _render_client_report_view(client_display_name: str, client_norm: str, *, show_header: bool = True):
+def _render_client_report_view(client_display_name: str, client_norm: str):
     """Render a report: address as hyperlink → Zillow, with Campaign filter and Search box."""
-    if show_header:
-        st.markdown(f"### Report: {escape(client_display_name)}", unsafe_allow_html=True)
+    # Single header (de-duplicated)
+    st.markdown(f"### Report for {escape(client_display_name)}", unsafe_allow_html=True)
+
+    # Close report button
+    colX, _ = st.columns([1,3])
+    with colX:
+        if st.button("Close report", key=f"__close_report_{client_norm}"):
+            _qp_set()  # clear query params
+            _safe_rerun()
 
     rows = fetch_sent_for_client(client_norm)
     total = len(rows)
 
-    # Campaign list (keep first-seen order)
     seen = []
     for r in rows:
         c = (r.get("campaign") or "").strip()
@@ -1357,130 +1363,196 @@ def _render_client_report_view(client_display_name: str, client_norm: str, *, sh
             use_container_width=False
         )
 
+# ---------- Smooth-scroll helper ----------
+def _scroll_to(element_id: str):
+    components.html(
+        f"""
+        <script>
+          const el = parent.document.getElementById("{element_id}");
+          if (el) {{
+            el.scrollIntoView({{behavior: "smooth", block: "start"}});
+          }}
+        </script>
+        """,
+        height=0,
+    )
+
+# ---------- Tiny client row (icons inline; no button containers) ----------
+def _client_row_html(name: str, norm: str, cid: int, active: bool):
+    """
+    Renders a single client row with tiny inline icons (no per-icon button container).
+    Icons show a tooltip on hover; clicking updates parent query params so the
+    report renders inline below the tables.
+    """
+    status = "active" if active else "inactive"
+    toggle_label = "Deactivate" if active else "Activate"
+
+    html = f"""
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  :root {{
+    --text: #0f172a;
+    --muted:#64748b;
+    --hover:#f8fafc;
+    --ok-bg:#dcfce7; --ok-fg:#166534; /* active = green pill */
+    --bad-bg:#fee2e2; --bad-fg:#991b1b;
+    --row-border: rgba(0,0,0,.08);
+  }}
+  @media (prefers-color-scheme: dark) {{
+    :root {{
+      --text:#f8fafc;
+      --muted:#94a3b8;
+      --hover:#0f172a;
+      --ok-bg:#064e3b; --ok-fg:#a7f3d0;
+      --bad-bg:#7f1d1d; --bad-fg:#fecaca;
+      --row-border: rgba(255,255,255,.08);
+    }}
+  }}
+  html,body {{
+    margin:0; padding:0;
+    font-family: -apple-system, Segoe UI, Roboto, Arial, sans-serif;
+    color: var(--text);
+  }}
+  .row {{
+    display:flex; align-items:center; justify-content:space-between;
+    padding:10px 8px; border-bottom:1px solid var(--row-border);
+  }}
+  .left {{
+    display:flex; align-items:center; gap:8px; min-width:0;
+  }}
+  .name {{
+    font-weight:700; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;
+  }}
+  /* Visible, green "active" pill */
+  .pill {{
+    font-size:11px; font-weight:700; padding:2px 8px; border-radius:999px;
+  }}
+  .pill.active {{ background:var(--ok-bg); color:var(--ok-fg); }}
+  .pill.inactive {{ background:var(--bad-bg); color:var(--bad-fg); }}
+
+  /* Tiny inline icons — no button container */
+  .icons {{
+    display:flex; align-items:center; gap:8px;
+  }}
+  .ic {{
+    font-size:12px; line-height:1; cursor:pointer; user-select:none;
+    color: var(--muted);
+    padding: 0; margin:0; border:none; background:transparent;
+    display:inline-flex; align-items:center; justify-content:center;
+    transform: translateY(0);
+    transition: transform .08s ease, color .08s ease;
+  }}
+  .ic:hover {{ color: var(--text); transform: translateY(-1px); }}
+  .ic:focus {{ outline: 2px solid #93c5fd; outline-offset: 2px; border-radius:6px; }}
+</style>
+</head>
+<body>
+  <div class="row">
+    <div class="left">
+      <span class="name">{escape(name)}</span>
+      <span class="pill {status}">{status}</span>
+    </div>
+
+    <!-- inline icons (no container around each) -->
+    <div class="icons">
+      <!-- Report -->
+      <span class="ic" role="button" tabindex="0" title="Open report"
+        onclick="
+          try {{
+            const u = new URL(parent.location.href);
+            u.searchParams.set('report', '{escape(norm)}');
+            u.searchParams.set('scroll', '1');
+            parent.location.search = u.search;
+          }} catch(e) {{
+            parent.location.href = parent.location.href + (parent.location.search ? '&' : '?') + 'report={escape(norm)}&scroll=1';
+          }}
+          return false;
+        ">📄</span>
+
+      <!-- Rename -->
+      <span class="ic" role="button" tabindex="0" title="Rename"
+        onclick="
+          const newName = prompt('Rename client:', '{escape(name)}');
+          if (newName && newName.trim()) {{
+            const u = new URL(parent.location.href);
+            u.searchParams.set('act', 'rename');
+            u.searchParams.set('id', '{cid}');
+            u.searchParams.set('arg', newName.trim());
+            parent.location.search = u.search;
+          }}
+          return false;
+        ">✎</span>
+
+      <!-- Toggle active -->
+      <span class="ic" role="button" tabindex="0" title="{toggle_label}"
+        onclick="
+          const u = new URL(parent.location.href);
+          u.searchParams.set('act', 'toggle');
+          u.searchParams.set('id', '{cid}');
+          parent.location.search = u.search;
+          return false;
+        ">⟳</span>
+
+      <!-- Delete -->
+      <span class="ic" role="button" tabindex="0" title="Delete"
+        onclick="
+          if (confirm('Delete {escape(name)}? This cannot be undone.')) {{
+            const u = new URL(parent.location.href);
+            u.searchParams.set('act', 'delete');
+            u.searchParams.set('id', '{cid}');
+            parent.location.search = u.search;
+          }}
+          return false;
+        ">⌫</span>
+    </div>
+  </div>
+</body>
+</html>
+"""
+    components.html(html, height=46, scrolling=False)
+
 # ---------- CLIENTS TAB ----------
 with tab_clients:
     st.subheader("Clients")
     st.caption("Manage active and inactive clients. “test test” is always hidden.")
 
-    # ---- Session state ----
-    if "report_client" not in st.session_state:
-        # If legacy query param exists, honor it once
-        st.session_state["report_client"] = report_norm or None
-    if "rename_open_id" not in st.session_state:
-        st.session_state["rename_open_id"] = None
-
-    # ---- Compact CSS for this tab ----
-    st.markdown("""
-    <style>
-      .row-wrap { padding:8px 6px; border-bottom:1px solid rgba(0,0,0,.08); }
-      .row-line { display:flex; align-items:center; justify-content:space-between; gap:8px; }
-      .left-stack { display:flex; align-items:center; gap:10px; min-width:0; }
-      .name-strong { font-weight:700; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
-      /* Green Active pill */
-      .tag-active { font-size:11px; font-weight:700; padding:2px 8px; border-radius:999px; background:#dcfce7; color:#166534; }
-      .tag-inactive { font-size:11px; font-weight:700; padding:2px 8px; border-radius:999px; background:#e2e8f0; color:#334155; }
-      /* Compact icon-only buttons */
-      div[data-testid="stButton"] > button {
-        padding: 2px 8px !important;
-        height: 28px !important;
-        font-size: 14px !important;
-        line-height: 1 !important;
-      }
-    </style>
-    """, unsafe_allow_html=True)
+    # Read query params (report will render only when present)
+    report_norm_qp = _qp_get("report", "")
+    want_scroll = _qp_get("scroll", "") in ("1","true","yes")
 
     all_clients = fetch_clients(include_inactive=True)
     active = [c for c in all_clients if c.get("active")]
     inactive = [c for c in all_clients if not c.get("active")]
 
-    def render_client_row(c):
-        st.markdown('<div class="row-wrap"><div class="row-line">', unsafe_allow_html=True)
-
-        left_col, right_col = st.columns([0.74, 0.26])
-        with left_col:
-            st.markdown(
-                f"""
-                <div class="left-stack">
-                    <span class="name-strong">{escape(c['name'])}</span>
-                    <span class="{'tag-active' if c['active'] else 'tag-inactive'}">
-                        {'Active' if c['active'] else 'Inactive'}
-                    </span>
-                </div>
-                """,
-                unsafe_allow_html=True
-            )
-
-        with right_col:
-            bcols = st.columns(4, gap="small")
-
-            # ▦ Report
-            with bcols[0]:
-                if st.button("▦", key=f"report_{c['id']}", help="View report", use_container_width=True):
-                    st.session_state["report_client"] = c.get("name_norm")
-
-            # ✎ Rename
-            with bcols[1]:
-                if st.button("✎", key=f"rename_{c['id']}", help="Rename client", use_container_width=True):
-                    st.session_state["rename_open_id"] = c["id"] if st.session_state["rename_open_id"] != c["id"] else None
-
-            # ○/● Toggle Active
-            with bcols[2]:
-                toggle_icon = "●" if c["active"] else "○"
-                toggle_help = "Deactivate" if c["active"] else "Activate"
-                if st.button(toggle_icon, key=f"toggle_{c['id']}", help=toggle_help, use_container_width=True):
-                    toggle_client_active(c["id"], not c["active"])
-                    _safe_rerun()
-
-            # ⌫ Delete
-            with bcols[3]:
-                if st.button("⌫", key=f"delete_{c['id']}", help="Delete client", use_container_width=True):
-                    delete_client(c["id"])
-                    _safe_rerun()
-
-        st.markdown('</div></div>', unsafe_allow_html=True)
-
-        # Inline rename controls (only when toggled for this id)
-        if st.session_state.get("rename_open_id") == c["id"]:
-            new_name = st.text_input("New name", value=c["name"], key=f"rename_input_{c['id']}")
-            col_ok, col_cancel = st.columns([1,1])
-            with col_ok:
-                if st.button("Save name", key=f"rename_save_{c['id']}"):
-                    ok, msg = rename_client(c["id"], new_name)
-                    if ok:
-                        st.session_state["rename_open_id"] = None
-                        _safe_rerun()
-                    else:
-                        st.error(msg)
-            with col_cancel:
-                if st.button("Cancel", key=f"rename_cancel_{c['id']}"):
-                    st.session_state["rename_open_id"] = None
-
     colA, colB = st.columns(2)
 
+    # Active list
     with colA:
-        st.markdown("### Active")
+        st.markdown("### Active", unsafe_allow_html=True)
         if not active:
             st.write("_No active clients_")
         else:
             for c in active:
-                render_client_row(c)
+                _client_row_html(c["name"], c.get("name_norm",""), c["id"], active=True)
 
+    # Inactive list
     with colB:
-        st.markdown("### Inactive")
+        st.markdown("### Inactive", unsafe_allow_html=True)
         if not inactive:
             st.write("_No inactive clients_")
         else:
             for c in inactive:
-                render_client_row(c)
+                _client_row_html(c["name"], c.get("name_norm",""), c["id"], active=False)
 
-    # ---- REPORT SECTION INLINE (below lists) ----
-    if st.session_state.get("report_client"):
-        client_norm = st.session_state["report_client"]
-        display_name = next((c["name"] for c in all_clients if c.get("name_norm")==client_norm), client_norm)
-
+    # ---- REPORT SECTION BELOW THE TABLES (hidden unless report=...) ----
+    st.markdown('<div id="report_anchor"></div>', unsafe_allow_html=True)
+    if report_norm_qp:
+        display_name = next((c["name"] for c in all_clients if c.get("name_norm")==report_norm_qp), report_norm_qp)
         st.markdown("---")
-        st.markdown(f"### Report: {escape(display_name)}", unsafe_allow_html=True)
-        _render_client_report_view(display_name, client_norm, show_header=False)
-
-        if st.button("Close report", key="close_report"):
-            st.session_state["report_client"] = None
+        _render_client_report_view(display_name, report_norm_qp)
+        if want_scroll:
+            _scroll_to("report_anchor")
+            _qp_set(report=report_norm_qp)
