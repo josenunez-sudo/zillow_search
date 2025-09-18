@@ -1483,40 +1483,55 @@ with tab_clients:
     st.subheader("Clients")
     st.caption("Manage active and inactive clients. “test test” is always hidden.")
 
-    # Read query params (report will render only when present)
-    report_norm_qp = _qp_get("report", "")
-    want_scroll = _qp_get("scroll", "") in ("1","true","yes")
-
     all_clients = fetch_clients(include_inactive=True)
     active = [c for c in all_clients if c.get("active")]
     inactive = [c for c in all_clients if not c.get("active")]
 
+    def render_client_row(c):
+        col1, col2, col3, col4, col5 = st.columns([2,1,1,1,1])
+        with col1:
+            st.markdown(f"**{c['name']}**")
+            st.caption("active" if c["active"] else "inactive")
+        with col2:
+            if st.button("📑 Report", key=f"report_{c['id']}"):
+                st.session_state["report_client"] = c["name_norm"]
+        with col3:
+            if st.button("✎ Rename", key=f"rename_{c['id']}"):
+                new_name = st.text_input(f"Rename {c['name']}", value=c["name"], key=f"rename_input_{c['id']}")
+                if st.button(f"Confirm rename {c['id']}"):
+                    rename_client(c["id"], new_name)
+                    _safe_rerun()
+        with col4:
+            toggle_label = "Deactivate" if c["active"] else "Activate"
+            if st.button(toggle_label, key=f"toggle_{c['id']}"):
+                toggle_client_active(c["id"], not c["active"])
+                _safe_rerun()
+        with col5:
+            if st.button("⌫ Delete", key=f"delete_{c['id']}"):
+                delete_client(c["id"])
+                _safe_rerun()
+
     colA, colB = st.columns(2)
 
-    # Active list
     with colA:
-        st.markdown("### Active", unsafe_allow_html=True)
+        st.markdown("### Active")
         if not active:
             st.write("_No active clients_")
         else:
             for c in active:
-                _client_row_html(c["name"], c.get("name_norm",""), c["id"], active=True)
+                render_client_row(c)
 
-    # Inactive list
     with colB:
-        st.markdown("### Inactive", unsafe_allow_html=True)
+        st.markdown("### Inactive")
         if not inactive:
             st.write("_No inactive clients_")
         else:
             for c in inactive:
-                _client_row_html(c["name"], c.get("name_norm",""), c["id"], active=False)
+                render_client_row(c)
 
-    # ---- REPORT SECTION BELOW THE TABLES (hidden unless report=...) ----
-    st.markdown('<div id="report_anchor"></div>', unsafe_allow_html=True)
-    if report_norm_qp:
-        display_name = next((c["name"] for c in all_clients if c.get("name_norm")==report_norm_qp), report_norm_qp)
+    # ---- REPORT SECTION BELOW ----
+    if "report_client" in st.session_state and st.session_state["report_client"]:
+        client_norm = st.session_state["report_client"]
+        display_name = next((c["name"] for c in all_clients if c.get("name_norm")==client_norm), client_norm)
         st.markdown("---")
-        _render_client_report_view(display_name, report_norm_qp)
-        if want_scroll:
-            _scroll_to("report_anchor")
-            _qp_set(report=report_norm_qp)  # keep report param, drop scroll
+        _render_client_report_view(display_name, client_norm)
