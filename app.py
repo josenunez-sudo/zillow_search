@@ -1318,7 +1318,7 @@ def _render_client_report_view(client_display_name: str, client_norm: str, *, sh
     rows = fetch_sent_for_client(client_norm)
     total = len(rows)
 
-    # Campaigns (unique, preserve first-seen order)
+    # Campaign list (preserve first-seen order)
     seen = []
     for r in rows:
         c = (r.get("campaign") or "").strip()
@@ -1389,6 +1389,7 @@ def _render_client_report_view(client_display_name: str, client_norm: str, *, sh
             mime="text/csv",
             use_container_width=False
         )
+
 
 
 # ---------- Smooth-scroll helper ----------
@@ -1466,63 +1467,78 @@ with tab_clients:
     active = [c for c in all_clients if c.get("active")]
     inactive = [c for c in all_clients if not c.get("active")]
 
-    # ---- State buckets ----
+    # ---- Session state ----
     if "report_client" not in st.session_state:
-        st.session_state["report_client"] = None  # holds name_norm for the selected report
+        st.session_state["report_client"] = None       # holds name_norm for the selected report
     if "rename_open_id" not in st.session_state:
-        st.session_state["rename_open_id"] = None  # which row is currently in rename mode
+        st.session_state["rename_open_id"] = None      # which row is currently in rename mode
 
-    # Small CSS helpers for the row (green "Active" tag + compact buttons)
+    # ---- Compact CSS for this tab ----
     st.markdown("""
     <style>
+      /* Row + layout */
       .row-wrap { padding:8px 6px; border-bottom:1px solid rgba(0,0,0,.08); }
       .row-line { display:flex; align-items:center; justify-content:space-between; gap:8px; }
       .left-stack { display:flex; align-items:center; gap:10px; min-width:0; }
       .name-strong { font-weight:700; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+      /* Green Active pill */
       .tag-active { font-size:11px; font-weight:700; padding:2px 8px; border-radius:999px; background:#dcfce7; color:#166534; }
       .tag-inactive { font-size:11px; font-weight:700; padding:2px 8px; border-radius:999px; background:#e2e8f0; color:#334155; }
-      .icon-bar { display:flex; align-items:center; gap:6px; }
-      .icon-btn { min-width:0 !important; padding:2px 6px !important; }
+      /* Make icon buttons compact (affects only small buttons rendered hereafter) */
+      div[data-testid="stButton"] button {
+        padding: 2px 8px;
+        height: 28px;
+        font-size: 14px;
+        line-height: 1;
+      }
     </style>
     """, unsafe_allow_html=True)
 
     def render_client_row(c):
-        # left: name + active pill
+        # Whole row container
+        st.markdown('<div class="row-wrap"><div class="row-line">', unsafe_allow_html=True)
+
+        # LEFT side: name + active pill
         left_col, right_col = st.columns([0.75, 0.25])
         with left_col:
             st.markdown(
                 f"""
-                <div class="row-wrap">
-                  <div class="row-line">
-                    <div class="left-stack">
-                        <span class="name-strong">{escape(c['name'])}</span>
-                        <span class="{'tag-active' if c['active'] else 'tag-inactive'}">
-                            {'Active' if c['active'] else 'Inactive'}
-                        </span>
-                    </div>
+                <div class="left-stack">
+                    <span class="name-strong">{escape(c['name'])}</span>
+                    <span class="{'tag-active' if c['active'] else 'tag-inactive'}">
+                        {'Active' if c['active'] else 'Inactive'}
+                    </span>
+                </div>
                 """, unsafe_allow_html=True
             )
-        with right_col:
-            st.markdown('<div class="row-wrap"><div class="row-line"><div class="icon-bar">', unsafe_allow_html=True)
-            # ▦ Report (document) — icon-only with tooltip
-            if st.button("▦", key=f"report_{c['id']}", help="View report", use_container_width=False):
-                st.session_state["report_client"] = c.get("name_norm")
-            # ✎ Rename — toggles inline rename input for this row
-            if st.button("✎", key=f"rename_{c['id']}", help="Rename client", use_container_width=False):
-                st.session_state["rename_open_id"] = c["id"] if st.session_state["rename_open_id"] != c["id"] else None
-            # ○/● Toggle Active
-            toggle_icon = "●" if c["active"] else "○"
-            toggle_help = "Deactivate" if c["active"] else "Activate"
-            if st.button(toggle_icon, key=f"toggle_{c['id']}", help=toggle_help, use_container_width=False):
-                toggle_client_active(c["id"], not c["active"])
-                _safe_rerun()
-            # ⌫ Delete
-            if st.button("⌫", key=f"delete_{c['id']}", help="Delete client", use_container_width=False):
-                delete_client(c["id"])
-                _safe_rerun()
-            st.markdown('</div></div></div>', unsafe_allow_html=True)
 
-        # Inline rename row (only when opened for this id)
+        # RIGHT side: 4 buttons in sub-columns so they stay side-by-side
+        with right_col:
+            bcols = st.columns([1,1,1,1], gap="small")
+            # ▦ Report (icon-only)
+            with bcols[0]:
+                if st.button("▦", key=f"report_{c['id']}", help="View report", use_container_width=True):
+                    st.session_state["report_client"] = c.get("name_norm")
+            # ✎ Rename (toggle inline rename controls)
+            with bcols[1]:
+                if st.button("✎", key=f"rename_{c['id']}", help="Rename client", use_container_width=True):
+                    st.session_state["rename_open_id"] = c["id"] if st.session_state["rename_open_id"] != c["id"] else None
+            # ○/● Toggle Active
+            with bcols[2]:
+                toggle_icon = "●" if c["active"] else "○"
+                toggle_help = "Deactivate" if c["active"] else "Activate"
+                if st.button(toggle_icon, key=f"toggle_{c['id']}", help=toggle_help, use_container_width=True):
+                    toggle_client_active(c["id"], not c["active"])
+                    _safe_rerun()
+            # ⌫ Delete
+            with bcols[3]:
+                if st.button("⌫", key=f"delete_{c['id']}", help="Delete client", use_container_width=True):
+                    delete_client(c["id"])
+                    _safe_rerun()
+
+        st.markdown('</div></div>', unsafe_allow_html=True)
+
+        # Inline rename controls (only for the open row)
         if st.session_state["rename_open_id"] == c["id"]:
             new_name = st.text_input("New name", value=c["name"], key=f"rename_input_{c['id']}")
             col_ok, col_cancel = st.columns([1,1])
@@ -1559,7 +1575,6 @@ with tab_clients:
                 render_client_row(c)
 
     # ---- REPORT SECTION INLINE (below lists) ----
-    # If a report client is selected in state, render it here inline.
     if st.session_state["report_client"]:
         client_norm = st.session_state["report_client"]
         display_name = next(
@@ -1568,10 +1583,10 @@ with tab_clients:
         )
 
         st.markdown("---")
-        # Compact, single header (no duplication)
+        # Single concise header (no duplication)
         st.markdown(f"### Report: {escape(display_name)}", unsafe_allow_html=True)
 
-        # Render the report WITHOUT its internal header (avoid redundancy)
+        # Render the report without its own header (avoid redundancy)
         _render_client_report_view(display_name, client_norm, show_header=False)
 
         # Close report button
