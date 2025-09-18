@@ -1374,6 +1374,9 @@ def _client_row_html(name: str, norm: str, cid: int, active: bool):
     """
     Renders a single client row with tiny, hover-only icons INSIDE the component iframe.
     This isolates styling so icons stay inline, subtle, and hidden until hover.
+
+    FIX: icon links now use real anchors with target="_top" so they work outside the iframe.
+         Added aria-labels, title tooltips, and a quick visual click feedback.
     """
     status = "active" if active else "inactive"
     view_toggle_label = "Deactivate" if active else "Activate"
@@ -1430,6 +1433,7 @@ def _client_row_html(name: str, norm: str, cid: int, active: bool):
     border:0; background:transparent; padding:2px 5px; border-radius:6px;
     font-size:12px; color:#64748b; cursor:pointer; line-height:1;
     display:inline-flex; align-items:center; justify-content:center;
+    text-decoration:none;
   }}
   .icon-btn:hover {{ background:var(--row-hover); color:var(--text-strong); }}
   .icon-btn.danger:hover {{ background:#fee2e2; color:#991b1b; }}
@@ -1458,40 +1462,57 @@ def _client_row_html(name: str, norm: str, cid: int, active: bool):
       <span class="client-status {status}">{status}</span>
     </div>
     <div class="action-bar">
-      <button class="icon-btn" data-tip="View report" onclick="
-        const u = new URL(parent.location.href);
-        u.searchParams.set('report','{escape(norm)}');
-        u.searchParams.set('scroll','1');
-        parent.location.href = u.toString();
-        return false;
-      ">▦</button>
-      <button class="icon-btn" data-tip="Rename" onclick="
-        const newName = prompt('Rename client: {escape(name)}','{escape(name)}');
-        if (newName && newName.trim()) {{
-          const u = new URL(parent.location.href);
-          u.searchParams.set('act','rename');
-          u.searchParams.set('id','{cid}');
-          u.searchParams.set('arg', newName.trim());
-          parent.location.href = u.toString();
-        }}
-        return false;
-      ">✎</button>
-      <button class="icon-btn" data-tip="{view_toggle_label}" onclick="
-        const u = new URL(parent.location.href);
-        u.searchParams.set('act','toggle');
-        u.searchParams.set('id','{cid}');
-        parent.location.href = u.toString();
-        return false;
-      ">{view_toggle_icon}</button>
-      <button class="icon-btn danger" data-tip="Delete" onclick="
-        if (confirm('Delete {escape(name)}? This cannot be undone.')) {{
-          const u = new URL(parent.location.href);
-          u.searchParams.set('act','delete');
-          u.searchParams.set('id','{cid}');
-          parent.location.href = u.toString();
-        }}
-        return false;
-      ">⌫</button>
+      <!-- VIEW REPORT: use a real link that escapes the iframe -->
+      <a class="icon-btn" role="button" aria-label="View report for {escape(name)}"
+         title="View report"
+         data-tip="View report"
+         href="?report={escape(norm)}&scroll=1"
+         target="_top"
+         onclick="this.textContent='• • •';">
+         ▦
+      </a>
+
+      <!-- RENAME: prompt then navigate (still gives visual feedback) -->
+      <a class="icon-btn" role="button" aria-label="Rename {escape(name)}"
+         title="Rename"
+         data-tip="Rename"
+         href="#"
+         onclick="
+           const newName = prompt('Rename client: {escape(name)}','{escape(name)}');
+           if (newName && newName.trim()) {{
+             this.textContent='• • •';
+             const qs = new URLSearchParams({{act:'rename', id:'{cid}', arg:newName.trim()}}).toString();
+             top.location.href = '?' + qs;
+           }}
+           return false;
+         ">
+         ✎
+      </a>
+
+      <!-- ACTIVATE/DEACTIVATE -->
+      <a class="icon-btn" role="button" aria-label="{view_toggle_label} {escape(name)}"
+         title="{view_toggle_label}"
+         data-tip="{view_toggle_label}"
+         href="?act=toggle&id={cid}"
+         target="_top"
+         onclick="this.textContent='• • •';">
+         {view_toggle_icon}
+      </a>
+
+      <!-- DELETE -->
+      <a class="icon-btn danger" role="button" aria-label="Delete {escape(name)}"
+         title="Delete"
+         data-tip="Delete"
+         href="#"
+         onclick="
+           if (confirm('Delete {escape(name)}? This cannot be undone.')) {{
+             this.textContent='• • •';
+             top.location.href='?act=delete&id={cid}';
+           }}
+           return false;
+         ">
+         ⌫
+      </a>
     </div>
   </div>
 </body>
