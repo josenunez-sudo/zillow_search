@@ -1309,13 +1309,16 @@ def fetch_sent_for_client(client_norm: str, limit: int = 5000):
     except Exception:
         return []
 
-def _render_client_report_view(client_display_name: str, client_norm: str):
-    """Render a report: address as hyperlink → Zillow, with Campaign filter and Search box."""
-    st.markdown(f"### Report: {escape(client_display_name)}", unsafe_allow_html=True)
+def _render_client_report_view(client_display_name: str, client_norm: str, *, show_header: bool = True):
+    """Render a report: address as hyperlink → Zillow, with Campaign filter and Search box.
+       If show_header=False, suppress the title line."""
+    if show_header:
+        st.markdown(f"### Report: {escape(client_display_name)}", unsafe_allow_html=True)
 
     rows = fetch_sent_for_client(client_norm)
     total = len(rows)
 
+    # Campaigns (unique, preserve first-seen order)
     seen = []
     for r in rows:
         c = (r.get("campaign") or "").strip()
@@ -1386,6 +1389,7 @@ def _render_client_report_view(client_display_name: str, client_norm: str):
             mime="text/csv",
             use_container_width=False
         )
+
 
 # ---------- Smooth-scroll helper ----------
 def _scroll_to(element_id: str):
@@ -1462,44 +1466,81 @@ with tab_clients:
     active = [c for c in all_clients if c.get("active")]
     inactive = [c for c in all_clients if not c.get("active")]
 
-    # Initialize session state
+    # ---- State buckets ----
     if "report_client" not in st.session_state:
-        st.session_state["report_client"] = None
+        st.session_state["report_client"] = None  # holds name_norm for the selected report
+    if "rename_open_id" not in st.session_state:
+        st.session_state["rename_open_id"] = None  # which row is currently in rename mode
+
+    # Small CSS helpers for the row (green "Active" tag + compact buttons)
+    st.markdown("""
+    <style>
+      .row-wrap { padding:8px 6px; border-bottom:1px solid rgba(0,0,0,.08); }
+      .row-line { display:flex; align-items:center; justify-content:space-between; gap:8px; }
+      .left-stack { display:flex; align-items:center; gap:10px; min-width:0; }
+      .name-strong { font-weight:700; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+      .tag-active { font-size:11px; font-weight:700; padding:2px 8px; border-radius:999px; background:#dcfce7; color:#166534; }
+      .tag-inactive { font-size:11px; font-weight:700; padding:2px 8px; border-radius:999px; background:#e2e8f0; color:#334155; }
+      .icon-bar { display:flex; align-items:center; gap:6px; }
+      .icon-btn { min-width:0 !important; padding:2px 6px !important; }
+    </style>
+    """, unsafe_allow_html=True)
 
     def render_client_row(c):
-        col1, col2, col3, col4, col5 = st.columns([3,1,1,1,1])
-        with col1:
-            st.markdown(f"**{c['name']}**", unsafe_allow_html=True)
-
-        # 📑 Report
-        with col2:
-            if st.button("📑", key=f"report_{c['id']}", help="View report"):
-                st.session_state["report_client"] = c["name_norm"]
-
-        # ✎ Rename
-        with col3:
-            if st.button("✎", key=f"rename_{c['id']}", help="Rename client"):
-                new_name = st.text_input(f"Rename {c['name']}", value=c["name"], key=f"rename_input_{c['id']}")
-                if st.button(f"Confirm rename {c['id']}"):
-                    rename_client(c["id"], new_name)
-                    _safe_rerun()
-
-        # ○ / ● Toggle Active
-        with col4:
+        # left: name + active pill
+        left_col, right_col = st.columns([0.75, 0.25])
+        with left_col:
+            st.markdown(
+                f"""
+                <div class="row-wrap">
+                  <div class="row-line">
+                    <div class="left-stack">
+                        <span class="name-strong">{escape(c['name'])}</span>
+                        <span class="{'tag-active' if c['active'] else 'tag-inactive'}">
+                            {'Active' if c['active'] else 'Inactive'}
+                        </span>
+                    </div>
+                """, unsafe_allow_html=True
+            )
+        with right_col:
+            st.markdown('<div class="row-wrap"><div class="row-line"><div class="icon-bar">', unsafe_allow_html=True)
+            # ▦ Report (document) — icon-only with tooltip
+            if st.button("▦", key=f"report_{c['id']}", help="View report", use_container_width=False):
+                st.session_state["report_client"] = c.get("name_norm")
+            # ✎ Rename — toggles inline rename input for this row
+            if st.button("✎", key=f"rename_{c['id']}", help="Rename client", use_container_width=False):
+                st.session_state["rename_open_id"] = c["id"] if st.session_state["rename_open_id"] != c["id"] else None
+            # ○/● Toggle Active
             toggle_icon = "●" if c["active"] else "○"
             toggle_help = "Deactivate" if c["active"] else "Activate"
-            if st.button(toggle_icon, key=f"toggle_{c['id']}", help=toggle_help):
+            if st.button(toggle_icon, key=f"toggle_{c['id']}", help=toggle_help, use_container_width=False):
                 toggle_client_active(c["id"], not c["active"])
                 _safe_rerun()
-
-        # ⌫ Delete
-        with col5:
-            if st.button("⌫", key=f"delete_{c['id']}", help="Delete client"):
+            # ⌫ Delete
+            if st.button("⌫", key=f"delete_{c['id']}", help="Delete client", use_container_width=False):
                 delete_client(c["id"])
                 _safe_rerun()
+            st.markdown('</div></div></div>', unsafe_allow_html=True)
+
+        # Inline rename row (only when opened for this id)
+        if st.session_state["rename_open_id"] == c["id"]:
+            new_name = st.text_input("New name", value=c["name"], key=f"rename_input_{c['id']}")
+            col_ok, col_cancel = st.columns([1,1])
+            with col_ok:
+                if st.button("Save name", key=f"rename_save_{c['id']}"):
+                    ok, msg = rename_client(c["id"], new_name)
+                    if ok:
+                        st.session_state["rename_open_id"] = None
+                        _safe_rerun()
+                    else:
+                        st.error(msg)
+            with col_cancel:
+                if st.button("Cancel", key=f"rename_cancel_{c['id']}"):
+                    st.session_state["rename_open_id"] = None
 
     colA, colB = st.columns(2)
 
+    # Active list
     with colA:
         st.markdown("### Active")
         if not active:
@@ -1508,6 +1549,7 @@ with tab_clients:
             for c in active:
                 render_client_row(c)
 
+    # Inactive list
     with colB:
         st.markdown("### Inactive")
         if not inactive:
@@ -1516,13 +1558,24 @@ with tab_clients:
             for c in inactive:
                 render_client_row(c)
 
-    # ---- REPORT SECTION INLINE ----
+    # ---- REPORT SECTION INLINE (below lists) ----
+    # If a report client is selected in state, render it here inline.
     if st.session_state["report_client"]:
         client_norm = st.session_state["report_client"]
         display_name = next(
             (c["name"] for c in all_clients if c.get("name_norm") == client_norm),
             client_norm
         )
+
         st.markdown("---")
-        st.subheader(f"Report for {display_name}")
-        _render_client_report_view(display_name, client_norm)
+        # Compact, single header (no duplication)
+        st.markdown(f"### Report: {escape(display_name)}", unsafe_allow_html=True)
+
+        # Render the report WITHOUT its internal header (avoid redundancy)
+        _render_client_report_view(display_name, client_norm, show_header=False)
+
+        # Close report button
+        close_cols = st.columns([1, 6])
+        with close_cols[0]:
+            if st.button("Close report", key="close_report"):
+                st.session_state["report_client"] = None
