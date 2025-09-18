@@ -1494,65 +1494,87 @@ with tab_clients:
     </style>
     """, unsafe_allow_html=True)
 
-    def render_client_row(c):
-        # Whole row container
-        st.markdown('<div class="row-wrap"><div class="row-line">', unsafe_allow_html=True)
+def render_client_row(c):
+    # --- Row shell ---
+    st.markdown('<div class="row-wrap"><div class="row-line">', unsafe_allow_html=True)
 
-        # LEFT side: name + active pill
-        left_col, right_col = st.columns([0.75, 0.25])
-        with left_col:
-            st.markdown(
-                f"""
-                <div class="left-stack">
-                    <span class="name-strong">{escape(c['name'])}</span>
-                    <span class="{'tag-active' if c['active'] else 'tag-inactive'}">
-                        {'Active' if c['active'] else 'Inactive'}
-                    </span>
-                </div>
-                """, unsafe_allow_html=True
-            )
+    # LEFT: name + active pill
+    left_col, right_col = st.columns([0.75, 0.25])
+    with left_col:
+        st.markdown(
+            f"""
+            <div class="left-stack">
+                <span class="name-strong">{escape(c['name'])}</span>
+                <span class="{'tag-active' if c['active'] else 'tag-inactive'}">
+                    {'Active' if c['active'] else 'Inactive'}
+                </span>
+            </div>
+            """,
+            unsafe_allow_html=True
+        )
 
-        # RIGHT side: 4 buttons in sub-columns so they stay side-by-side
-        with right_col:
-            bcols = st.columns([1,1,1,1], gap="small")
-            # ▦ Report (icon-only)
-            with bcols[0]:
-                if st.button("▦", key=f"report_{c['id']}", help="View report", use_container_width=True):
-                    st.session_state["report_client"] = c.get("name_norm")
-            # ✎ Rename (toggle inline rename controls)
-            with bcols[1]:
-                if st.button("✎", key=f"rename_{c['id']}", help="Rename client", use_container_width=True):
-                    st.session_state["rename_open_id"] = c["id"] if st.session_state["rename_open_id"] != c["id"] else None
-            # ○/● Toggle Active
-            with bcols[2]:
-                toggle_icon = "●" if c["active"] else "○"
-                toggle_help = "Deactivate" if c["active"] else "Activate"
-                if st.button(toggle_icon, key=f"toggle_{c['id']}", help=toggle_help, use_container_width=True):
-                    toggle_client_active(c["id"], not c["active"])
-                    _safe_rerun()
-            # ⌫ Delete
-            with bcols[3]:
-                if st.button("⌫", key=f"delete_{c['id']}", help="Delete client", use_container_width=True):
-                    delete_client(c["id"])
-                    _safe_rerun()
+    # RIGHT: four icon buttons in a single flow (no per-icon subcolumns)
+    with right_col:
+        row_cls = f"icon-row-{c['id']}"
+        # Row-scoped CSS to make st.button wrappers render inline and compact
+        st.markdown(
+            f"""
+            <style>
+              .{row_cls} div[data-testid="stButton"] {{
+                display: inline-block;
+                margin-right: 6px;
+              }}
+              .{row_cls} div[data-testid="stButton"] button {{
+                padding: 2px 8px;
+                height: 28px;
+                font-size: 14px;
+                line-height: 1;
+              }}
+            </style>
+            <div class="{row_cls}"></div>
+            """,
+            unsafe_allow_html=True
+        )
 
-        st.markdown('</div></div>', unsafe_allow_html=True)
+        # Place buttons sequentially; CSS above makes them inline side-by-side
+        # ▦ Report
+        if st.button("▦", key=f"report_{c['id']}", help="View report", use_container_width=False):
+            st.session_state["report_client"] = c.get("name_norm")
 
-        # Inline rename controls (only for the open row)
-        if st.session_state["rename_open_id"] == c["id"]:
-            new_name = st.text_input("New name", value=c["name"], key=f"rename_input_{c['id']}")
-            col_ok, col_cancel = st.columns([1,1])
-            with col_ok:
-                if st.button("Save name", key=f"rename_save_{c['id']}"):
-                    ok, msg = rename_client(c["id"], new_name)
-                    if ok:
-                        st.session_state["rename_open_id"] = None
-                        _safe_rerun()
-                    else:
-                        st.error(msg)
-            with col_cancel:
-                if st.button("Cancel", key=f"rename_cancel_{c['id']}"):
+        # ✎ Rename (toggle inline rename controls)
+        if st.button("✎", key=f"rename_{c['id']}", help="Rename client", use_container_width=False):
+            st.session_state["rename_open_id"] = c["id"] if st.session_state["rename_open_id"] != c["id"] else None
+
+        # ○/● Toggle Active
+        toggle_icon = "●" if c["active"] else "○"
+        toggle_help = "Deactivate" if c["active"] else "Activate"
+        if st.button(toggle_icon, key=f"toggle_{c['id']}", help=toggle_help, use_container_width=False):
+            toggle_client_active(c["id"], not c["active"])
+            _safe_rerun()
+
+        # ⌫ Delete
+        if st.button("⌫", key=f"delete_{c['id']}", help="Delete client", use_container_width=False):
+            delete_client(c["id"])
+            _safe_rerun()
+
+    st.markdown('</div></div>', unsafe_allow_html=True)
+
+    # Inline rename controls (only when opened for this id)
+    if st.session_state.get("rename_open_id") == c["id"]:
+        new_name = st.text_input("New name", value=c["name"], key=f"rename_input_{c['id']}")
+        col_ok, col_cancel = st.columns([1,1])
+        with col_ok:
+            if st.button("Save name", key=f"rename_save_{c['id']}"):
+                ok, msg = rename_client(c["id"], new_name)
+                if ok:
                     st.session_state["rename_open_id"] = None
+                    _safe_rerun()
+                else:
+                    st.error(msg)
+        with col_cancel:
+            if st.button("Cancel", key=f"rename_cancel_{c['id']}"):
+                st.session_state["rename_open_id"] = None
+
 
     colA, colB = st.columns(2)
 
