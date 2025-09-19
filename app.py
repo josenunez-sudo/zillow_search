@@ -1422,64 +1422,82 @@ def _render_client_report_view(client_display_name: str, client_norm: str):
             use_container_width=False
         )
 
-# ---------- Clients tab — original 4 buttons style (▦ ✎ ⟳ ⌫) but reliable ----------
-def _client_row_icons(name: str, norm: str, cid: int, active: bool):
-    # left = name + status
-    st.markdown(
-        f"<div class='client-row'><div class='client-left'>"
-        f"<span class='client-name'>{escape(name)}</span>"
-        f"<span class='pill {'active' if active else ''}'>{'active' if active else 'inactive'}</span>"
-        f"</div><div class='iconbar' id='icons_{cid}'></div></div>",
-        unsafe_allow_html=True
-    )
-
-    # Mount the four icon-like buttons inline
-    cont = st.container()
-    with cont:
-        c1, c2, c3, c4, gap = st.columns([0.18,0.18,0.18,0.18,0.28])
-        # ▦ REPORT
-        if c1.button("▦", key=f"rep_{cid}", help="Open report"):
-            _qp_set(report=norm, scroll="1")
-            _safe_rerun()
-
-        # ✎ RENAME
-        if c2.button("✎", key=f"rn_btn_{cid}", help="Rename"):
-            st.session_state[f"__edit_{cid}"] = True
-
-        # ⟳ ACTIVATE/DEACTIVATE
-        if c3.button("⟳", key=f"tg_{cid}", help=("Deactivate" if active else "Activate")):
-            rows = SUPABASE.table("clients").select("active").eq("id", cid).limit(1).execute().data or []
-            cur = rows[0]["active"] if rows else active
-            toggle_client_active(cid, (not cur))
-            _safe_rerun()
-
-        # ⌫ DELETE (with confirm)
-        if c4.button("⌫", key=f"del_{cid}", help="Delete"):
-            st.session_state[f"__del_{cid}"] = True
-
-        # Inline rename editor
-        if st.session_state.get(f"__edit_{cid}"):
-            new_name = st.text_input("New name", value=name, key=f"rn_val_{cid}")
-            cc1, cc2 = st.columns([0.2,0.2])
-            if cc1.button("Save", key=f"rn_save_{cid}"):
-                ok, msg = rename_client(cid, new_name)
-                if not ok: st.warning(msg)
-                st.session_state[f"__edit_{cid}"] = False
-                _safe_rerun()
-            if cc2.button("Cancel", key=f"rn_cancel_{cid}"):
-                st.session_state[f"__edit_{cid}"] = False
-            st.markdown("<div class='inline-panel'></div>", unsafe_allow_html=True)
-
-        # Inline delete confirm
-        if st.session_state.get(f"__del_{cid}"):
-            dc1, dc2 = st.columns([0.2,0.2])
-            if dc1.button("Confirm delete", key=f"del_yes_{cid}"):
-                delete_client(cid)
-                st.session_state[f"__del_{cid}"] = False
-                _safe_rerun()
-            if dc2.button("Cancel", key=f"del_no_{cid}"):
-                st.session_state[f"__del_{cid}"] = False
-            st.markdown("<div class='inline-panel'></div>", unsafe_allow_html=True)
+# ---------- Clients tab — original 4 buttons inline (▦ ✎ ⟳ ⌫) ----------
+def _client_row_html(name: str, norm: str, cid: int, active: bool):
+    status = "active" if active else "inactive"
+    toggle_label = "Deactivate" if active else "Activate"
+    html = f"""
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  html, body {{ margin:0; padding:0; }}
+  /* Make the row a single line with space-between layout */
+  .client-row {{
+    display:flex; align-items:center; justify-content:space-between;
+    gap:12px; padding:10px 8px; border-bottom:1px solid #e2e8f0;
+    white-space:nowrap; width:100%;
+  }}
+  .client-left {{ display:flex; align-items:center; gap:8px; min-width:0; }}
+  /* Force client name to white so it's visible on dark themes */
+  .client-name {{
+    font-weight:700; color:#ffffff !important;
+    white-space:nowrap; overflow:hidden; text-overflow:ellipsis;
+  }}
+  .pill {{ font-size:11px; font-weight:800; padding:2px 10px; border-radius:999px; }}
+  .pill.active {{
+    background: linear-gradient(180deg, #dcfce7 0%, #bbf7d0 100%);
+    color:#166534; border:1px solid rgba(5,150,105,.35);
+    box-shadow: 0 4px 12px rgba(16,185,129,.25);
+  }}
+  .pill.inactive {{ background:#e2e8f0; color:#475569; }}
+  .iconbar {{ display:flex; align-items:center; gap:10px; white-space:nowrap; }}
+  .ic {{
+    font-size:14px; line-height:1; cursor:pointer; user-select:none;
+    color:#64748b; padding:0; margin:0; border:none; background:transparent;
+    display:inline-flex; align-items:center; justify-content:center;
+    transform: translateY(0); transition: transform .08s ease, color .08s ease;
+    text-decoration:none;
+  }}
+  .ic:hover {{ color:#0f172a; transform: translateY(-1px); }}
+  .ic:focus {{ outline: 2px solid #93c5fd; outline-offset: 2px; border-radius:6px; }}
+</style>
+</head>
+<body>
+  <div class="client-row">
+    <div class="client-left">
+      <span class="client-name">{escape(name)}</span>
+      <span class="pill {status}">{status}</span>
+    </div>
+    <div class="iconbar">
+      <a class="ic" title="Open report" href="?report={escape(norm)}&scroll=1" target="_parent">▦</a>
+      <span class="ic" title="Rename" role="button" tabindex="0"
+        onclick="
+          const newName = prompt('Rename client:', '{escape(name)}');
+          if (newName && newName.trim()) {{
+            const u = new URL(parent.location.href);
+            u.searchParams.set('act', 'rename');
+            u.searchParams.set('id', '{cid}');
+            u.searchParams.set('arg', newName.trim());
+            parent.location.search = u.search;
+          }}
+          return false;">✎</span>
+      <a class="ic" title="{toggle_label}" href="?act=toggle&id={cid}" target="_parent">⟳</a>
+      <span class="ic" title="Delete" role="button" tabindex="0"
+        onclick="
+          if (confirm('Delete {escape(name)}? This cannot be undone.')) {{
+            const u = new URL(parent.location.href);
+            u.searchParams.set('act', 'delete');
+            u.searchParams.set('id', '{cid}');
+            parent.location.search = u.search;
+          }}
+          return false;">⌫</span>
+    </div>
+  </div>
+</body>
+</html>"""
+    components.html(html, height=52, scrolling=False)
 
 # ---------- CLIENTS TAB ----------
 with tab_clients:
@@ -1501,7 +1519,7 @@ with tab_clients:
             st.write("_No active clients_")
         else:
             for c in active:
-                _client_row_icons(c["name"], c.get("name_norm",""), c["id"], active=True)
+                _client_row_html(c["name"], c.get("name_norm",""), c["id"], active=True)
 
     with colB:
         st.markdown("### Inactive", unsafe_allow_html=True)
@@ -1509,7 +1527,7 @@ with tab_clients:
             st.write("_No inactive clients_")
         else:
             for c in inactive:
-                _client_row_icons(c["name"], c.get("name_norm",""), c["id"], active=False)
+                _client_row_html(c["name"], c.get("name_norm",""), c["id"], active=False)
 
     # ---- REPORT SECTION BELOW THE TABLES ----
     st.markdown('<div id="report_anchor"></div>', unsafe_allow_html=True)
