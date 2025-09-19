@@ -158,7 +158,10 @@ html[data-theme="dark"] .pill.active,
 /* ===== Clients row: icon buttons (▦ ✎ ⟳ ⌫) ===== */
 .client-row { display:flex; align-items:center; justify-content:space-between; padding:10px 8px; border-bottom:1px solid var(--row-border); }
 .client-left { display:flex; align-items:center; gap:8px; min-width:0; }
-.client-name { font-weight:700; color:#ffffff !important; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; } /* always white */
+
+/* >>> Force client name to white <<< */
+.client-name { font-weight:700; color:#ffffff !important; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+
 .iconbar { display:flex; align-items:center; gap:8px; }
 .iconbar .stButton > button {
   min-width: 28px; height: 28px; padding:0 8px;
@@ -577,7 +580,7 @@ def resolve_from_source_url(source_url: str, defaults: Dict[str,str]) -> Tuple[s
                 u = it.get("url") or ""
                 if "/homedetails/" in u: return u, title
     if city or state or street:
-        return construct_deeplink_from_parts(street or title or "", city, state, zipc, defaults), compose_query_address(street or title or "", city, state, zipc, defaults)
+        return construct_deeplink_from_parts(street or title or "", city, state, zipc, defaults), compose_query_address(street, city, state, zipc, defaults)
     return final_url, ""
 
 # Primary resolver
@@ -974,7 +977,7 @@ def build_output(rows: List[Dict[str, Any]], fmt: str, use_display: bool = True,
         for r in rows:
             u = pick_url(r)
             if not u: continue
-            # Results export keeps URL as anchor text for clarity
+            # Keep anchor text = URL for clean sharing/unfurls
             items.append(f'<li><a href="{escape(u)}" target="_blank" rel="noopener">{escape(u)}</a></li>')
         return "<ul>\n" + "\n".join(items) + "\n</ul>\n", "text/html"
 
@@ -1023,7 +1026,7 @@ with tab_run:
     with c1:
         use_shortlinks = st.checkbox("Use short links (Bitly)", value=False, help="Optional tracking; sharing uses clean Zillow links.")
     with c2:
-        # Default unchecked as requested
+        # Default UNCHECKED per your request
         enrich_details = st.checkbox("Enrich details", value=False)
     with c3:
         show_details = st.checkbox("Show details under results", value=False)
@@ -1036,7 +1039,7 @@ with tab_run:
         if not selected_client:
             only_show_new = False
 
-    # Hide table by default to remove dead space; user can enable it
+    # Default: hide table to remove dead space; you can re-enable
     table_view = st.checkbox("Show results as table", value=False, help="Easier to scan details")
 
     client_tag = _norm_tag(client_tag_raw)
@@ -1099,15 +1102,16 @@ with tab_run:
     clicked = st.button("🚀 Run", use_container_width=True, key="__run_btn__")
     st.markdown('</div>', unsafe_allow_html=True)
 
-    # Results HTML list with copy-all — ALWAYS hyperlinks, compact spacing
+    # Results HTML list with copy-all (ALWAYS hyperlinks, tight spacing)
     def results_list_with_copy_all(results: List[Dict[str, Any]], client_selected: bool):
         li_html = []
         for r in results:
             href = r.get("preview_url") or r.get("zillow_url") or r.get("display_url") or ""
-            if not href:
+            if not href: 
                 continue
             safe_href = escape(href)
-            link_txt = r.get("input_address") or href  # address text if available
+            link_txt = href  # keep the URL text for best SMS unfurls
+
             badge_html = ""
             if client_selected:
                 if r.get("already_sent"):
@@ -1116,8 +1120,9 @@ with tab_run:
                 else:
                     badge_html = ' <span class="badge new" title="New for this client">NEW</span>'
 
-            # hyperlink only (best for SMS unfurl), minimal spacing
-            li_html.append(f'<li style="margin:0.2rem 0;"><a href="{safe_href}" target="_blank" rel="noopener">{escape(link_txt)}</a>{badge_html}</li>')
+            li_html.append(
+                f'<li style="margin:0.2rem 0;"><a href="{safe_href}" target="_blank" rel="noopener">{escape(link_txt)}</a>{badge_html}</li>'
+            )
 
         items_html = "\n".join(li_html) if li_html else "<li>(no results)</li>"
 
@@ -1132,7 +1137,7 @@ with tab_run:
         <html><head><meta charset="utf-8" />
           <style>
             html,body {{ margin:0; font-family:-apple-system, Segoe UI, Roboto, Arial, sans-serif; }}
-            .results-wrap {{ position:relative; box-sizing:border-box; padding:8px 120px 6px 0; }}
+            .results-wrap {{ position:relative; box-sizing:border-box; padding:8px 120px 4px 0; }}
             ul.link-list {{ margin:0 0 0.2rem 1.2rem; padding:0; list-style:disc; }}
             ul.link-list li {{ margin:0.2rem 0; }}
             .copyall-btn {{ position:absolute; top:0; right:8px; z-index:5; padding:6px 10px; height:26px; border:0; border-radius:10px; color:#fff; font-weight:700; background:#1d4ed8; cursor:pointer; opacity:.95; }}
@@ -1157,14 +1162,14 @@ with tab_run:
             }})();
           </script>
         </body></html>"""
-        est_h = max(60, min(34 * max(1, len(li_html)) + 18, 700))
+        est_h = max(60, min(34 * max(1, len(li_html)) + 20, 700))
         components.html(html, height=est_h, scrolling=False)
 
     def _render_results_and_downloads(results: List[Dict[str, Any]], client_tag: str, campaign_tag: str, include_notes: bool, client_selected: bool):
         st.markdown("#### Results")
         results_list_with_copy_all(results, client_selected=client_selected)
 
-        # Optional table (off by default to remove dead space)
+        # Table removed by default (no dead space). Toggle above if you want it.
         if table_view:
             import pandas as pd
             cols = ["already_sent","dup_reason","dup_sent_at","display_url","zillow_url","preview_url","status","price","beds","baths","sqft","mls_id","input_address"]
@@ -1181,7 +1186,7 @@ with tab_run:
         st.download_button("Export", data=payload, file_name=f"address_alchemist{tag}_{ts}.{fmt}", mime=mime, use_container_width=True)
         st.session_state["__results__"] = {"results": results, "fmt": fmt}
 
-        # Thumbs (unchanged)
+        # Thumbs (kept as-is)
         thumbs=[]
         for r in results:
             img = r.get("image_url")
@@ -1412,64 +1417,66 @@ def _render_client_report_view(client_display_name: str, client_norm: str):
             use_container_width=False
         )
 
-# ---------- Clients tab — original 4 buttons style (▦ ✎ ⟳ ⌫) ----------
+# ---------- CLIENTS TAB — INLINE one-row layout (name + ▦ ✎ ⟳ ⌫) ----------
 def _client_row_icons(name: str, norm: str, cid: int, active: bool):
-    # left = name + status
-    st.markdown(
-        f"<div class='client-row'><div class='client-left'>"
-        f"<span class='client-name'>{escape(name)}</span>"
-        f"<span class='pill {'active' if active else ''}'>{'active' if active else 'inactive'}</span>"
-        f"</div><div class='iconbar' id='icons_{cid}'></div></div>",
-        unsafe_allow_html=True
-    )
+    # Single row using columns so widgets are inline with the name
+    col_name, col_rep, col_ren, col_tog, col_del, col_sp = st.columns([8, 1, 1, 1, 1, 2])
 
-    # Mount the four icon-like buttons inline
-    cont = st.container()
-    with cont:
-        c1, c2, c3, c4, gap = st.columns([0.18,0.18,0.18,0.18,0.28])
-        # ▦ REPORT
-        if c1.button("▦", key=f"rep_{cid}", help="Open report"):
+    with col_name:
+        st.markdown(
+            f"<span class='client-name'>{escape(name)}</span> "
+            f"<span class='pill {'active' if active else ''}'>{'active' if active else 'inactive'}</span>",
+            unsafe_allow_html=True
+        )
+
+    with col_rep:
+        if st.button("▦", key=f"rep_{cid}", help="Open report"):
             _qp_set(report=norm, scroll="1")
             _safe_rerun()
 
-        # ✎ RENAME
-        if c2.button("✎", key=f"rn_btn_{cid}", help="Rename"):
+    with col_ren:
+        if st.button("✎", key=f"rn_btn_{cid}", help="Rename"):
             st.session_state[f"__edit_{cid}"] = True
 
-        # ⟳ ACTIVATE/DEACTIVATE
-        if c3.button("⟳", key=f"tg_{cid}", help=("Deactivate" if active else "Activate")):
+    with col_tog:
+        if st.button("⟳", key=f"tg_{cid}", help=("Deactivate" if active else "Activate")):
             rows = SUPABASE.table("clients").select("active").eq("id", cid).limit(1).execute().data or []
             cur = rows[0]["active"] if rows else active
             toggle_client_active(cid, (not cur))
             _safe_rerun()
 
-        # ⌫ DELETE (with confirm)
-        if c4.button("⌫", key=f"del_{cid}", help="Delete"):
+    with col_del:
+        if st.button("⌫", key=f"del_{cid}", help="Delete"):
             st.session_state[f"__del_{cid}"] = True
 
-        # Inline rename editor
-        if st.session_state.get(f"__edit_{cid}"):
-            new_name = st.text_input("New name", value=name, key=f"rn_val_{cid}")
-            cc1, cc2 = st.columns([0.2,0.2])
-            if cc1.button("Save", key=f"rn_save_{cid}"):
-                ok, msg = rename_client(cid, new_name)
-                if not ok: st.warning(msg)
-                st.session_state[f"__edit_{cid}"] = False
-                _safe_rerun()
-            if cc2.button("Cancel", key=f"rn_cancel_{cid}"):
-                st.session_state[f"__edit_{cid}"] = False
-            st.markdown("<div class='inline-panel'></div>", unsafe_allow_html=True)
+    # Inline rename editor
+    if st.session_state.get(f"__edit_{cid}"):
+        st.markdown("<div class='inline-panel'>", unsafe_allow_html=True)
+        new_name = st.text_input("New name", value=name, key=f"rn_val_{cid}")
+        cc1, cc2 = st.columns([0.2, 0.2])
+        if cc1.button("Save", key=f"rn_save_{cid}"):
+            ok, msg = rename_client(cid, new_name)
+            if not ok: st.warning(msg)
+            st.session_state[f"__edit_{cid}"] = False
+            _safe_rerun()
+        if cc2.button("Cancel", key=f"rn_cancel_{cid}"):
+            st.session_state[f"__edit_{cid}"] = False
+        st.markdown("</div>", unsafe_allow_html=True)
 
-        # Inline delete confirm
-        if st.session_state.get(f"__del_{cid}"):
-            dc1, dc2 = st.columns([0.2,0.2])
-            if dc1.button("Confirm delete", key=f"del_yes_{cid}"):
-                delete_client(cid)
-                st.session_state[f"__del_{cid}"] = False
-                _safe_rerun()
-            if dc2.button("Cancel", key=f"del_no_{cid}"):
-                st.session_state[f"__del_{cid}"] = False
-            st.markdown("<div class='inline-panel'></div>", unsafe_allow_html=True)
+    # Inline delete confirm
+    if st.session_state.get(f"__del_{cid}"):
+        st.markdown("<div class='inline-panel'>", unsafe_allow_html=True)
+        dc1, dc2 = st.columns([0.25, 0.25])
+        if dc1.button("Confirm delete", key=f"del_yes_{cid}"):
+            delete_client(cid)
+            st.session_state[f"__del_{cid}"] = False
+            _safe_rerun()
+        if dc2.button("Cancel", key=f"del_no_{cid}"):
+            st.session_state[f"__del_{cid}"] = False
+        st.markdown("</div>", unsafe_allow_html=True)
+
+    # subtle divider under each row
+    st.markdown("<div style='border-bottom:1px solid var(--row-border); margin:4px 0 2px 0;'></div>", unsafe_allow_html=True)
 
 # ---------- CLIENTS TAB ----------
 with tab_clients:
