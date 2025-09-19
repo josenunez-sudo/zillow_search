@@ -1,24 +1,23 @@
 # services/images.py
-from __future__ import annotations
-import re, requests
-from typing import Dict, Any, Optional, Tuple
+import os, re, requests
+from typing import Optional, Tuple, Dict, Any
+
 import streamlit as st
-from core.config import GOOGLE_MAPS_API_KEY, REQUEST_TIMEOUT
 from services.enrich import extract_zillow_first_image
 
+REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "12"))
+
 UA_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                  "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36",
+    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
     "Accept-Language": "en-US,en;q=0.9",
     "Cache-Control": "no-cache",
 }
 
+GOOGLE_MAPS_API_KEY = os.getenv("GOOGLE_MAPS_API_KEY", "")
+
 def picture_for_result_with_log(query_address: str, zurl: str, csv_photo_url: Optional[str] = None):
-    log = {
-        "url": zurl, "csv_provided": bool(csv_photo_url), "stage": None,
-        "status_code": None, "html_len": None, "selected": None, "errors": []
-    }
+    log = {"url": zurl, "csv_provided": bool(csv_photo_url), "stage": None, "status_code": None, "html_len": None, "selected": None, "errors": []}
     def _ok(u:str)->bool: return isinstance(u,str) and (u.startswith("http://") or u.startswith("https://") or u.startswith("data:"))
     if csv_photo_url and _ok(csv_photo_url):
         log["stage"]="csv_photo"; log["selected"]=csv_photo_url; return csv_photo_url, log
