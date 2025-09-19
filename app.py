@@ -68,7 +68,7 @@ st.set_page_config(
     layout="centered",
 )
 
-# Base styles
+# Base styles (apply to Streamlit page)
 st.markdown("""
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@700;800&display=swap');
@@ -102,7 +102,7 @@ html[data-theme="dark"] .badge.new,
   box-shadow: 0 6px 16px rgba(6,95,70,.45), 0 1px 3px rgba(0,0,0,.35);
 }
 
-/* Theme vars */
+/* Theme variables */
 :root {
   --text-strong: #0f172a;
   --text-muted:  #475569;
@@ -647,7 +647,7 @@ def extract_zillow_first_image(html: str) -> Optional[str]:
             up=[u for (w,u) in cand if w<=1152]
             return (sorted(((w,u) for (w,u) in cand if w<=1152), key=lambda x:x[0])[-1][1] if up
                     else sorted(cand, key=lambda x:x[0])[-1][1])
-    m = re.search(r"(https://photos\.zillowstatic\.com/fp/\S+-cc_ft_\d+\.(?:jpg|webp))", html, re.I)
+    m = re.search(r"(https://photos\.zillowstatic\.com/fp/\S+-cc_ft_\d+\.(jpg|webp))", html, re.I)
     return m.group(1) if m else None
 def parse_listing_meta(html: str) -> Dict[str, Any]:
     meta = {}
@@ -821,7 +821,7 @@ def log_sent_rows(results: List[Dict[str, Any]], client_tag: str, campaign_tag: 
     except Exception as e:
         return False, str(e)
 
-# ---------- Clients registry ----------
+# ---------- Clients registry helpers (cached) ----------
 @st.cache_data(ttl=60, show_spinner=False)
 def fetch_clients(include_inactive: bool = False):
     if not _sb_ok(): return []
@@ -897,10 +897,10 @@ def _qp_get(name, default=None):
 
 def _qp_set(**kwargs):
     try:
-        if not kwargs:
-            st.query_params.clear()
-        else:
+        if kwargs:
             st.query_params.update(kwargs)
+        else:
+            st.query_params.clear()
     except Exception:
         if kwargs:
             st.experimental_set_query_params(**kwargs)
@@ -974,7 +974,7 @@ with tab_run:
     NO_CLIENT = "➤ No client (show ALL, no logging)"
     ADD_SENTINEL = "➕ Add new client…"
 
-    colC, colCamp = st.columns([1.2, 1])
+    colC, colK = st.columns([1.2, 1])
     with colC:
         active_clients = fetch_clients(include_inactive=False)
         names = [c["name"] for c in active_clients]
@@ -993,7 +993,7 @@ with tab_run:
                     st.error(f"Add failed: {msg}")
 
         client_tag_raw = (selected_client["name"] if selected_client else "")
-    with colCamp:
+    with colK:
         campaign_tag_raw = st.text_input("Campaign tag", value=datetime.utcnow().strftime("%Y%m%d"))
 
     c1, c2, c3, c4 = st.columns([1,1,1.25,1.45])
@@ -1074,28 +1074,15 @@ with tab_run:
     clicked = st.button("🚀 Run", use_container_width=True, key="__run_btn__")
     st.markdown('</div>', unsafe_allow_html=True)
 
-    # Results list (address as link text)
+    # Results HTML list with copy-all (ALWAYS preview links for best unfurl)
     def results_list_with_copy_all(results: List[Dict[str, Any]], client_selected: bool):
-        def addr_text_from_url(url: str) -> str:
-            if not url: return ""
-            u = unquote(url)
-            m = re.search(r"/homedetails/([^/]+)/\d{6,}_zpid/", u, re.I)
-            if m:
-                return re.sub(r"[-+]", " ", m.group(1)).strip().title()
-            m = re.search(r"/homes/([^/_]+)_rb/?", u, re.I)
-            if m:
-                return re.sub(r"[-+]", " ", m.group(1)).strip().title()
-            return ""
-
         li_html = []
         for r in results:
             href = r.get("preview_url") or r.get("zillow_url") or r.get("display_url") or ""
             if not href: continue
             safe_href = escape(href)
 
-            link_txt = (r.get("input_address") or addr_text_from_url(href) or "Open on Zillow")
-            safe_txt = escape(link_txt)
-
+            link_txt = r.get("input_address") or href
             badge_html = ""
             if client_selected:
                 if r.get("already_sent"):
@@ -1118,7 +1105,7 @@ with tab_run:
                     hlt = " ".join([f"<span class='hl'>{escape(h)}</span>" for h in (r.get("highlights") or [])])
                     detail_html += f"<div class='detail'>{escape(r.get('summary') or '')} {hlt}</div>"
 
-            li_html.append(f'<li><a href="{safe_href}" target="_blank" rel="noopener">{safe_txt}</a>{badge_html}{detail_html}</li>')
+            li_html.append(f'<li><a href="{safe_href}" target="_blank" rel="noopener">{escape(link_txt)}</a>{badge_html}{detail_html}</li>')
 
         items_html = "\n".join(li_html) if li_html else "<li>(no results)</li>"
 
@@ -1191,25 +1178,15 @@ with tab_run:
         if thumbs:
             st.markdown("#### Images")
             cols = st.columns(3)
-            def addr_text_from_url(url: str) -> str:
-                if not url: return ""
-                u = unquote(url)
-                m = re.search(r"/homedetails/([^/]+)/\d{6,}_zpid/", u, re.I)
-                if m:
-                    return re.sub(r"[-+]", " ", m.group(1)).strip().title()
-                m = re.search(r"/homes/([^/_]+)_rb/?", u, re.I)
-                if m:
-                    return re.sub(r"[-+]", " ", m.group(1)).strip().title()
-                return ""
             for i,(r,img) in enumerate(thumbs):
                 with cols[i%3]:
                     st.image(img, use_container_width=True)
                     mls_id = (r.get("mls_id") or "").strip()
+                    addr = (r.get("input_address") or "").strip()
                     url = r.get("preview_url") or r.get("zillow_url") or r.get("display_url") or "#"
-                    addr = (r.get("input_address") or addr_text_from_url(url) or "Open on Zillow")
-                    mls_html = f"<strong>MLS#: {escape(mls_id)}</strong>" if mls_id else ""
+                    link_text = escape(addr) if addr else "View listing"
                     st.markdown(
-                        f"<div class='img-label'>{mls_html}<br/><a href='{escape(url)}' target='_blank' rel='noopener'>{escape(addr)}</a></div>",
+                        f"<div class='img-label'>{('<strong>MLS#: '+escape(mls_id)+'</strong><br/>' if mls_id else '')}<a href='{escape(url)}' target='_blank' rel='noopener'>{link_text}</a></div>",
                         unsafe_allow_html=True
                     )
 
@@ -1308,6 +1285,10 @@ with tab_run:
 # ---------- Sent reports ----------
 @st.cache_data(ttl=120, show_spinner=False)
 def fetch_sent_for_client(client_norm: str, limit: int = 5000):
+    """
+    Fetch sent rows for a given normalized client name from Supabase.
+    Returns list of dicts: [{url, address, sent_at, campaign, mls_id, canonical, zpid}, ...]
+    """
     if not (_supabase_available() and client_norm.strip()):
         return []
     try:
@@ -1326,26 +1307,31 @@ def fetch_sent_for_client(client_norm: str, limit: int = 5000):
 def address_text_from_url(url: str) -> str:
     if not url: return ""
     u = unquote(url)
+    # /homedetails/123-Main-St-Austin-TX-78701/12345678_zpid/
     m = re.search(r"/homedetails/([^/]+)/\d{6,}_zpid/", u, re.I)
     if m:
         return re.sub(r"[-+]", " ", m.group(1)).strip().title()
+    # /homes/123-Main-St-Austin-TX-78701_rb/
     m = re.search(r"/homes/([^/_]+)_rb/?", u, re.I)
     if m:
         return re.sub(r"[-+]", " ", m.group(1)).strip().title()
     return ""
 
 def _render_client_report_view(client_display_name: str, client_norm: str):
+    """Render a report: address as hyperlink → Zillow, with Campaign filter and Search box."""
     st.markdown(f"### Report for {escape(client_display_name)}", unsafe_allow_html=True)
 
+    # Close report button
     colX, _ = st.columns([1,3])
     with colX:
         if st.button("Close report", key=f"__close_report_{client_norm}"):
-            _qp_set()
+            _qp_set()  # clear query params
             _safe_rerun()
 
     rows = fetch_sent_for_client(client_norm)
     total = len(rows)
 
+    # Campaign filter options
     seen = []
     for r in rows:
         c = (r.get("campaign") or "").strip()
@@ -1389,9 +1375,7 @@ def _render_client_report_view(client_display_name: str, client_norm: str):
     for r in rows_f:
         url = (r.get("url") or "").strip()
         # Use stored address OR derive from URL → never "Open on Zillow"
-        addr = (r.get("address") or "").strip()
-        if not addr:
-            addr = address_text_from_url(url) or "Listing"
+        addr = (r.get("address") or "").strip() or address_text_from_url(url) or "Listing"
         sent_at = r.get("sent_at") or ""
         camp = (r.get("campaign") or "").strip()
         chip = ""
@@ -1420,7 +1404,7 @@ def _render_client_report_view(client_display_name: str, client_norm: str):
             use_container_width=False
         )
 
-# ---------- Smooth-scroll ----------
+# ---------- Smooth-scroll helper ----------
 def _scroll_to(element_id: str):
     components.html(
         f"""
@@ -1434,13 +1418,13 @@ def _scroll_to(element_id: str):
         height=0,
     )
 
-# ---------- Clients tab row: text buttons (no funky glyphs) ----------
+# ---------- Clients tab rows: **native Streamlit buttons only** (no HTML iframe/icons) ----------
 def _client_row_native(name: str, norm: str, cid: int, active: bool):
     left, right = st.columns([3, 2])
     with left:
         st.markdown(
             f"<div style='display:flex;align-items:center;gap:8px;'>"
-            f"<span class='client-name'>{escape(name)}</span>"
+            f"<span class='client-name' style='font-weight:700'>{escape(name)}</span>"
             f"<span class='pill {'active' if active else ''}' style='margin-left:6px;'>{'active' if active else 'inactive'}</span>"
             f"</div>",
             unsafe_allow_html=True
@@ -1469,6 +1453,7 @@ with tab_clients:
     st.subheader("Clients")
     st.caption("Manage active and inactive clients. “test test” is always hidden.")
 
+    # Read query params (report will render only when present)
     report_norm_qp = _qp_get("report", "")
     want_scroll = _qp_get("scroll", "") in ("1","true","yes")
 
@@ -1478,6 +1463,7 @@ with tab_clients:
 
     colA, colB = st.columns(2)
 
+    # Active list
     with colA:
         st.markdown("### Active", unsafe_allow_html=True)
         if not active:
@@ -1486,6 +1472,7 @@ with tab_clients:
             for c in active:
                 _client_row_native(c["name"], c.get("name_norm",""), c["id"], active=True)
 
+    # Inactive list
     with colB:
         st.markdown("### Inactive", unsafe_allow_html=True)
         if not inactive:
@@ -1494,6 +1481,7 @@ with tab_clients:
             for c in inactive:
                 _client_row_native(c["name"], c.get("name_norm",""), c["id"], active=False)
 
+    # ---- REPORT SECTION BELOW THE TABLES ----
     st.markdown('<div id="report_anchor"></div>', unsafe_allow_html=True)
     if report_norm_qp:
         display_name = next((c["name"] for c in all_clients if c.get("name_norm")==report_norm_qp), report_norm_qp)
