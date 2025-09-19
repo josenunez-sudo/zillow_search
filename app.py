@@ -106,11 +106,27 @@ html[data-theme="dark"], .stApp [data-theme="dark"] {
 /* Section heading */
 .clients-h3 { color: var(--text-muted); font-weight: 700; margin: 8px 0 6px; }
 
-/* For any non-iframe client rows you might render in the future */
-.client-row { padding: 12px 8px; border-bottom: 1px solid var(--row-border); }
-.client-name { color: var(--text-strong); font-weight: 700; }
-.client-status.active   { background: var(--chip-active-bg);   color: var(--chip-active-fg); }
-.client-status.inactive { background: var(--chip-inactive-bg); color: var(--chip-inactive-fg); }
+/* Clients list row (native Streamlit version, mimics your old iframe styling) */
+.client-row { border-bottom:1px solid var(--row-border); padding:10px 8px 8px; }
+.client-row-inner { display:flex; align-items:center; justify-content:space-between; gap:8px; }
+.client-left { display:flex; align-items:center; gap:8px; min-width:0; }
+.client-name { color: var(--text-strong); font-weight:700; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.pill { font-size:11px; font-weight:700; padding:2px 8px; border-radius:999px; }
+.pill.active { background: var(--chip-active-bg); color: var(--chip-active-fg); }
+.pill.inactive { background: var(--chip-inactive-bg); color: var(--chip-inactive-fg); }
+
+/* Icon buttons (style Streamlit buttons to look like inline icons) */
+.ic-bar { display:flex; align-items:center; gap:10px; }
+.ic-bar .stButton > button {
+  font-size:14px !important; line-height:1 !important; cursor:pointer; user-select:none;
+  color: var(--text-muted) !important;
+  padding:0 !important; margin:0 !important; border:none !important; background:transparent !important;
+  display:inline-flex !important; align-items:center !important; justify-content:center !important;
+  transform: translateY(0); transition: transform .08s ease, color .08s ease;
+  min-width:auto !important; height:auto !important;
+}
+.ic-bar .stButton > button:hover { color: var(--text-strong) !important; transform: translateY(-1px); }
+.ic-bar .stButton > button:focus { outline: 2px solid #93c5fd !important; outline-offset: 2px !important; border-radius:6px !important; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -129,11 +145,7 @@ html[data-theme="dark"], .stApp [data-theme="dark"] {
   --aa-chip-active-bg:  #064e3b; --aa-chip-active-fg:#a7f3d0;
   --aa-chip-inactive-bg: #7f1d1d; --aa-chip-inactive-fg:#fecaca;
 }
-@media (prefers-color-scheme: dark) {
-  :root { --aa-text-strong: #f8fafc; --aa-text-muted: #cbd5e1; }
-}
-.client-name { color: var(--aa-text-strong) !important; font-weight: 700; }
-.client-status { color: var(--aa-text-strong) !important; font-size:11px !important; }
+.client-name { color: var(--aa-text-strong) !important; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -732,11 +744,6 @@ def _supabase_available():
 
 @st.cache_data(ttl=300, show_spinner=False)
 def get_already_sent_maps(client_tag: str):
-    """
-    Returns:
-      canon_set, zpid_set, canon_info, zpid_info
-    where *_info map -> {"sent_at": "...", "url": "..."} for tooltip context.
-    """
     if not (_supabase_available() and client_tag.strip()):
         return set(), set(), {}, {}
     try:
@@ -1259,10 +1266,6 @@ with tab_run:
 # ---------- Sent reports ----------
 @st.cache_data(ttl=120, show_spinner=False)
 def fetch_sent_for_client(client_norm: str, limit: int = 5000):
-    """
-    Fetch sent rows for a given normalized client name from Supabase.
-    Returns list of dicts: [{url, address, sent_at, campaign, mls_id, canonical, zpid}, ...]
-    """
     if not (_supabase_available() and client_norm.strip()):
         return []
     try:
@@ -1278,10 +1281,8 @@ def fetch_sent_for_client(client_norm: str, limit: int = 5000):
         return []
 
 def _render_client_report_view(client_display_name: str, client_norm: str):
-    """Render a report: address as hyperlink → Zillow, with Campaign filter and Search box."""
     st.markdown(f"### Report for {escape(client_display_name)}", unsafe_allow_html=True)
 
-    # Close report button
     colX, _ = st.columns([1,3])
     with colX:
         if st.button("Close report", key=f"__close_report_{client_norm}"):
@@ -1362,6 +1363,77 @@ def _render_client_report_view(client_display_name: str, client_norm: str):
             use_container_width=False
         )
 
+# ---------- Client rows (native Streamlit; no iframes) ----------
+def _client_row_native(name: str, norm: str, cid: int, active: bool):
+    status = "active" if active else "inactive"
+    toggle_label = "Deactivate" if active else "Activate"
+
+    with st.container():
+        st.markdown('<div class="client-row">', unsafe_allow_html=True)
+        cols = st.columns([8, 4])
+        with cols[0]:
+            st.markdown(
+                f'<div class="client-row-inner"><div class="client-left">'
+                f'<span class="client-name">{escape(name)}</span>'
+                f'<span class="pill {status}">{status}</span>'
+                f'</div></div>', unsafe_allow_html=True
+            )
+        with cols[1]:
+            # icon bar with buttons styled like your inline icons
+            st.markdown('<div class="ic-bar">', unsafe_allow_html=True)
+            b_report = st.button("▦", key=f"rep_{cid}", help="Open report")
+            b_rename = st.button("✎", key=f"ren_{cid}", help="Rename")
+            b_toggle = st.button("⟳", key=f"tog_{cid}", help=toggle_label)
+            b_delete = st.button("⌫", key=f"del_{cid}", help="Delete")
+            st.markdown('</div>', unsafe_allow_html=True)
+
+        st.markdown('</div>', unsafe_allow_html=True)
+
+    # Actions
+    if b_report:
+        _qp_set(report=norm, scroll="1")
+        _safe_rerun()
+
+    if b_toggle:
+        rows = SUPABASE.table("clients").select("active").eq("id", cid).limit(1).execute().data or []
+        cur = rows[0]["active"] if rows else active
+        toggle_client_active(cid, (not cur))
+        _safe_rerun()
+
+    # Optional simple rename UX: show an input just-in-time
+    if b_rename:
+        st.session_state[f"__rename_open_{cid}"] = True
+
+    if st.session_state.get(f"__rename_open_{cid}"):
+        new_val = st.text_input("New name", value=name, key=f"__rename_val_{cid}")
+        c1, c2 = st.columns([1,1])
+        with c1:
+            if st.button("Save", key=f"__rename_save_{cid}"):
+                ok, msg = rename_client(cid, new_val)
+                if ok:
+                    st.session_state[f"__rename_open_{cid}"] = False
+                    _safe_rerun()
+                else:
+                    st.error(msg)
+        with c2:
+            if st.button("Cancel", key=f"__rename_cancel_{cid}"):
+                st.session_state[f"__rename_open_{cid}"] = False
+                _safe_rerun()
+
+    if b_delete:
+        # No JS confirm available; quick guard via a second click
+        if not st.session_state.get(f"__confirm_del_{cid}"):
+            st.warning(f"Click Delete again to remove '{name}'.")
+            st.session_state[f"__confirm_del_{cid}"] = True
+        else:
+            ok, msg = delete_client(cid)
+            if ok:
+                st.session_state.pop(f"__confirm_del_{cid}", None)
+                _safe_rerun()
+            else:
+                st.error(msg)
+                st.session_state.pop(f"__confirm_del_{cid}", None)
+
 # ---------- Smooth-scroll helper ----------
 def _scroll_to(element_id: str):
     components.html(
@@ -1375,139 +1447,6 @@ def _scroll_to(element_id: str):
         """,
         height=0,
     )
-
-# ---------- Tiny client row (icons inline; no button containers) ----------
-def _client_row_html(name: str, norm: str, cid: int, active: bool):
-    """
-    Renders a single client row with tiny inline icons (no per-icon button container).
-    Report + Toggle now use JS (like Rename/Delete) to set parent query params reliably.
-    """
-    status = "active" if active else "inactive"
-    toggle_label = "Deactivate" if active else "Activate"
-
-    html = f"""
-<!DOCTYPE html>
-<html>
-<head>
-<meta charset="utf-8">
-<style>
-  :root {{
-    --text: #0f172a;
-    --muted:#64748b;
-    --hover:#f8fafc;
-    --ok-bg:#dcfce7; --ok-fg:#166534; /* active = green pill */
-    --bad-bg:#fee2e2; --bad-fg:#991b1b;
-    --row-border: rgba(0,0,0,.08);
-  }}
-  @media (prefers-color-scheme: dark) {{
-    :root {{
-      --text:#f8fafc;
-      --muted:#94a3b8;
-      --hover:#0f172a;
-      --ok-bg:#064e3b; --ok-fg:#a7f3d0;
-      --bad-bg:#7f1d1d; --bad-fg:#fecaca;
-      --row-border: rgba(255,255,255,.08);
-    }}
-  }}
-  html,body {{
-    margin:0; padding:0;
-    font-family: -apple-system, Segoe UI, Roboto, Arial, sans-serif;
-    color: var(--text);
-  }}
-  .row {{
-    display:flex; align-items:center; justify-content:space-between;
-    padding:10px 8px; border-bottom:1px solid var(--row-border);
-  }}
-  .left {{
-    display:flex; align-items:center; gap:8px; min-width:0;
-  }}
-  .name {{
-    font-weight:700; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;
-  }}
-  /* Visible, green "active" pill */
-  .pill {{
-    font-size:11px; font-weight:700; padding:2px 8px; border-radius:999px;
-  }}
-  .pill.active {{ background:var(--ok-bg); color:var(--ok-fg); }}
-  .pill.inactive {{ background:var(--bad-bg); color:var(--bad-fg); }}
-
-  /* Tiny inline icons — no button container */
-  .icons {{
-    display:flex; align-items:center; gap:10px;
-  }}
-  .ic {{
-    font-size:14px; line-height:1; cursor:pointer; user-select:none;
-    color: var(--muted);
-    padding: 0; margin:0; border:none; background:transparent;
-    display:inline-flex; align-items:center; justify-content:center;
-    transform: translateY(0);
-    transition: transform .08s ease, color .08s ease;
-    text-decoration:none;
-  }}
-  .ic:hover {{ color: var(--text); transform: translateY(-1px); }}
-  .ic:focus {{ outline: 2px solid #93c5fd; outline-offset: 2px; border-radius:6px; }}
-</style>
-</head>
-<body>
-  <div class="row">
-    <div class="left">
-      <span class="name">{escape(name)}</span>
-      <span class="pill {status}">{status}</span>
-    </div>
-
-    <!-- inline icons (no container around each) -->
-    <div class="icons">
-      <!-- Report (now JS updates parent query) -->
-      <span class="ic" role="button" tabindex="0" title="Open report"
-        onclick="
-          const u = new URL(parent.location.href);
-          u.searchParams.set('report', '{escape(norm)}');
-          u.searchParams.set('scroll', '1');
-          parent.location.href = u.toString();
-          return false;
-        ">▦</span>
-
-      <!-- Rename (JS prompt) -->
-      <span class="ic" role="button" tabindex="0" title="Rename"
-        onclick="
-          const newName = prompt('Rename client:', '{escape(name)}');
-          if (newName && newName.trim()) {{
-            const u = new URL(parent.location.href);
-            u.searchParams.set('act', 'rename');
-            u.searchParams.set('id', '{cid}');
-            u.searchParams.set('arg', newName.trim());
-            parent.location.href = u.toString();
-          }}
-          return false;
-        ">✎</span>
-
-      <!-- Toggle active (now JS updates parent query) -->
-      <span class="ic" role="button" tabindex="0" title="{toggle_label}"
-        onclick="
-          const u = new URL(parent.location.href);
-          u.searchParams.set('act', 'toggle');
-          u.searchParams.set('id', '{cid}');
-          parent.location.href = u.toString();
-          return false;
-        ">⟳</span>
-
-      <!-- Delete (JS confirm) -->
-      <span class="ic" role="button" tabindex="0" title="Delete"
-        onclick="
-          if (confirm('Delete {escape(name)}? This cannot be undone.')) {{
-            const u = new URL(parent.location.href);
-            u.searchParams.set('act', 'delete');
-            u.searchParams.set('id', '{cid}');
-            parent.location.href = u.toString();
-          }}
-          return false;
-        ">⌫</span>
-    </div>
-  </div>
-</body>
-</html>
-"""
-    components.html(html, height=48, scrolling=False)
 
 # ---------- CLIENTS TAB ----------
 with tab_clients:
@@ -1531,7 +1470,7 @@ with tab_clients:
             st.write("_No active clients_")
         else:
             for c in active:
-                _client_row_html(c["name"], c.get("name_norm",""), c["id"], active=True)
+                _client_row_native(c["name"], c.get("name_norm",""), c["id"], active=True)
 
     # Inactive list
     with colB:
@@ -1540,7 +1479,7 @@ with tab_clients:
             st.write("_No inactive clients_")
         else:
             for c in inactive:
-                _client_row_html(c["name"], c.get("name_norm",""), c["id"], active=False)
+                _client_row_native(c["name"], c.get("name_norm",""), c["id"], active=False)
 
     # ---- REPORT SECTION BELOW THE TABLES (hidden unless report=...) ----
     st.markdown('<div id="report_anchor"></div>', unsafe_allow_html=True)
