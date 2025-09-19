@@ -1,15 +1,32 @@
+# ui/clients_tab.py
+from __future__ import annotations
+import os, re, io
+from datetime import datetime
+from html import escape
+from urllib.parse import unquote
+from typing import Dict, Any, List, Optional
+
 import streamlit as st
 import streamlit.components.v1 as components
-from html import escape
-from core.cache import safe_rerun
-from services.supabase_client import (
-    fetch_clients, toggle_client_active, rename_client, delete_client, get_supabase
-)
+from supabase import create_client, Client
+
+# -------------------- Rerun + query params --------------------
+
+def _safe_rerun():
+    try:
+        st.rerun()
+    except Exception:
+        try:
+            st.experimental_rerun()
+        except Exception:
+            pass
 
 def _qp_get(name, default=None):
     try:
-        qp = st.query_params; val = qp.get(name, default)
-        if isinstance(val, list) and val: return val[0]
+        qp = st.query_params
+        val = qp.get(name, default)
+        if isinstance(val, list) and val:
+            return val[0]
         return val
     except Exception:
         qp = st.experimental_get_query_params()
@@ -17,176 +34,331 @@ def _qp_get(name, default=None):
 
 def _qp_set(**kwargs):
     try:
-        if kwargs: st.query_params.update(kwargs)
-        else: st.query_params.clear()
+        if kwargs:
+            st.query_params.update(kwargs)
+        else:
+            st.query_params.clear()
     except Exception:
-        if kwargs: st.experimental_set_query_params(**kwargs)
-        else: st.experimental_set_query_params()
+        if kwargs:
+            st.experimental_set_query_params(**kwargs)
+        else:
+            st.experimental_set_query_params()
+
+# -------------------- Supabase bootstrap --------------------
+
+@st.cache_resource
+def _get_supabase() -> Optional[Client]:
+    try:
+        url = os.getenv("SUPABASE_URL", st.secrets.get("SUPABASE_URL", ""))
+        key = os.getenv("SUPABASE_SERVICE_ROLE", st.secrets.get("SUPABASE_SERVICE_ROLE", ""))
+        if not url or not key:
+            return None
+        return create_client(url, key)
+    except Exception:
+        return None
+
+SUPABASE = _get_supabase()
+
+def _sb_ok() -> bool:
+    try:
+        return bool(SUPABASE)
+    except NameError:
+        return False
+
+# -------------------- Helpers --------------------
+
+def _norm_tag(s: str) -> str:
+    return re.sub(r"\s+", " ", (s or "").strip()).lower()
 
 def address_text_from_url(url: str) -> str:
-    from urllib.parse import unquote
-    import re
     if not url: return ""
     u = unquote(url)
     m = re.search(r"/homedetails/([^/]+)/\d{6,}_zpid/", u, re.I)
-    if m: return re.sub(r"[-+]", " ", m.group(1)).strip().title()
+    if m:
+        return re.sub(r"[-+]", " ", m.group(1)).strip().title()
     m = re.search(r"/homes/([^/_]+)_rb/?", u, re.I)
-    return (re.sub(r"[-+]", " ", m.group(1)).strip().title() if m else "")
+    if m:
+        return re.sub(r"[-+]", " ", m.group(1)).strip().title()
+    return ""
+
+# -------------------- Data access --------------------
+
+@st.cache_data(ttl=60, show_spinner=False)
+def fetch_clients(include_inactive: bool = False) -> List[Dict[str, Any]]:
+    if not _sb_ok():
+        return []
+    try:
+        rows = (
+            SUPABASE.table("clients")
+            .select("id,name,name_norm,active")
+            .order("name", desc=False)
+            .execute()
+            .data
+            or []
+        )
+        rows = [r for r in rows if r.get("name_norm") != _norm_tag("test test")]
+        return rows if include_inactive else [r for r in rows if r.get("active")]
+    except Exception:
+        return []
+
+def _invalidate_clients_cache():
+    try:
+        fetch_clients.clear()  # type: ignore[attr-defined]
+    except Exception:
+        pass
+
+def toggle_client_active(client_id: int, new_active: bool):
+    if not _sb_ok() or not client_id:
+        return False, "Not configured"
+    try:
+        SUPABASE.table("clients").update({"active": new_active}).eq("id", client_id).execute()
+        _invalidate_clients_cache()
+        return True, "ok"
+    except Exception as e:
+        return False, str(e)
+
+def rename_client(client_id: int, new_name: str):
+    if not _sb_ok() or not client_id or not (new_name or "").strip():
+        return False, "Bad input"
+    try:
+        new_norm = _norm_tag(new_name)
+        existing = SUPABASE.table("clients").select("id").eq("name_norm", new_norm).limit(1).execute().data or []
+        if existing and existing[0]["id"] != client_id:
+            return False, "A client with that (normalized) name already exists."
+        SUPABASE.table("clients").update({"name": new_name.strip(), "name_norm": new_norm}).eq("id", client_id).execute()
+        _invalidate_clients_cache()
+        return True, "ok"
+    except Exception as e:
+        return False, str(e)
+
+def delete_client(client_id: int):
+    if not _sb_ok() or not client_id:
+        return False, "Not configured"
+    try:
+        SUPABASE.table("clients").delete().eq("id", client_id).execute()
+        _invalidate_clients_cache()
+        return True, "ok"
+    except Exception as e:
+        return False, str(e)
+
+@st.cache_data(ttl=120, show_spinner=False)
+def fetch_sent_for_client(client_norm: str, limit: int = 5000) -> List[Dict[str, Any]]:
+    if not (_sb_ok() and client_norm.strip()):
+        return []
+    try:
+        cols = "url,address,sent_at,campaign,mls_id,canonical,zpid"
+        resp = (
+            SUPABASE.table("sent")
+            .select(cols)
+            .eq("client", client_norm.strip())
+            .order("sent_at", desc=True)
+            .limit(limit)
+            .execute()
+        )
+        return resp.data or []
+    except Exception:
+        return []
+
+# -------------------- UI: row + report --------------------
+
+def _client_row_icons(name: str, norm: str, cid: int, active: bool):
+    """
+    Single-row layout with the client's name (left) and the four icon buttons (right), inline.
+    """
+    # One logical row
+    left, right = st.columns([0.70, 0.30])
+    with left:
+        st.markdown(
+            f"<div class='client-left'>"
+            f"<span class='client-name'>{escape(name)}</span>"
+            f"<span class='pill {'active' if active else ''}'>{'active' if active else 'inactive'}</span>"
+            f"</div>",
+            unsafe_allow_html=True,
+        )
+    with right:
+        b1, b2, b3, b4 = st.columns(4)
+        # ▦ REPORT
+        if b1.button("▦", key=f"rep_{cid}", help="Open report"):
+            _qp_set(report=norm, scroll="1")
+            _safe_rerun()
+        # ✎ RENAME
+        if b2.button("✎", key=f"rn_btn_{cid}", help="Rename"):
+            st.session_state[f"__edit_{cid}"] = True
+        # ⟳ ACTIVATE/DEACTIVATE
+        if b3.button("⟳", key=f"tg_{cid}", help=("Deactivate" if active else "Activate")):
+            try:
+                rows = SUPABASE.table("clients").select("active").eq("id", cid).limit(1).execute().data or []
+                cur = rows[0]["active"] if rows else active
+            except Exception:
+                cur = active
+            toggle_client_active(cid, (not cur))
+            _safe_rerun()
+        # ⌫ DELETE (with confirm)
+        if b4.button("⌫", key=f"del_{cid}", help="Delete"):
+            st.session_state[f"__del_{cid}"] = True
+
+    # Inline rename editor
+    if st.session_state.get(f"__edit_{cid}"):
+        new_name = st.text_input("New name", value=name, key=f"rn_val_{cid}")
+        cc1, cc2 = st.columns([0.2, 0.2])
+        if cc1.button("Save", key=f"rn_save_{cid}"):
+            ok, msg = rename_client(cid, new_name)
+            if not ok: st.warning(msg)
+            st.session_state[f"__edit_{cid}"] = False
+            _safe_rerun()
+        if cc2.button("Cancel", key=f"rn_cancel_{cid}"):
+            st.session_state[f"__edit_{cid}"] = False
+        st.markdown("<div style='margin-top:6px; padding:6px; border:1px dashed var(--row-border); border-radius:8px; background:rgba(148,163,184,.08);'></div>", unsafe_allow_html=True)
+
+    # Inline delete confirm
+    if st.session_state.get(f"__del_{cid}"):
+        dc1, dc2 = st.columns([0.2, 0.2])
+        if dc1.button("Confirm delete", key=f"del_yes_{cid}"):
+            delete_client(cid)
+            st.session_state[f"__del_{cid}"] = False
+            _safe_rerun()
+        if dc2.button("Cancel", key=f"del_no_{cid}"):
+            st.session_state[f"__del_{cid}"] = False
+        st.markdown("<div style='margin-top:6px; padding:6px; border:1px dashed var(--row-border); border-radius:8px; background:rgba(148,163,184,.08);'></div>", unsafe_allow_html=True)
 
 def _render_client_report_view(client_display_name: str, client_norm: str):
-    from services.supabase_client import fetch_sent_for_client
     st.markdown(f"### Report for {escape(client_display_name)}", unsafe_allow_html=True)
 
-    colX, _ = st.columns([1,3])
+    colX, _ = st.columns([1, 3])
     with colX:
         if st.button("Close report", key=f"__close_report_{client_norm}"):
-            _qp_set(); safe_rerun()
+            _qp_set()  # clear all query params
+            _safe_rerun()
 
     rows = fetch_sent_for_client(client_norm)
     total = len(rows)
 
-    # campaign filter + search
+    # Build campaign filter choices
     seen = []
     for r in rows:
         c = (r.get("campaign") or "").strip()
-        if c not in seen: seen.append(c)
-    labels = ["All campaigns"] + [("— no campaign —" if c == "" else c) for c in seen]
-    keys   = [None] + seen
+        if c not in seen:
+            seen.append(c)
+    campaign_labels = ["All campaigns"] + [("— no campaign —" if c == "" else c) for c in seen]
+    campaign_keys   = [None] + seen
 
     colF1, colF2, colF3 = st.columns([1.2, 1.8, 1])
     with colF1:
-        sel_idx = st.selectbox("Filter by campaign", list(range(len(labels))),
-                               format_func=lambda i: labels[i], index=0, key=f"__camp_{client_norm}")
-        sel_campaign = keys[sel_idx]
+        sel_idx = st.selectbox(
+            "Filter by campaign",
+            list(range(len(campaign_labels))),
+            format_func=lambda i: campaign_labels[i],
+            index=0,
+            key=f"__camp_{client_norm}",
+        )
+        sel_campaign = campaign_keys[sel_idx]
     with colF2:
-        q = st.text_input("Search address / MLS / URL", value="", placeholder="e.g. 407 Woodall, 2501234, /homedetails/", key=f"__q_{client_norm}")
+        q = st.text_input(
+            "Search address / MLS / URL",
+            value="",
+            placeholder="e.g. 407 Woodall, 2501234, /homedetails/",
+            key=f"__q_{client_norm}",
+        )
         q_norm = q.strip().lower()
     with colF3:
         st.caption(f"{total} total logged")
 
     def _match(row) -> bool:
-        if sel_campaign is not None and (row.get("campaign") or "").strip() != sel_campaign:
-            return False
-        if not q_norm: return True
+        if sel_campaign is not None:
+            if (row.get("campaign") or "").strip() != sel_campaign:
+                return False
+        if not q_norm:
+            return True
         addr = (row.get("address") or "").lower()
         mls  = (row.get("mls_id") or "").lower()
         url  = (row.get("url") or "").lower()
         return (q_norm in addr) or (q_norm in mls) or (q_norm in url)
 
     rows_f = [r for r in rows if _match(r)]
-    st.caption(f"{len(rows_f)} matching listing{'s' if len(rows_f)!=1 else ''}")
+    count = len(rows_f)
+
+    st.caption(f"{count} matching listing{'s' if count!=1 else ''}")
 
     if not rows_f:
-        st.info("No results match the current filters."); return
+        st.info("No results match the current filters.")
+        return
 
     items_html = []
-    from html import escape as _esc
     for r in rows_f:
         url = (r.get("url") or "").strip()
         addr = (r.get("address") or "").strip() or address_text_from_url(url) or "Listing"
         sent_at = r.get("sent_at") or ""
         camp = (r.get("campaign") or "").strip()
-        chip = f"<span style='font-size:11px;font-weight:700;padding:2px 6px;border-radius:999px;background:#e2e8f0;margin-left:6px;'>{_esc(camp)}</span>" if camp and sel_campaign is None else ""
+        chip = ""
+        if sel_campaign is None and camp:
+            chip = f"<span style='font-size:11px; font-weight:700; padding:2px 6px; border-radius:999px; background:#e2e8f0; margin-left:6px;'>{escape(camp)}</span>"
         items_html.append(
             f"""<li>
-                  <a href="{_esc(url)}" target="_blank" rel="noopener">{_esc(addr)}</a>
-                  <span style="color:#64748b;font-size:12px;margin-left:6px;">{_esc(sent_at)}</span>
+                  <a href="{escape(url)}" target="_blank" rel="noopener">{escape(addr)}</a>
+                  <span style="color:#64748b; font-size:12px; margin-left:6px;">{escape(sent_at)}</span>
                   {chip}
                 </li>"""
         )
-    st.markdown("<ul class='link-list'>" + "\n".join(items_html) + "</ul>", unsafe_allow_html=True)
+    html = "<ul class='link-list'>" + "\n".join(items_html) + "</ul>"
+    st.markdown(html, unsafe_allow_html=True)
 
-def _client_row_icons(name: str, norm: str, cid: int, active: bool):
-    # Single HTML block for perfect inline alignment (name + pill + icons)
-    components.html(f"""
-<!DOCTYPE html><html><head><meta charset="utf-8">
-<style>
-.row {{display:flex;align-items:center;justify-content:space-between;padding:10px 8px;border-bottom:1px solid rgba(226,232,240,1);}}
-.left {{display:flex;align-items:center;gap:8px;min-width:0;}}
-.name {{font-weight:700;color:#fff;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}}
-.pill {{font-size:11px;font-weight:800;padding:2px 10px;border-radius:999px;{('background:linear-gradient(180deg,#dcfce7, #bbf7d0);color:#166534;border:1px solid rgba(5,150,105,.35);' if active else 'background:#fee2e2;color:#991b1b;')}}}}
-.icons {{display:flex;align-items:center;gap:8px;}}
-.ic {{min-width: 28px;height:28px;padding:0 8px;border-radius:8px;border:1px solid rgba(0,0,0,.08);font-weight:700;line-height:1;cursor:pointer;background:#f8fafc;color:#64748b;text-decoration:none;display:flex;align-items:center;justify-content:center;}}
-.ic:hover {{transform: translateY(-1px);}}
-</style></head><body>
-  <div class="row">
-    <div class="left">
-      <span class="name">{escape(name)}</span>
-      <span class="pill">{'ACTIVE' if active else 'INACTIVE'}</span>
-    </div>
-    <div class="icons">
-      <a class="ic" href="?report={escape(norm)}&scroll=1" target="_parent" title="Open report">▦</a>
-      <a class="ic" href="#" onclick="
-        const n=prompt('Rename client:', '{escape(name)}');
-        if(n && n.trim()){{
-          const u=new URL(parent.location.href);
-          u.searchParams.set('act','rename');
-          u.searchParams.set('id','{cid}');
-          u.searchParams.set('arg', n.trim());
-          parent.location.search=u.search;
-        }}
-        return false;
-      " title="Rename">✎</a>
-      <a class="ic" href="?act=toggle&id={cid}" target="_parent" title="{'Deactivate' if active else 'Activate'}">⟳</a>
-      <a class="ic" href="#" onclick="
-        if(confirm('Delete {escape(name)}? This cannot be undone.')){{
-          const u=new URL(parent.location.href);
-          u.searchParams.set('act','delete');
-          u.searchParams.set('id','{cid}');
-          parent.location.search=u.search;
-        }}
-        return false;
-      " title="Delete">⌫</a>
-    </div>
-  </div>
-</body></html>""", height=56, scrolling=False)
+    with st.expander("Export filtered report"):
+        import pandas as pd
+        buf = io.StringIO()
+        pd.DataFrame(rows_f).to_csv(buf, index=False)
+        st.download_button(
+            "Download CSV",
+            data=buf.getvalue(),
+            file_name=f"client_report_{client_norm}_{datetime.utcnow().strftime('%Y%m%d%H%M%S')}.csv",
+            mime="text/csv",
+            use_container_width=False,
+        )
+
+# -------------------- Public entrypoint --------------------
 
 def render_clients_tab():
     st.subheader("Clients")
     st.caption("Manage active and inactive clients. “test test” is always hidden.")
 
-    # Handle query param actions (toggle/rename/delete) *before* rendering
-    act = _qp_get("act",""); cid = _qp_get("id",""); arg = _qp_get("arg",""); report_norm = _qp_get("report","")
-    if act and cid:
-        try: cid_int = int(cid)
-        except Exception: cid_int = 0
-        if cid_int:
-            if act == "toggle":
-                supa = get_supabase()
-                cur = (supa.table("clients").select("active").eq("id", cid_int).limit(1).execute().data or [{"active": True}])[0]["active"]
-                toggle_client_active(cid_int, (not cur))
-            elif act == "rename" and arg:
-                rename_client(cid_int, arg)
-            elif act == "delete":
-                delete_client(cid_int)
-        _qp_set(); safe_rerun()
+    report_norm_qp = _qp_get("report", "")
+    want_scroll = _qp_get("scroll", "") in ("1","true","yes")
 
     all_clients = fetch_clients(include_inactive=True)
     active = [c for c in all_clients if c.get("active")]
     inactive = [c for c in all_clients if not c.get("active")]
 
     colA, colB = st.columns(2)
+
     with colA:
         st.markdown("### Active", unsafe_allow_html=True)
-        if not active: st.write("_No active clients_")
+        if not active:
+            st.write("_No active clients_")
         else:
-            for c in active: _client_row_icons(c["name"], c.get("name_norm",""), c["id"], active=True)
+            for c in active:
+                _client_row_icons(c["name"], c.get("name_norm",""), c["id"], active=True)
 
     with colB:
         st.markdown("### Inactive", unsafe_allow_html=True)
-        if not inactive: st.write("_No inactive clients_")
+        if not inactive:
+            st.write("_No inactive clients_")
         else:
-            for c in inactive: _client_row_icons(c["name"], c.get("name_norm",""), c["id"], active=False)
+            for c in inactive:
+                _client_row_icons(c["name"], c.get("name_norm",""), c["id"], active=False)
 
-    # Report render
+    # Report section
     st.markdown('<div id="report_anchor"></div>', unsafe_allow_html=True)
-    report_norm_qp = _qp_get("report",""); want_scroll = _qp_get("scroll","") in ("1","true","yes")
     if report_norm_qp:
         display_name = next((c["name"] for c in all_clients if c.get("name_norm")==report_norm_qp), report_norm_qp)
         st.markdown("---")
         _render_client_report_view(display_name, report_norm_qp)
         if want_scroll:
-            components.html("""<script>
-              const el = parent.document.getElementById("report_anchor");
-              if(el){ el.scrollIntoView({behavior:"smooth", block:"start"}); }
-            </script>""", height=0)
+            components.html(
+                """
+                <script>
+                  const el = parent.document.getElementById("report_anchor");
+                  if (el) { el.scrollIntoView({behavior: "smooth", block: "start"}); }
+                </script>
+                """,
+                height=0,
+            )
+            _qp_set(report=report_norm_qp)
