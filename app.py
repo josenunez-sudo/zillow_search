@@ -120,14 +120,13 @@ html[data-theme="dark"], .stApp [data-theme="dark"] {
   --bad-bg:#7f1d1d; --bad-fg:#fecaca;
 }
 
-/* Status pill — match NEW style for ACTIVE */
+/* Status pill */
 .pill { font-size:11px; font-weight:800; padding:2px 10px; border-radius:999px; }
 .pill.active {
   background: linear-gradient(180deg, var(--ok-bg) 0%, #bbf7d0 100%);
   color: var(--ok-fg);
   border:1px solid rgba(5,150,105,.35);
   box-shadow: 0 4px 12px rgba(16,185,129,.25);
-  text-transform: uppercase;
 }
 html[data-theme="dark"] .pill.active,
 .stApp [data-theme="dark"] .pill.active {
@@ -136,7 +135,6 @@ html[data-theme="dark"] .pill.active,
   border-color: rgba(167,243,208,.35);
   box-shadow: 0 4px 12px rgba(6,95,70,.45);
 }
-.pill.inactive { background: var(--bad-bg); color: var(--bad-fg); }
 
 /* Run button pop */
 .run-zone .stButton > button {
@@ -157,23 +155,25 @@ html[data-theme="dark"] .pill.active,
 }
 .run-zone .stButton > button:active { transform: translateY(0) scale(.99) !important; }
 
-/* ===== Clients row ===== */
-.client-row { display:flex; align-items:center; justify-content:space-between; padding:10px 8px; border-bottom:1px solid var(--row-border); overflow:visible; }
+/* ===== Clients row: icon buttons (▦ ✎ ⟳ ⌫) ===== */
+.client-row { display:flex; align-items:center; justify-content:space-between; padding:10px 8px; border-bottom:1px solid var(--row-border); }
 .client-left { display:flex; align-items:center; gap:8px; min-width:0; }
 .client-name { font-weight:700; color:#ffffff !important; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; } /* always white */
-.iconbar { display:flex; align-items:center; gap:10px; flex-shrink:0; }
-
-/* Tiny inline icons look */
-.ic {
-  font-size:14px; line-height:1; cursor:pointer; user-select:none;
-  color: #64748b; padding: 0 4px; margin:0; border:none; background:transparent;
-  display:inline-flex; align-items:center; justify-content:center; text-decoration:none;
-  transition: transform .08s ease, color .08s ease;
+.iconbar { display:flex; align-items:center; gap:8px; }
+.iconbar .stButton > button {
+  min-width: 28px; height: 28px; padding:0 8px;
+  border-radius: 8px; border:1px solid rgba(0,0,0,.08);
+  font-weight:700; line-height:1; cursor:pointer;
+  background:#f8fafc; color:#64748b;
+  transition: transform .08s ease, box-shadow .12s ease, filter .08s ease;
 }
-.ic:hover { color: var(--text-strong); transform: translateY(-1px); }
-.ic:focus { outline: 2px solid #93c5fd; outline-offset: 2px; border-radius:6px; }
+html[data-theme="dark"] .iconbar .stButton > button {
+  background:#0f172a; color:#cbd5e1; border-color:rgba(255,255,255,.08);
+}
+.iconbar .stButton > button:hover { transform: translateY(-1px); }
+.iconbar .stButton > button:active { transform: translateY(0) scale(.98); }
 
-/* inline editor container */
+/* Tiny inline confirms/editors */
 .inline-panel {
   margin-top:6px; padding:6px; border:1px dashed var(--row-border); border-radius:8px; background:rgba(148,163,184,.08);
 }
@@ -974,7 +974,7 @@ def build_output(rows: List[Dict[str, Any]], fmt: str, use_display: bool = True,
         for r in rows:
             u = pick_url(r)
             if not u: continue
-            # For export HTML, keep URL as the visible text for clarity/unfurl
+            # Results export keeps URL as anchor text for clarity
             items.append(f'<li><a href="{escape(u)}" target="_blank" rel="noopener">{escape(u)}</a></li>')
         return "<ul>\n" + "\n".join(items) + "\n</ul>\n", "text/html"
 
@@ -1023,7 +1023,8 @@ with tab_run:
     with c1:
         use_shortlinks = st.checkbox("Use short links (Bitly)", value=False, help="Optional tracking; sharing uses clean Zillow links.")
     with c2:
-        enrich_details = st.checkbox("Enrich details", value=False)  # default unchecked
+        # Default unchecked as requested
+        enrich_details = st.checkbox("Enrich details", value=False)
     with c3:
         show_details = st.checkbox("Show details under results", value=False)
     with c4:
@@ -1035,7 +1036,8 @@ with tab_run:
         if not selected_client:
             only_show_new = False
 
-    table_view = st.checkbox("Show results as table", value=True, help="Easier to scan details")
+    # Hide table by default to remove dead space; user can enable it
+    table_view = st.checkbox("Show results as table", value=False, help="Easier to scan details")
 
     client_tag = _norm_tag(client_tag_raw)
     campaign_tag = _norm_tag(campaign_tag_raw)
@@ -1097,17 +1099,15 @@ with tab_run:
     clicked = st.button("🚀 Run", use_container_width=True, key="__run_btn__")
     st.markdown('</div>', unsafe_allow_html=True)
 
-    # ===== Results HTML list with copy-all (ALWAYS show clean URLs and remove gap) =====
+    # Results HTML list with copy-all — ALWAYS hyperlinks, compact spacing
     def results_list_with_copy_all(results: List[Dict[str, Any]], client_selected: bool):
-        # Build <li> items with URL as both href and visible text (best SMS unfurl behavior)
         li_html = []
         for r in results:
             href = r.get("preview_url") or r.get("zillow_url") or r.get("display_url") or ""
             if not href:
                 continue
             safe_href = escape(href)
-            link_txt = href  # force visible text to URL for reliable SMS unfurl
-
+            link_txt = r.get("input_address") or href  # address text if available
             badge_html = ""
             if client_selected:
                 if r.get("already_sent"):
@@ -1116,13 +1116,11 @@ with tab_run:
                 else:
                     badge_html = ' <span class="badge new" title="New for this client">NEW</span>'
 
-            li_html.append(
-                f'<li style="margin:0.25rem 0;"><a href="{safe_href}" target="_blank" rel="noopener">{escape(link_txt)}</a>{badge_html}</li>'
-            )
+            # hyperlink only (best for SMS unfurl), minimal spacing
+            li_html.append(f'<li style="margin:0.2rem 0;"><a href="{safe_href}" target="_blank" rel="noopener">{escape(link_txt)}</a>{badge_html}</li>')
 
         items_html = "\n".join(li_html) if li_html else "<li>(no results)</li>"
 
-        # Copy-all uses clean URLs (one per line)
         copy_lines = []
         for r in results:
             u = r.get("preview_url") or r.get("zillow_url") or r.get("display_url") or ""
@@ -1130,28 +1128,14 @@ with tab_run:
                 copy_lines.append(u.strip())
         copy_text = "\\n".join(copy_lines) + ("\\n" if copy_lines else "")
 
-        # Tight CSS: zero bottom padding/margins to remove gap before the table
         html = f"""
         <html><head><meta charset="utf-8" />
           <style>
-            html,body {{ margin:0; padding:0; font-family:-apple-system, Segoe UI, Roboto, Arial, sans-serif; }}
-            .results-wrap {{
-              position:relative; box-sizing:border-box;
-              padding:8px 132px 0 0;   /* bottom=0 to eliminate space */
-              margin:0;
-            }}
-            ul.link-list {{
-              margin:0;                  /* no bottom margin */
-              padding:0 0 .25rem 1.2rem; /* slight indent, zero bottom gap */
-              list-style:disc;
-            }}
-            ul.link-list li {{ margin:0.25rem 0; }}
-            .copyall-btn {{
-              position:absolute; top:0; right:8px; z-index:5;
-              padding:8px 12px; height:28px; border:0; border-radius:10px;
-              color:#fff; font-weight:700; background:#1d4ed8; cursor:pointer;
-              opacity:.92;
-            }}
+            html,body {{ margin:0; font-family:-apple-system, Segoe UI, Roboto, Arial, sans-serif; }}
+            .results-wrap {{ position:relative; box-sizing:border-box; padding:8px 120px 6px 0; }}
+            ul.link-list {{ margin:0 0 0.2rem 1.2rem; padding:0; list-style:disc; }}
+            ul.link-list li {{ margin:0.2rem 0; }}
+            .copyall-btn {{ position:absolute; top:0; right:8px; z-index:5; padding:6px 10px; height:26px; border:0; border-radius:10px; color:#fff; font-weight:700; background:#1d4ed8; cursor:pointer; opacity:.95; }}
           </style>
         </head><body>
           <div class="results-wrap">
@@ -1173,16 +1157,14 @@ with tab_run:
             }})();
           </script>
         </body></html>"""
-
-        # Height is tight because there's no bottom padding — adjust with list length
-        est_h = max(70, min(36 * max(1, len(li_html)) + 12, 900))
+        est_h = max(60, min(34 * max(1, len(li_html)) + 18, 700))
         components.html(html, height=est_h, scrolling=False)
 
     def _render_results_and_downloads(results: List[Dict[str, Any]], client_tag: str, campaign_tag: str, include_notes: bool, client_selected: bool):
         st.markdown("#### Results")
         results_list_with_copy_all(results, client_selected=client_selected)
 
-        # Keep the table (snug, no extra spacer)
+        # Optional table (off by default to remove dead space)
         if table_view:
             import pandas as pd
             cols = ["already_sent","dup_reason","dup_sent_at","display_url","zillow_url","preview_url","status","price","beds","baths","sqft","mls_id","input_address"]
@@ -1430,24 +1412,24 @@ def _render_client_report_view(client_display_name: str, client_norm: str):
             use_container_width=False
         )
 
-# ---------- Clients tab — icon row (▦ ✎ ⟳ ⌫), inline & working ----------
+# ---------- Clients tab — original 4 buttons style (▦ ✎ ⟳ ⌫) ----------
 def _client_row_icons(name: str, norm: str, cid: int, active: bool):
-    # Header row container
+    # left = name + status
     st.markdown(
         f"<div class='client-row'><div class='client-left'>"
         f"<span class='client-name'>{escape(name)}</span>"
-        f"<span class='pill {'active' if active else 'inactive'}'>{'ACTIVE' if active else 'INACTIVE'}</span>"
+        f"<span class='pill {'active' if active else ''}'>{'active' if active else 'inactive'}</span>"
         f"</div><div class='iconbar' id='icons_{cid}'></div></div>",
         unsafe_allow_html=True
     )
 
-    # Inline buttons aligned using Streamlit columns
+    # Mount the four icon-like buttons inline
     cont = st.container()
     with cont:
         c1, c2, c3, c4, gap = st.columns([0.18,0.18,0.18,0.18,0.28])
         # ▦ REPORT
         if c1.button("▦", key=f"rep_{cid}", help="Open report"):
-            _qp_set(report=norm, scroll="1")  # sets query param consumed below
+            _qp_set(report=norm, scroll="1")
             _safe_rerun()
 
         # ✎ RENAME
