@@ -120,16 +120,20 @@ html[data-theme="dark"], .stApp [data-theme="dark"] {
   --bad-bg:#7f1d1d; --bad-fg:#fecaca;
 }
 
-/* Status pill */
-.pill { font-size:11px; font-weight:800; padding:2px 10px; border-radius:999px; }
-.pill.active {
+/* Status pill & NEW tag (match look) */
+.pill, .tag-new {
+  font-size:11px; font-weight:800; padding:2px 10px; border-radius:999px;
+  border:1px solid rgba(5,150,105,.35);
+}
+.pill.active, .tag-new {
   background: linear-gradient(180deg, var(--ok-bg) 0%, #bbf7d0 100%);
   color: var(--ok-fg);
-  border:1px solid rgba(5,150,105,.35);
   box-shadow: 0 4px 12px rgba(16,185,129,.25);
 }
 html[data-theme="dark"] .pill.active,
-.stApp [data-theme="dark"] .pill.active {
+html[data-theme="dark"] .tag-new,
+.stApp [data-theme="dark"] .pill.active,
+.stApp [data-theme="dark"] .tag-new {
   background: linear-gradient(180deg, #064e3b 0%, #065f46 100%);
   color:#a7f3d0;
   border-color: rgba(167,243,208,.35);
@@ -155,28 +159,25 @@ html[data-theme="dark"] .pill.active,
 }
 .run-zone .stButton > button:active { transform: translateY(0) scale(.99) !important; }
 
-/* ===== Clients row: icon buttons (▦ ✎ ⟳ ⌫) ===== */
-.client-row { display:flex; align-items:center; justify-content:space-between; padding:10px 8px; border-bottom:1px solid var(--row-border); }
-.client-left { display:flex; align-items:center; gap:8px; min-width:0; }
-.client-name { font-weight:700; color: var(--text-strong); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
-.iconbar { display:flex; align-items:center; gap:8px; }
-.iconbar .stButton > button {
-  min-width: 28px; height: 28px; padding:0 8px;
-  border-radius: 8px; border:1px solid rgba(0,0,0,.08);
-  font-weight:700; line-height:1; cursor:pointer;
-  background:#f8fafc; color:#64748b;
-  transition: transform .08s ease, box-shadow .12s ease, filter .08s ease;
+/* ===== Clients row (inline icons) ===== */
+.client-row { display:flex; align-items:center; justify-content:space-between; padding:12px 10px; border-bottom:1px solid var(--row-border); }
+.client-left { display:flex; align-items:center; gap:10px; min-width:0; }
+.client-name { font-weight:800; color:#fff !important; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.iconbar { display:flex; align-items:center; gap:10px; }
+.ic {
+  font-size:14px; line-height:1; cursor:pointer; user-select:none;
+  color: var(--text-strong); text-decoration:none;
+  padding:6px 10px; border-radius:8px; border:1px solid rgba(0,0,0,.08);
+  background:#f8fafc; display:inline-flex; align-items:center; justify-content:center;
+  transition: transform .08s ease, filter .08s ease;
 }
-html[data-theme="dark"] .iconbar .stButton > button {
-  background:#0f172a; color:#cbd5e1; border-color:rgba(255,255,255,.08);
+.ic:hover { transform: translateY(-1px); }
+html[data-theme="dark"] .ic {
+  background:#0f172a; color:#e2e8f0; border-color:rgba(255,255,255,.08);
 }
-.iconbar .stButton > button:hover { transform: translateY(-1px); }
-.iconbar .stButton > button:active { transform: translateY(0) scale(.98); }
 
-/* Tiny inline confirms/editors */
-.inline-panel {
-  margin-top:6px; padding:6px; border:1px dashed var(--row-border); border-radius:8px; background:rgba(148,163,184,.08);
-}
+/* Avoid clipping */
+.stMarkdown, .st-emotion-cache, .element-container { overflow: visible !important; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -693,7 +694,7 @@ def parse_listing_meta(html: str) -> Dict[str, Any]:
     meta["summary"] = summarize_remarks(remark or "")
     meta["highlights"] = extract_highlights(remark or "")
     return meta
-async def enrich_results_async(results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+async def enrich_results_async(results: List[Dict[str, Any]]) -> List[Dict[str, Any]]]:
     targets = [(i, r["zillow_url"]) for i, r in enumerate(results) if "/homedetails/" in (r.get("zillow_url") or "")]
     if not targets: return results
     limits = min(12, max(4, len(targets)))
@@ -1104,15 +1105,15 @@ with tab_run:
             href = r.get("preview_url") or r.get("zillow_url") or r.get("display_url") or ""
             if not href: continue
             safe_href = escape(href)
-
             link_txt = r.get("input_address") or href
+
             badge_html = ""
             if client_selected:
                 if r.get("already_sent"):
                     tip = f"Duplicate ({escape(r.get('dup_reason','') or '-')}); sent {escape(r.get('dup_sent_at') or '-')}"
                     badge_html = f' <span class="badge dup" title="{tip}">Duplicate</span>'
                 else:
-                    badge_html = ' <span class="badge new" title="New for this client">NEW</span>'
+                    badge_html = ' <span class="tag-new" title="New for this client">NEW</span>'
 
             detail_html = ""
             if show_details:
@@ -1326,7 +1327,7 @@ def fetch_sent_for_client(client_norm: str, limit: int = 5000):
     except Exception:
         return []
 
-# Helper: derive human-readable address text from Zillow URL if DB 'address' missing
+# Helper: address text from Zillow URL if DB 'address' missing
 def address_text_from_url(url: str) -> str:
     if not url: return ""
     u = unquote(url)
@@ -1339,7 +1340,7 @@ def address_text_from_url(url: str) -> str:
     return ""
 
 def _render_client_report_view(client_display_name: str, client_norm: str):
-    """Render a report: address as hyperlink → Zillow, with Campaign filter and Search box."""
+    """Report: address hyperlink → Zillow, with Campaign filter and Search box."""
     st.markdown(f"### Report for {escape(client_display_name)}", unsafe_allow_html=True)
 
     colX, _ = st.columns([1,3])
@@ -1422,46 +1423,24 @@ def _render_client_report_view(client_display_name: str, client_norm: str):
             use_container_width=False
         )
 
-# ---------- Clients tab — original 4 buttons inline (▦ ✎ ⟳ ⌫) ----------
+# ---------- Clients row (INLINE, working links) ----------
 def _client_row_html(name: str, norm: str, cid: int, active: bool):
+    """
+    Inline row with 4 working buttons:
+      ▦ Documents (report)  ✎ Rename  ⟳ Activate/Deactivate  ⌫ Delete
+    Report & Toggle are real links targeting the parent (reliable in Streamlit).
+    Rename/Delete use JS prompt/confirm.
+    """
     status = "active" if active else "inactive"
     toggle_label = "Deactivate" if active else "Activate"
+    # Build one iframe block so nothing is clipped and buttons are inline.
     html = f"""
 <!DOCTYPE html>
 <html>
 <head>
 <meta charset="utf-8">
 <style>
-  html, body {{ margin:0; padding:0; }}
-  /* Make the row a single line with space-between layout */
-  .client-row {{
-    display:flex; align-items:center; justify-content:space-between;
-    gap:12px; padding:10px 8px; border-bottom:1px solid #e2e8f0;
-    white-space:nowrap; width:100%;
-  }}
-  .client-left {{ display:flex; align-items:center; gap:8px; min-width:0; }}
-  /* Force client name to white so it's visible on dark themes */
-  .client-name {{
-    font-weight:700; color:#ffffff !important;
-    white-space:nowrap; overflow:hidden; text-overflow:ellipsis;
-  }}
-  .pill {{ font-size:11px; font-weight:800; padding:2px 10px; border-radius:999px; }}
-  .pill.active {{
-    background: linear-gradient(180deg, #dcfce7 0%, #bbf7d0 100%);
-    color:#166534; border:1px solid rgba(5,150,105,.35);
-    box-shadow: 0 4px 12px rgba(16,185,129,.25);
-  }}
-  .pill.inactive {{ background:#e2e8f0; color:#475569; }}
-  .iconbar {{ display:flex; align-items:center; gap:10px; white-space:nowrap; }}
-  .ic {{
-    font-size:14px; line-height:1; cursor:pointer; user-select:none;
-    color:#64748b; padding:0; margin:0; border:none; background:transparent;
-    display:inline-flex; align-items:center; justify-content:center;
-    transform: translateY(0); transition: transform .08s ease, color .08s ease;
-    text-decoration:none;
-  }}
-  .ic:hover {{ color:#0f172a; transform: translateY(-1px); }}
-  .ic:focus {{ outline: 2px solid #93c5fd; outline-offset: 2px; border-radius:6px; }}
+  html,body {{ margin:0; padding:0; font-family:-apple-system, Segoe UI, Roboto, Arial, sans-serif; }}
 </style>
 </head>
 <body>
@@ -1471,33 +1450,44 @@ def _client_row_html(name: str, norm: str, cid: int, active: bool):
       <span class="pill {status}">{status}</span>
     </div>
     <div class="iconbar">
-      <a class="ic" title="Open report" href="?report={escape(norm)}&scroll=1" target="_parent">▦</a>
-      <span class="ic" title="Rename" role="button" tabindex="0"
-        onclick="
-          const newName = prompt('Rename client:', '{escape(name)}');
-          if (newName && newName.trim()) {{
-            const u = new URL(parent.location.href);
-            u.searchParams.set('act', 'rename');
-            u.searchParams.set('id', '{cid}');
-            u.searchParams.set('arg', newName.trim());
-            parent.location.search = u.search;
-          }}
-          return false;">✎</span>
+      <!-- Documents / Report -->
+      <a class="ic" title="Documents" href="?report={escape(norm)}&scroll=1" target="_parent">▦</a>
+
+      <!-- Rename -->
+      <a class="ic" title="Rename" href="#"
+         onclick="
+           const newName = prompt('Rename client:', '{escape(name)}');
+           if (newName && newName.trim()) {{
+             const u = new URL(parent.location.href);
+             u.searchParams.set('act','rename');
+             u.searchParams.set('id','{cid}');
+             u.searchParams.set('arg', newName.trim());
+             parent.location.search = u.search;
+           }}
+           return false;
+         ">✎</a>
+
+      <!-- Toggle -->
       <a class="ic" title="{toggle_label}" href="?act=toggle&id={cid}" target="_parent">⟳</a>
-      <span class="ic" title="Delete" role="button" tabindex="0"
-        onclick="
-          if (confirm('Delete {escape(name)}? This cannot be undone.')) {{
-            const u = new URL(parent.location.href);
-            u.searchParams.set('act', 'delete');
-            u.searchParams.set('id', '{cid}');
-            parent.location.search = u.search;
-          }}
-          return false;">⌫</span>
+
+      <!-- Delete -->
+      <a class="ic" title="Delete" href="#"
+         onclick="
+           if (confirm('Delete {escape(name)}? This cannot be undone.')) {{
+             const u = new URL(parent.location.href);
+             u.searchParams.set('act','delete');
+             u.searchParams.set('id','{cid}');
+             parent.location.search = u.search;
+           }}
+           return false;
+         ">⌫</a>
     </div>
   </div>
 </body>
-</html>"""
-    components.html(html, height=52, scrolling=False)
+</html>
+"""
+    # Make the iframe tall enough so the bottom of delete isn't clipped.
+    components.html(html, height=58, scrolling=False)
 
 # ---------- CLIENTS TAB ----------
 with tab_clients:
