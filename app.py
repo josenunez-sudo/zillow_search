@@ -694,7 +694,7 @@ def parse_listing_meta(html: str) -> Dict[str, Any]:
     meta["summary"] = summarize_remarks(remark or "")
     meta["highlights"] = extract_highlights(remark or "")
     return meta
-async def enrich_results_async(results: List[Dict[str, Any]]) -> List[Dict[str, Any]]]:
+async def enrich_results_async(results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     targets = [(i, r["zillow_url"]) for i, r in enumerate(results) if "/homedetails/" in (r.get("zillow_url") or "")]
     if not targets: return results
     limits = min(12, max(4, len(targets)))
