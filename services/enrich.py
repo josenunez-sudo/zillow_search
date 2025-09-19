@@ -1,10 +1,15 @@
 # services/enrich.py
-from __future__ import annotations
-import re, httpx, asyncio, requests
-from typing import Dict, Any, List, Optional, Tuple
-from core.config import REQUEST_TIMEOUT
-from services.resolver import UA_HEADERS
-from utils.html_tools import summarize_remarks, extract_highlights
+import os, re, asyncio, httpx, requests
+from typing import Dict, Any, List, Optional
+
+REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "12"))
+
+UA_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Cache-Control": "no-cache",
+}
 
 RE_PRICE  = re.compile(r'"(?:price|unformattedPrice|priceZestimate)"\s*:\s*"?\$?([\d,]+)"?', re.I)
 RE_STATUS = re.compile(r'"(?:homeStatus|statusText)"\s*:\s*"([^"]+)"', re.I)
@@ -13,20 +18,36 @@ RE_BATHS  = re.compile(r'"(?:bathrooms|baths)"\s*:\s*([0-9.]+)', re.I)
 RE_SQFT   = re.compile(r'"(?:livingArea|livingAreaValue|area)"\s*:\s*([0-9,]+)', re.I)
 RE_DESC   = re.compile(r'"(?:description|homeDescription|marketingDescription)"\s*:\s*"([^"]+)"', re.I)
 
-def _fetch_html_sync(url: str) -> str:
-    try:
-        r = requests.get(url, headers=UA_HEADERS, timeout=REQUEST_TIMEOUT)
-        if r.status_code == 200: return r.text
-    except Exception:
-        pass
-    return ""
+KEY_HL = [("new roof","roof"),("hvac","hvac"),("ac unit","ac"),("furnace","furnace"),("water heater","water heater"),
+          ("renovated","renovated"),("updated","updated"),("remodeled","remodeled"),("open floor plan","open plan"),
+          ("cul-de-sac","cul-de-sac"),("pool","pool"),("fenced","fenced"),("acre","acre"),("hoa","hoa"),
+          ("primary on main","primary on main"),("finished basement","finished basement")]
+
+def _tidy_txt(s: str) -> str:
+    return re.sub(r'\s+', ' ', (s or '')).strip()
+
+def summarize_remarks(text: str, max_sent: int = 2) -> str:
+    text = _tidy_txt(text)
+    if not text: return ""
+    sents = re.split(r'(?<=[\.\!\?])\s+', text)
+    if len(sents) <= max_sent: return text
+    pref_kw = ["updated","renovated","new","roof","hvac","kitchen","bath","floor","windows","mechanicals","acres","acre","lot","school","zoned","hoa","no hoa"]
+    scored = [(sum(1 for k in pref_kw if k in s.lower()), i, s) for i,s in enumerate(sents[:8])]
+    scored.sort(key=lambda x:(-x[0], x[1]))
+    return " ".join([s for _,_,s in scored[:max_sent]])
+
+def extract_highlights(text: str) -> List[str]:
+    t = (text or "").lower(); out=[]
+    for pat,label in KEY_HL:
+        if pat in t: out.append(label)
+    return list(dict.fromkeys(out))[:6]
 
 async def _fetch_html_async(client: httpx.AsyncClient, url: str) -> str:
     try:
         r = await client.get(url, headers=UA_HEADERS, timeout=REQUEST_TIMEOUT)
         if r.status_code == 200: return r.text
     except Exception:
-        pass
+        return ""
     return ""
 
 def extract_zillow_first_image(html: str) -> Optional[str]:
@@ -51,7 +72,7 @@ def extract_zillow_first_image(html: str) -> Optional[str]:
     return m.group(1) if m else None
 
 def parse_listing_meta(html: str) -> Dict[str, Any]:
-    meta: Dict[str, Any] = {}
+    meta = {}
     if not html: return meta
     m = RE_PRICE.search(html);   meta["price"]  = m.group(1) if m else None
     m = RE_STATUS.search(html);  meta["status"] = m.group(1) if m else None
