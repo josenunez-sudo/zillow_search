@@ -53,14 +53,14 @@ SUPABASE = get_supabase()
 # ---------- Page & global styles ----------
 def _page_icon_from_avif(path: str):
     if not os.path.exists(path):
-        return "⚗️"
+        return "🏡"
     try:
         im = Image.open(path); im.load()
         if im.mode not in ("RGB", "RGBA"): im = im.convert("RGBA")
         buf = io.BytesIO(); im.save(buf, format="PNG")
         return buf.getvalue()
     except Exception:
-        return "⚗️"
+        return "🏘️"
 
 st.set_page_config(
     page_title="Address Alchemist",
@@ -1481,7 +1481,7 @@ def _client_row_icons(name: str, norm: str, cid: int, active: bool):
 # ---------- CLIENTS TAB ----------
 with tab_clients:
     st.subheader("Clients")
-    st.caption("Manage active and inactive clients. “test test” is always hidden.")
+    st.caption("")
 
     report_norm_qp = _qp_get("report", "")
     want_scroll = _qp_get("scroll", "") in ("1","true","yes")
