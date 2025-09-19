@@ -1369,25 +1369,38 @@ def _client_row_native(name: str, norm: str, cid: int, active: bool):
     toggle_label = "Deactivate" if active else "Activate"
 
     with st.container():
+        # whole row wrapper
         st.markdown('<div class="client-row">', unsafe_allow_html=True)
-        cols = st.columns([8, 4])
-        with cols[0]:
+        # two columns: left = name + pill, right = icons
+        col_left, col_right = st.columns([0.7, 0.3], vertical_alignment="center")
+
+        with col_left:
+            # render name & pill inline using your classes
             st.markdown(
-                f'<div class="client-row-inner"><div class="client-left">'
-                f'<span class="client-name">{escape(name)}</span>'
-                f'<span class="pill {status}">{status}</span>'
-                f'</div></div>', unsafe_allow_html=True
+                f"""<div class="client-row-inner">
+                        <div class="client-left">
+                            <span class="client-name">{escape(name)}</span>
+                            <span class="pill {status}">{status}</span>
+                        </div>
+                    </div>""",
+                unsafe_allow_html=True
             )
-        with cols[1]:
-            # icon bar with buttons styled like your inline icons
+
+        with col_right:
+            # icon buttons side-by-side
             st.markdown('<div class="ic-bar">', unsafe_allow_html=True)
-            b_report = st.button("▦", key=f"rep_{cid}", help="Open report")
-            b_rename = st.button("✎", key=f"ren_{cid}", help="Rename")
-            b_toggle = st.button("⟳", key=f"tog_{cid}", help=toggle_label)
-            b_delete = st.button("⌫", key=f"del_{cid}", help="Delete")
+            c1, c2, c3, c4 = st.columns([1,1,1,1], vertical_alignment="center")
+            with c1:
+                b_report = st.button("▦", key=f"rep_{cid}", help="Open report")
+            with c2:
+                b_rename = st.button("✎", key=f"ren_{cid}", help="Rename")
+            with c3:
+                b_toggle = st.button("⟳", key=f"tog_{cid}", help=toggle_label)
+            with c4:
+                b_delete = st.button("⌫", key=f"del_{cid}", help="Delete")
             st.markdown('</div>', unsafe_allow_html=True)
 
-        st.markdown('</div>', unsafe_allow_html=True)
+        st.markdown('</div>', unsafe_allow_html=True)  # /client-row
 
     # Actions
     if b_report:
@@ -1400,14 +1413,13 @@ def _client_row_native(name: str, norm: str, cid: int, active: bool):
         toggle_client_active(cid, (not cur))
         _safe_rerun()
 
-    # Optional simple rename UX: show an input just-in-time
     if b_rename:
         st.session_state[f"__rename_open_{cid}"] = True
 
     if st.session_state.get(f"__rename_open_{cid}"):
         new_val = st.text_input("New name", value=name, key=f"__rename_val_{cid}")
-        c1, c2 = st.columns([1,1])
-        with c1:
+        csa, csb = st.columns([1,1])
+        with csa:
             if st.button("Save", key=f"__rename_save_{cid}"):
                 ok, msg = rename_client(cid, new_val)
                 if ok:
@@ -1415,13 +1427,12 @@ def _client_row_native(name: str, norm: str, cid: int, active: bool):
                     _safe_rerun()
                 else:
                     st.error(msg)
-        with c2:
+        with csb:
             if st.button("Cancel", key=f"__rename_cancel_{cid}"):
                 st.session_state[f"__rename_open_{cid}"] = False
                 _safe_rerun()
 
     if b_delete:
-        # No JS confirm available; quick guard via a second click
         if not st.session_state.get(f"__confirm_del_{cid}"):
             st.warning(f"Click Delete again to remove '{name}'.")
             st.session_state[f"__confirm_del_{cid}"] = True
@@ -1433,6 +1444,7 @@ def _client_row_native(name: str, norm: str, cid: int, active: bool):
             else:
                 st.error(msg)
                 st.session_state.pop(f"__confirm_del_{cid}", None)
+
 
 # ---------- Smooth-scroll helper ----------
 def _scroll_to(element_id: str):
