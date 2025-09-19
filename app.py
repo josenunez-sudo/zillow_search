@@ -106,25 +106,25 @@ html[data-theme="dark"] .badge.new,
 :root {
   --text-strong: #0f172a;
   --text-muted:  #475569;
-  --chip-active-bg:  #dcfce7; --chip-active-fg:#166534;
-  --chip-inactive-bg:#fee2e2; --chip-inactive-fg:#991b1b;
   --row-border: #e2e8f0;
   --row-hover:  #f8fafc;
+  --ok-bg:#dcfce7; --ok-fg:#166534;
+  --bad-bg:#fee2e2; --bad-fg:#991b1b;
 }
 html[data-theme="dark"], .stApp [data-theme="dark"] {
   --text-strong: #f8fafc;
   --text-muted:  #cbd5e1;
-  --chip-active-bg:  #064e3b; --chip-active-fg:#a7f3d0;
-  --chip-inactive-bg:#7f1d1d; --chip-inactive-fg:#fecaca;
   --row-border: #0b1220;
   --row-hover:  #0f172a;
+  --ok-bg:#064e3b; --ok-fg:#a7f3d0;
+  --bad-bg:#7f1d1d; --bad-fg:#fecaca;
 }
 
 /* Status pill */
 .pill { font-size:11px; font-weight:800; padding:2px 10px; border-radius:999px; }
 .pill.active {
-  background: linear-gradient(180deg, #dcfce7 0%, #bbf7d0 100%);
-  color:#065f46;
+  background: linear-gradient(180deg, var(--ok-bg) 0%, #bbf7d0 100%);
+  color: var(--ok-fg);
   border:1px solid rgba(5,150,105,.35);
   box-shadow: 0 4px 12px rgba(16,185,129,.25);
 }
@@ -154,6 +154,29 @@ html[data-theme="dark"] .pill.active,
   filter: brightness(1.06) !important;
 }
 .run-zone .stButton > button:active { transform: translateY(0) scale(.99) !important; }
+
+/* ===== Clients row: icon buttons (▦ ✎ ⟳ ⌫) ===== */
+.client-row { display:flex; align-items:center; justify-content:space-between; padding:10px 8px; border-bottom:1px solid var(--row-border); }
+.client-left { display:flex; align-items:center; gap:8px; min-width:0; }
+.client-name { font-weight:700; color: var(--text-strong); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.iconbar { display:flex; align-items:center; gap:8px; }
+.iconbar .stButton > button {
+  min-width: 28px; height: 28px; padding:0 8px;
+  border-radius: 8px; border:1px solid rgba(0,0,0,.08);
+  font-weight:700; line-height:1; cursor:pointer;
+  background:#f8fafc; color:#64748b;
+  transition: transform .08s ease, box-shadow .12s ease, filter .08s ease;
+}
+html[data-theme="dark"] .iconbar .stButton > button {
+  background:#0f172a; color:#cbd5e1; border-color:rgba(255,255,255,.08);
+}
+.iconbar .stButton > button:hover { transform: translateY(-1px); }
+.iconbar .stButton > button:active { transform: translateY(0) scale(.98); }
+
+/* Tiny inline confirms/editors */
+.inline-panel {
+  margin-top:6px; padding:6px; border:1px dashed var(--row-border); border-radius:8px; background:rgba(148,163,184,.08);
+}
 </style>
 """, unsafe_allow_html=True)
 
@@ -595,7 +618,7 @@ def process_single_row(row, *, delay=0.5, land_mode=True, defaults=None,
     time.sleep(min(delay, 0.4))
     return {"input_address": query_address, "mls_id": mls_id, "zillow_url": zurl, "status": status, "csv_photo": csv_photo}
 
-# Enrichment (regex strings fixed)
+# Enrichment
 RE_PRICE  = re.compile(r'"(?:price|unformattedPrice|priceZestimate)"\s*:\s*"?\$?([\d,]+)"?', re.I)
 RE_STATUS = re.compile(r'"(?:homeStatus|statusText)"\s*:\s*"([^"]+)"', re.I)
 RE_BEDS   = re.compile(r'"(?:bedrooms|beds)"\s*:\s*(\d+)', re.I)
@@ -1307,11 +1330,9 @@ def fetch_sent_for_client(client_norm: str, limit: int = 5000):
 def address_text_from_url(url: str) -> str:
     if not url: return ""
     u = unquote(url)
-    # /homedetails/123-Main-St-Austin-TX-78701/12345678_zpid/
     m = re.search(r"/homedetails/([^/]+)/\d{6,}_zpid/", u, re.I)
     if m:
         return re.sub(r"[-+]", " ", m.group(1)).strip().title()
-    # /homes/123-Main-St-Austin-TX-78701_rb/
     m = re.search(r"/homes/([^/_]+)_rb/?", u, re.I)
     if m:
         return re.sub(r"[-+]", " ", m.group(1)).strip().title()
@@ -1321,7 +1342,6 @@ def _render_client_report_view(client_display_name: str, client_norm: str):
     """Render a report: address as hyperlink → Zillow, with Campaign filter and Search box."""
     st.markdown(f"### Report for {escape(client_display_name)}", unsafe_allow_html=True)
 
-    # Close report button
     colX, _ = st.columns([1,3])
     with colX:
         if st.button("Close report", key=f"__close_report_{client_norm}"):
@@ -1331,7 +1351,6 @@ def _render_client_report_view(client_display_name: str, client_norm: str):
     rows = fetch_sent_for_client(client_norm)
     total = len(rows)
 
-    # Campaign filter options
     seen = []
     for r in rows:
         c = (r.get("campaign") or "").strip()
@@ -1374,7 +1393,6 @@ def _render_client_report_view(client_display_name: str, client_norm: str):
     items_html = []
     for r in rows_f:
         url = (r.get("url") or "").strip()
-        # Use stored address OR derive from URL → never "Open on Zillow"
         addr = (r.get("address") or "").strip() or address_text_from_url(url) or "Listing"
         sent_at = r.get("sent_at") or ""
         camp = (r.get("campaign") or "").strip()
@@ -1404,56 +1422,70 @@ def _render_client_report_view(client_display_name: str, client_norm: str):
             use_container_width=False
         )
 
-# ---------- Smooth-scroll helper ----------
-def _scroll_to(element_id: str):
-    components.html(
-        f"""
-        <script>
-          const el = parent.document.getElementById("{element_id}");
-          if (el) {{
-            el.scrollIntoView({{behavior: "smooth", block: "start"}});
-          }}
-        </script>
-        """,
-        height=0,
+# ---------- Clients tab — original 4 buttons style (▦ ✎ ⟳ ⌫) but reliable ----------
+def _client_row_icons(name: str, norm: str, cid: int, active: bool):
+    # left = name + status
+    st.markdown(
+        f"<div class='client-row'><div class='client-left'>"
+        f"<span class='client-name'>{escape(name)}</span>"
+        f"<span class='pill {'active' if active else ''}'>{'active' if active else 'inactive'}</span>"
+        f"</div><div class='iconbar' id='icons_{cid}'></div></div>",
+        unsafe_allow_html=True
     )
 
-# ---------- Clients tab rows: **native Streamlit buttons only** (no HTML iframe/icons) ----------
-def _client_row_native(name: str, norm: str, cid: int, active: bool):
-    left, right = st.columns([3, 2])
-    with left:
-        st.markdown(
-            f"<div style='display:flex;align-items:center;gap:8px;'>"
-            f"<span class='client-name' style='font-weight:700'>{escape(name)}</span>"
-            f"<span class='pill {'active' if active else ''}' style='margin-left:6px;'>{'active' if active else 'inactive'}</span>"
-            f"</div>",
-            unsafe_allow_html=True
-        )
-    with right:
-        c1, c2, c3, c4 = st.columns(4)
-        if c1.button("Report", key=f"rep_{cid}"):
+    # Mount the four icon-like buttons inline
+    cont = st.container()
+    with cont:
+        c1, c2, c3, c4, gap = st.columns([0.18,0.18,0.18,0.18,0.28])
+        # ▦ REPORT
+        if c1.button("▦", key=f"rep_{cid}", help="Open report"):
             _qp_set(report=norm, scroll="1")
             _safe_rerun()
-        new = c2.text_input("Rename to…", value=name, key=f"rn_{cid}")
-        if c2.button("Rename", key=f"do_rn_{cid}"):
-            ok, msg = rename_client(cid, new)
-            if not ok: st.warning(msg)
-            _safe_rerun()
-        if c3.button("Activate" if not active else "Deactivate", key=f"tg_{cid}"):
+
+        # ✎ RENAME
+        if c2.button("✎", key=f"rn_btn_{cid}", help="Rename"):
+            st.session_state[f"__edit_{cid}"] = True
+
+        # ⟳ ACTIVATE/DEACTIVATE
+        if c3.button("⟳", key=f"tg_{cid}", help=("Deactivate" if active else "Activate")):
             rows = SUPABASE.table("clients").select("active").eq("id", cid).limit(1).execute().data or []
             cur = rows[0]["active"] if rows else active
             toggle_client_active(cid, (not cur))
             _safe_rerun()
-        if c4.button("Delete", key=f"del_{cid}"):
-            delete_client(cid)
-            _safe_rerun()
+
+        # ⌫ DELETE (with confirm)
+        if c4.button("⌫", key=f"del_{cid}", help="Delete"):
+            st.session_state[f"__del_{cid}"] = True
+
+        # Inline rename editor
+        if st.session_state.get(f"__edit_{cid}"):
+            new_name = st.text_input("New name", value=name, key=f"rn_val_{cid}")
+            cc1, cc2 = st.columns([0.2,0.2])
+            if cc1.button("Save", key=f"rn_save_{cid}"):
+                ok, msg = rename_client(cid, new_name)
+                if not ok: st.warning(msg)
+                st.session_state[f"__edit_{cid}"] = False
+                _safe_rerun()
+            if cc2.button("Cancel", key=f"rn_cancel_{cid}"):
+                st.session_state[f"__edit_{cid}"] = False
+            st.markdown("<div class='inline-panel'></div>", unsafe_allow_html=True)
+
+        # Inline delete confirm
+        if st.session_state.get(f"__del_{cid}"):
+            dc1, dc2 = st.columns([0.2,0.2])
+            if dc1.button("Confirm delete", key=f"del_yes_{cid}"):
+                delete_client(cid)
+                st.session_state[f"__del_{cid}"] = False
+                _safe_rerun()
+            if dc2.button("Cancel", key=f"del_no_{cid}"):
+                st.session_state[f"__del_{cid}"] = False
+            st.markdown("<div class='inline-panel'></div>", unsafe_allow_html=True)
 
 # ---------- CLIENTS TAB ----------
 with tab_clients:
     st.subheader("Clients")
     st.caption("Manage active and inactive clients. “test test” is always hidden.")
 
-    # Read query params (report will render only when present)
     report_norm_qp = _qp_get("report", "")
     want_scroll = _qp_get("scroll", "") in ("1","true","yes")
 
@@ -1463,23 +1495,21 @@ with tab_clients:
 
     colA, colB = st.columns(2)
 
-    # Active list
     with colA:
         st.markdown("### Active", unsafe_allow_html=True)
         if not active:
             st.write("_No active clients_")
         else:
             for c in active:
-                _client_row_native(c["name"], c.get("name_norm",""), c["id"], active=True)
+                _client_row_icons(c["name"], c.get("name_norm",""), c["id"], active=True)
 
-    # Inactive list
     with colB:
         st.markdown("### Inactive", unsafe_allow_html=True)
         if not inactive:
             st.write("_No inactive clients_")
         else:
             for c in inactive:
-                _client_row_native(c["name"], c.get("name_norm",""), c["id"], active=False)
+                _client_row_icons(c["name"], c.get("name_norm",""), c["id"], active=False)
 
     # ---- REPORT SECTION BELOW THE TABLES ----
     st.markdown('<div id="report_anchor"></div>', unsafe_allow_html=True)
@@ -1488,5 +1518,12 @@ with tab_clients:
         st.markdown("---")
         _render_client_report_view(display_name, report_norm_qp)
         if want_scroll:
-            _scroll_to("report_anchor")
+            components.html(
+                """
+                <script>
+                  const el = parent.document.getElementById("report_anchor");
+                  if (el) { el.scrollIntoView({behavior: "smooth", block: "start"}); }
+                </script>
+                """, height=0
+            )
             _qp_set(report=report_norm_qp)
