@@ -6,6 +6,7 @@ import os, csv, io, re, time, json, asyncio
 from datetime import datetime
 from typing import List, Dict, Any, Optional, Tuple
 from html import escape
+from urllib.parse import unquote
 
 import requests
 import httpx
@@ -67,7 +68,7 @@ st.set_page_config(
     layout="centered",
 )
 
-# Base styles (apply to Streamlit page)
+# Base styles
 st.markdown("""
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@700;800&display=swap');
@@ -101,7 +102,7 @@ html[data-theme="dark"] .badge.new,
   box-shadow: 0 6px 16px rgba(6,95,70,.45), 0 1px 3px rgba(0,0,0,.35);
 }
 
-/* Theme variables */
+/* Theme vars */
 :root {
   --text-strong: #0f172a;
   --text-muted:  #475569;
@@ -119,16 +120,7 @@ html[data-theme="dark"], .stApp [data-theme="dark"] {
   --row-hover:  #0f172a;
 }
 
-/* Section heading */
-.clients-h3 { color: var(--text-muted); font-weight: 700; margin: 8px 0 6px; }
-
-/* For any non-iframe client rows you might render in the future */
-.client-row { padding: 12px 8px; border-bottom: 1px solid var(--row-border); }
-.client-name { color: var(--text-strong); font-weight: 700; }
-.client-status.active   { background: var(--chip-active-bg);   color: var(--chip-active-fg); }
-.client-status.inactive { background: var(--chip-inactive-bg); color: var(--chip-inactive-fg); }
-
-/* Match the pop style for active pill when we render native rows */
+/* Status pill */
 .pill { font-size:11px; font-weight:800; padding:2px 10px; border-radius:999px; }
 .pill.active {
   background: linear-gradient(180deg, #dcfce7 0%, #bbf7d0 100%);
@@ -144,7 +136,7 @@ html[data-theme="dark"] .pill.active,
   box-shadow: 0 4px 12px rgba(6,95,70,.45);
 }
 
-/* Run button glow / pop (scoped) */
+/* Run button pop */
 .run-zone .stButton > button {
   background: linear-gradient(180deg, #2563eb 0%, #1d4ed8 100%) !important;
   color: #fff !important;
@@ -161,32 +153,7 @@ html[data-theme="dark"] .pill.active,
   box-shadow: 0 12px 28px rgba(29,78,216,.40), 0 3px 10px rgba(0,0,0,.18) !important;
   filter: brightness(1.06) !important;
 }
-.run-zone .stButton > button:active {
-  transform: translateY(0) scale(.99) !important;
-}
-</style>
-""", unsafe_allow_html=True)
-
-# Extra theme-safe overrides for legibility
-st.markdown("""
-<style>
-:root {
-  --aa-text-strong: #0b1220;
-  --aa-text-muted:  #475569;
-  --aa-chip-active-bg:  #dcfce7; --aa-chip-active-fg:#166534;
-  --aa-chip-inactive-bg:#fee2e2; --aa-chip-inactive-fg:#991b1b;
-}
-html[data-theme="dark"], .stApp [data-theme="dark"] {
-  --aa-text-strong: #f8fafc;
-  --aa-text-muted:  #cbd5e1;
-  --aa-chip-active-bg:  #064e3b; --aa-chip-active-fg:#a7f3d0;
-  --aa-chip-inactive-bg: #7f1d1d; --aa-chip-inactive-fg:#fecaca;
-}
-@media (prefers-color-scheme: dark) {
-  :root { --aa-text-strong: #f8fafc; --aa-text-muted: #cbd5e1; }
-}
-.client-name { color: var(--aa-text-strong) !important; font-weight: 700; }
-.client-status { color: var(--aa-text-strong) !important; font-size:11px !important; }
+.run-zone .stButton > button:active { transform: translateY(0) scale(.99) !important; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -785,11 +752,6 @@ def _supabase_available():
 
 @st.cache_data(ttl=300, show_spinner=False)
 def get_already_sent_maps(client_tag: str):
-    """
-    Returns:
-      canon_set, zpid_set, canon_info, zpid_info
-    where *_info map -> {"sent_at": "...", "url": "..."} for tooltip context.
-    """
     if not (_supabase_available() and client_tag.strip()):
         return set(), set(), {}, {}
     try:
@@ -859,7 +821,7 @@ def log_sent_rows(results: List[Dict[str, Any]], client_tag: str, campaign_tag: 
     except Exception as e:
         return False, str(e)
 
-# ---------- Clients registry helpers (cached) ----------
+# ---------- Clients registry ----------
 @st.cache_data(ttl=60, show_spinner=False)
 def fetch_clients(include_inactive: bool = False):
     if not _sb_ok(): return []
@@ -936,12 +898,10 @@ def _qp_get(name, default=None):
 def _qp_set(**kwargs):
     try:
         if not kwargs:
-            # clear all (modern API)
             st.query_params.clear()
         else:
             st.query_params.update(kwargs)
     except Exception:
-        # legacy fallback
         if kwargs:
             st.experimental_set_query_params(**kwargs)
         else:
@@ -967,7 +927,7 @@ if act and cid:
             rename_client(cid_int, arg)
         elif act == "delete":
             delete_client(cid_int)
-    _qp_set()  # clear params
+    _qp_set()
     _safe_rerun()
 
 # ---------- Output builders ----------
@@ -1014,7 +974,7 @@ with tab_run:
     NO_CLIENT = "➤ No client (show ALL, no logging)"
     ADD_SENTINEL = "➕ Add new client…"
 
-    colC, colK = st.columns([1.2, 1])
+    colC, colCamp = st.columns([1.2, 1])
     with colC:
         active_clients = fetch_clients(include_inactive=False)
         names = [c["name"] for c in active_clients]
@@ -1033,7 +993,7 @@ with tab_run:
                     st.error(f"Add failed: {msg}")
 
         client_tag_raw = (selected_client["name"] if selected_client else "")
-    with colK:
+    with colCamp:
         campaign_tag_raw = st.text_input("Campaign tag", value=datetime.utcnow().strftime("%Y%m%d"))
 
     c1, c2, c3, c4 = st.columns([1,1,1.25,1.45])
@@ -1114,16 +1074,26 @@ with tab_run:
     clicked = st.button("🚀 Run", use_container_width=True, key="__run_btn__")
     st.markdown('</div>', unsafe_allow_html=True)
 
-    # Results HTML list with copy-all (ALWAYS preview links for best unfurl)
+    # Results list (address as link text)
     def results_list_with_copy_all(results: List[Dict[str, Any]], client_selected: bool):
+        def addr_text_from_url(url: str) -> str:
+            if not url: return ""
+            u = unquote(url)
+            m = re.search(r"/homedetails/([^/]+)/\d{6,}_zpid/", u, re.I)
+            if m:
+                return re.sub(r"[-+]", " ", m.group(1)).strip().title()
+            m = re.search(r"/homes/([^/_]+)_rb/?", u, re.I)
+            if m:
+                return re.sub(r"[-+]", " ", m.group(1)).strip().title()
+            return ""
+
         li_html = []
         for r in results:
             href = r.get("preview_url") or r.get("zillow_url") or r.get("display_url") or ""
             if not href: continue
             safe_href = escape(href)
 
-            # link TEXT = address (fallback to "Open on Zillow")
-            link_txt = r.get("input_address") or "Open on Zillow"
+            link_txt = (r.get("input_address") or addr_text_from_url(href) or "Open on Zillow")
             safe_txt = escape(link_txt)
 
             badge_html = ""
@@ -1211,6 +1181,7 @@ with tab_run:
         st.download_button("Export", data=payload, file_name=f"address_alchemist{tag}_{ts}.{fmt}", mime=mime, use_container_width=True)
         st.session_state["__results__"] = {"results": results, "fmt": fmt}
 
+        # Thumbs
         thumbs=[]
         for r in results:
             img = r.get("image_url")
@@ -1220,16 +1191,25 @@ with tab_run:
         if thumbs:
             st.markdown("#### Images")
             cols = st.columns(3)
+            def addr_text_from_url(url: str) -> str:
+                if not url: return ""
+                u = unquote(url)
+                m = re.search(r"/homedetails/([^/]+)/\d{6,}_zpid/", u, re.I)
+                if m:
+                    return re.sub(r"[-+]", " ", m.group(1)).strip().title()
+                m = re.search(r"/homes/([^/_]+)_rb/?", u, re.I)
+                if m:
+                    return re.sub(r"[-+]", " ", m.group(1)).strip().title()
+                return ""
             for i,(r,img) in enumerate(thumbs):
                 with cols[i%3]:
                     st.image(img, use_container_width=True)
                     mls_id = (r.get("mls_id") or "").strip()
-                    addr = (r.get("input_address") or "").strip()
                     url = r.get("preview_url") or r.get("zillow_url") or r.get("display_url") or "#"
+                    addr = (r.get("input_address") or addr_text_from_url(url) or "Open on Zillow")
                     mls_html = f"<strong>MLS#: {escape(mls_id)}</strong>" if mls_id else ""
-                    link_text = escape(addr) if addr else "Open on Zillow"
                     st.markdown(
-                        f"<div class='img-label'>{mls_html}<br/><a href='{escape(url)}' target='_blank' rel='noopener'>{link_text}</a></div>",
+                        f"<div class='img-label'>{mls_html}<br/><a href='{escape(url)}' target='_blank' rel='noopener'>{escape(addr)}</a></div>",
                         unsafe_allow_html=True
                     )
 
@@ -1328,10 +1308,6 @@ with tab_run:
 # ---------- Sent reports ----------
 @st.cache_data(ttl=120, show_spinner=False)
 def fetch_sent_for_client(client_norm: str, limit: int = 5000):
-    """
-    Fetch sent rows for a given normalized client name from Supabase.
-    Returns list of dicts: [{url, address, sent_at, campaign, mls_id, canonical, zpid}, ...]
-    """
     if not (_supabase_available() and client_norm.strip()):
         return []
     try:
@@ -1346,15 +1322,25 @@ def fetch_sent_for_client(client_norm: str, limit: int = 5000):
     except Exception:
         return []
 
+# Helper: derive human-readable address text from Zillow URL if DB 'address' missing
+def address_text_from_url(url: str) -> str:
+    if not url: return ""
+    u = unquote(url)
+    m = re.search(r"/homedetails/([^/]+)/\d{6,}_zpid/", u, re.I)
+    if m:
+        return re.sub(r"[-+]", " ", m.group(1)).strip().title()
+    m = re.search(r"/homes/([^/_]+)_rb/?", u, re.I)
+    if m:
+        return re.sub(r"[-+]", " ", m.group(1)).strip().title()
+    return ""
+
 def _render_client_report_view(client_display_name: str, client_norm: str):
-    """Render a report: address as hyperlink → Zillow, with Campaign filter and Search box."""
     st.markdown(f"### Report for {escape(client_display_name)}", unsafe_allow_html=True)
 
-    # Close report button
     colX, _ = st.columns([1,3])
     with colX:
         if st.button("Close report", key=f"__close_report_{client_norm}"):
-            _qp_set()  # clear query params
+            _qp_set()
             _safe_rerun()
 
     rows = fetch_sent_for_client(client_norm)
@@ -1402,7 +1388,10 @@ def _render_client_report_view(client_display_name: str, client_norm: str):
     items_html = []
     for r in rows_f:
         url = (r.get("url") or "").strip()
-        addr = (r.get("address") or "").strip() or "Open on Zillow"
+        # Use stored address OR derive from URL → never "Open on Zillow"
+        addr = (r.get("address") or "").strip()
+        if not addr:
+            addr = address_text_from_url(url) or "Listing"
         sent_at = r.get("sent_at") or ""
         camp = (r.get("campaign") or "").strip()
         chip = ""
@@ -1431,7 +1420,7 @@ def _render_client_report_view(client_display_name: str, client_norm: str):
             use_container_width=False
         )
 
-# ---------- Smooth-scroll helper ----------
+# ---------- Smooth-scroll ----------
 def _scroll_to(element_id: str):
     components.html(
         f"""
@@ -1445,7 +1434,7 @@ def _scroll_to(element_id: str):
         height=0,
     )
 
-# ---------- Native client row (Streamlit buttons for reliability) ----------
+# ---------- Clients tab row: text buttons (no funky glyphs) ----------
 def _client_row_native(name: str, norm: str, cid: int, active: bool):
     left, right = st.columns([3, 2])
     with left:
@@ -1458,24 +1447,20 @@ def _client_row_native(name: str, norm: str, cid: int, active: bool):
         )
     with right:
         c1, c2, c3, c4 = st.columns(4)
-        # Report
-        if c1.button("▦", key=f"rep_{cid}", help="Open report"):
+        if c1.button("Report", key=f"rep_{cid}"):
             _qp_set(report=norm, scroll="1")
             _safe_rerun()
-        # Rename
-        new = c2.text_input(" ", value=name, key=f"rn_{cid}", label_visibility="collapsed")
-        if c2.button("✎", key=f"do_rn_{cid}", help="Rename to value in box"):
+        new = c2.text_input("Rename to…", value=name, key=f"rn_{cid}")
+        if c2.button("Rename", key=f"do_rn_{cid}"):
             ok, msg = rename_client(cid, new)
             if not ok: st.warning(msg)
             _safe_rerun()
-        # Toggle
-        if c3.button("⟳", key=f"tg_{cid}", help="Activate/Deactivate"):
+        if c3.button("Activate" if not active else "Deactivate", key=f"tg_{cid}"):
             rows = SUPABASE.table("clients").select("active").eq("id", cid).limit(1).execute().data or []
-            cur = rows[0]["active"] if rows else True
+            cur = rows[0]["active"] if rows else active
             toggle_client_active(cid, (not cur))
             _safe_rerun()
-        # Delete
-        if c4.button("⌫", key=f"del_{cid}", help="Delete client"):
+        if c4.button("Delete", key=f"del_{cid}"):
             delete_client(cid)
             _safe_rerun()
 
@@ -1484,7 +1469,6 @@ with tab_clients:
     st.subheader("Clients")
     st.caption("Manage active and inactive clients. “test test” is always hidden.")
 
-    # Read query params (report will render only when present)
     report_norm_qp = _qp_get("report", "")
     want_scroll = _qp_get("scroll", "") in ("1","true","yes")
 
@@ -1494,7 +1478,6 @@ with tab_clients:
 
     colA, colB = st.columns(2)
 
-    # Active list
     with colA:
         st.markdown("### Active", unsafe_allow_html=True)
         if not active:
@@ -1503,7 +1486,6 @@ with tab_clients:
             for c in active:
                 _client_row_native(c["name"], c.get("name_norm",""), c["id"], active=True)
 
-    # Inactive list
     with colB:
         st.markdown("### Inactive", unsafe_allow_html=True)
         if not inactive:
@@ -1512,7 +1494,6 @@ with tab_clients:
             for c in inactive:
                 _client_row_native(c["name"], c.get("name_norm",""), c["id"], active=False)
 
-    # ---- REPORT SECTION BELOW THE TABLES (hidden unless report=...) ----
     st.markdown('<div id="report_anchor"></div>', unsafe_allow_html=True)
     if report_norm_qp:
         display_name = next((c["name"] for c in all_clients if c.get("name_norm")==report_norm_qp), report_norm_qp)
