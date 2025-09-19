@@ -1477,7 +1477,7 @@ def _client_row_html(name: str, norm: str, cid: int, active: bool):
 </html>
 """
     # Slightly taller to avoid clipping last icon
-    components.html(html, height=52, scrolling=False)
+    components.html(html, height=56, scrolling=False)
 
 # ---------- CLIENTS TAB ----------
 with tab_clients:
