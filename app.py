@@ -68,7 +68,7 @@ st.set_page_config(
     layout="centered",
 )
 
-# Base styles (apply to Streamlit page)
+# Base styles
 st.markdown("""
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@700;800&display=swap');
@@ -83,24 +83,6 @@ textarea:focus { outline:3px solid #93c5fd !important; outline-offset:2px; }
 [data-testid="stFileUploadClearButton"] { display:none !important; }
 .detail { font-size:14.5px; margin:8px 0 0 0; line-height:1.35; }
 .hl { display:inline-block; background:#f1f5f9; border-radius:8px; padding:2px 6px; margin-right:6px; font-size:12px; }
-
-/* Badges */
-.badge { display:inline-block; font-size:12px; font-weight:800; padding:2px 8px; border-radius:999px; margin-left:8px; }
-.badge.dup { background:#fee2e2; color:#991b1b; }
-.badge.new {
-  background: linear-gradient(180deg, #dcfce7 0%, #bbf7d0 100%);
-  color:#065f46;
-  border:1px solid rgba(5,150,105,.35);
-  box-shadow: 0 6px 16px rgba(16,185,129,.25), 0 1px 3px rgba(0,0,0,.08);
-  text-transform: uppercase;
-}
-html[data-theme="dark"] .badge.new,
-.stApp [data-theme="dark"] .badge.new {
-  background: linear-gradient(180deg, #064e3b 0%, #065f46 100%);
-  color:#a7f3d0;
-  border-color: rgba(167,243,208,.35);
-  box-shadow: 0 6px 16px rgba(6,95,70,.45), 0 1px 3px rgba(0,0,0,.35);
-}
 
 /* Theme variables */
 :root {
@@ -120,7 +102,7 @@ html[data-theme="dark"], .stApp [data-theme="dark"] {
   --bad-bg:#7f1d1d; --bad-fg:#fecaca;
 }
 
-/* Status pill */
+/* Status pill (used in Clients) */
 .pill { font-size:11px; font-weight:800; padding:2px 10px; border-radius:999px; }
 .pill.active {
   background: linear-gradient(180deg, var(--ok-bg) 0%, #bbf7d0 100%);
@@ -135,48 +117,67 @@ html[data-theme="dark"] .pill.active,
   border-color: rgba(167,243,208,.35);
   box-shadow: 0 4px 12px rgba(6,95,70,.45);
 }
+.pill.inactive { background: var(--bad-bg); color: var(--bad-fg); }
+
+/* Badges — NEW now matches the active pill look */
+.badge { display:inline-block; font-size:12px; font-weight:800; padding:2px 10px; border-radius:999px; margin-left:8px; }
+.badge.dup { background:#fee2e2; color:#991b1b; }
+.badge.new {
+  background: linear-gradient(180deg, var(--ok-bg) 0%, #bbf7d0 100%);
+  color: var(--ok-fg);
+  border:1px solid rgba(5,150,105,.35);
+  box-shadow: 0 4px 12px rgba(16,185,129,.25);
+  text-transform: uppercase;
+}
+html[data-theme="dark"] .badge.new,
+.stApp [data-theme="dark"] .badge.new {
+  background: linear-gradient(180deg, #064e3b 0%, #065f46 100%);
+  color:#a7f3d0;
+  border-color: rgba(167,243,208,.35);
+  box-shadow: 0 4px 12px rgba(6,95,70,.45);
+}
 
 /* Run button pop */
 .run-zone .stButton > button {
   background: linear-gradient(180deg, #2563eb 0%, #1d4ed8 100%) !important;
-  color: #fff !important;
-  font-weight: 800 !important;
-  letter-spacing: .2px !important;
-  border: 0 !important;
-  border-radius: 12px !important;
+  color: #fff !important; font-weight: 800 !important; letter-spacing: .2px !important;
+  border: 0 !important; border-radius: 12px !important;
   box-shadow: 0 8px 20px rgba(29,78,216,.35), 0 2px 6px rgba(0,0,0,.15) !important;
   transform: translateY(0) !important;
   transition: transform .08s ease, box-shadow .12s ease, filter .08s ease !important;
 }
-.run-zone .stButton > button:hover {
-  transform: translateY(-1px) !important;
-  box-shadow: 0 12px 28px rgba(29,78,216,.40), 0 3px 10px rgba(0,0,0,.18) !important;
-  filter: brightness(1.06) !important;
-}
+.run-zone .stButton > button:hover { transform: translateY(-1px) !important; box-shadow: 0 12px 28px rgba(29,78,216,.40), 0 3px 10px rgba(0,0,0,.18) !important; }
 .run-zone .stButton > button:active { transform: translateY(0) scale(.99) !important; }
 
-/* ===== Clients row: icon buttons (▦ ✎ ⟳ ⌫) ===== */
-.client-row { display:flex; align-items:center; justify-content:space-between; padding:10px 8px; border-bottom:1px solid var(--row-border); }
-.client-left { display:flex; align-items:center; gap:8px; min-width:0; }
-.client-name { font-weight:700; color: var(--text-strong); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
-.iconbar { display:flex; align-items:center; gap:8px; }
-.iconbar .stButton > button {
-  min-width: 28px; height: 28px; padding:0 8px;
-  border-radius: 8px; border:1px solid rgba(0,0,0,.08);
-  font-weight:700; line-height:1; cursor:pointer;
+/* ===== Client list (inline) ===== */
+.client-name { font-weight:700; color:#fff !important; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; } /* force white */
+.client-divider { height:1px; background:var(--row-border); margin:6px 0; }
+
+/* Inline icon-ish buttons */
+.iconish .stButton > button {
+  min-width: 28px; height: 28px; padding:0 8px; border-radius: 8px;
+  border:1px solid rgba(0,0,0,.08); font-weight:700; line-height:1; cursor:pointer;
   background:#f8fafc; color:#64748b;
   transition: transform .08s ease, box-shadow .12s ease, filter .08s ease;
 }
-html[data-theme="dark"] .iconbar .stButton > button {
-  background:#0f172a; color:#cbd5e1; border-color:rgba(255,255,255,.08);
-}
-.iconbar .stButton > button:hover { transform: translateY(-1px); }
-.iconbar .stButton > button:active { transform: translateY(0) scale(.98); }
+html[data-theme="dark"] .iconish .stButton > button { background:#0f172a; color:#cbd5e1; border-color:rgba(255,255,255,.08); }
+.iconish .stButton > button:hover { transform: translateY(-1px); }
+.iconish .stButton > button:active { transform: translateY(0) scale(.98); }
+</style>
+""", unsafe_allow_html=True)
 
-/* Tiny inline confirms/editors */
-.inline-panel {
-  margin-top:6px; padding:6px; border:1px dashed var(--row-border); border-radius:8px; background:rgba(148,163,184,.08);
+# Extra theme-safe overrides for legibility
+st.markdown("""
+<style>
+:root {
+  --aa-text-strong: #0b1220;
+  --aa-text-muted:  #475569;
 }
+html[data-theme="dark"], .stApp [data-theme="dark"] {
+  --aa-text-strong: #f8fafc;
+  --aa-text-muted:  #cbd5e1;
+}
+.client-status { color: var(--aa-text-strong) !important; font-size:11px !important; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -555,7 +556,6 @@ def construct_deeplink_from_parts(street, city, state, zipc, defaults):
     a = slug.lower(); a = re.sub(r"[^\w\s,-]", "", a).replace(",", ""); a = re.sub(r"\s+", "-", a.strip())
     return f"https://www.zillow.com/homes/{a}_rb/"
 
-# Resolve from arbitrary source URL
 def resolve_from_source_url(source_url: str, defaults: Dict[str,str]) -> Tuple[str, str]:
     final_url, html, _ = expand_url_and_fetch_html(source_url)
     mls_id = extract_any_mls_id(html)
@@ -577,10 +577,9 @@ def resolve_from_source_url(source_url: str, defaults: Dict[str,str]) -> Tuple[s
                 u = it.get("url") or ""
                 if "/homedetails/" in u: return u, title
     if city or state or street:
-        return construct_deeplink_from_parts(street or title or "", city, state, zipc, defaults), compose_query_address(street or title or "", city, state, zipc, defaults)
+        return construct_deeplink_from_parts(street or title or "", city, state, zipc, defaults), compose_query_address(street, city, state, zipc, defaults)
     return final_url, ""
 
-# Primary resolver
 def process_single_row(row, *, delay=0.5, land_mode=True, defaults=None,
                        require_state=True, mls_first=True, default_mls_name="", max_candidates=20):
     defaults = defaults or {"city":"", "state":"", "zip":""}
@@ -661,6 +660,7 @@ def extract_zillow_first_image(html: str) -> Optional[str]:
         )
         if m: return m.group(1)
     m = re.search(r"srcset=['\"]([^'\"]*photos\.zillowstatic\.com[^'\"]+)['\"]", html, re.I)
+        # (rest unchanged)
     if m:
         cand=[]
         for part in m.group(1).split(","):
@@ -670,7 +670,7 @@ def extract_zillow_first_image(html: str) -> Optional[str]:
             up=[u for (w,u) in cand if w<=1152]
             return (sorted(((w,u) for (w,u) in cand if w<=1152), key=lambda x:x[0])[-1][1] if up
                     else sorted(cand, key=lambda x:x[0])[-1][1])
-    m = re.search(r"(https://photos\.zillowstatic\.com/fp/\S+-cc_ft_\d+\.(jpg|webp))", html, re.I)
+    m = re.search(r"(https://photos\.zillowstatic\.com/fp/\S+-cc_ft_\d+\.(?:jpg|webp))", html, re.I)
     return m.group(1) if m else None
 def parse_listing_meta(html: str) -> Dict[str, Any]:
     meta = {}
@@ -844,7 +844,7 @@ def log_sent_rows(results: List[Dict[str, Any]], client_tag: str, campaign_tag: 
     except Exception as e:
         return False, str(e)
 
-# ---------- Clients registry helpers (cached) ----------
+# ---------- Clients registry helpers ----------
 @st.cache_data(ttl=60, show_spinner=False)
 def fetch_clients(include_inactive: bool = False):
     if not _sb_ok(): return []
@@ -920,15 +920,15 @@ def _qp_get(name, default=None):
 
 def _qp_set(**kwargs):
     try:
-        if kwargs:
-            st.query_params.update(kwargs)
+        if not kwargs:
+            if hasattr(st, "query_params"): st.query_params.clear()
+            else: st.experimental_set_query_params()
         else:
-            st.query_params.clear()
+            if hasattr(st, "query_params"): st.query_params.update(kwargs)
+            else: st.experimental_set_query_params(**kwargs)
     except Exception:
-        if kwargs:
-            st.experimental_set_query_params(**kwargs)
-        else:
-            st.experimental_set_query_params()
+        if kwargs: st.experimental_set_query_params(**kwargs)
+        else: st.experimental_set_query_params()
 
 act = _qp_get("act", "")
 cid = _qp_get("id", "")
@@ -950,7 +950,7 @@ if act and cid:
             rename_client(cid_int, arg)
         elif act == "delete":
             delete_client(cid_int)
-    _qp_set()
+    _qp_set()  # clear params
     _safe_rerun()
 
 # ---------- Output builders ----------
@@ -974,10 +974,11 @@ def build_output(rows: List[Dict[str, Any]], fmt: str, use_display: bool = True,
         for r in rows:
             u = pick_url(r)
             if not u: continue
-            txt = r.get("input_address") or u
-            items.append(f'<li><a href="{escape(u)}" target="_blank" rel="noopener">{escape(txt)}</a></li>')
+            # Results page should show hyperlink text, not address nor raw url
+            items.append(f'<li><a href="{escape(u)}" target="_blank" rel="noopener">Open on Zillow</a></li>')
         return "<ul>\n" + "\n".join(items) + "\n</ul>\n", "text/html"
 
+    # txt / md payload: just the URLs (copyable)
     lines = []
     for r in rows:
         u = pick_url(r)
@@ -1092,12 +1093,11 @@ with tab_run:
         st.markdown("**Preview (pasted)** (first 5):")
         st.markdown("<ul class='link-list'>" + "\n".join([f"<li>{escape(p)}</li>" for p in lines_clean[:5]]) + ("<li>…</li>" if count_pasted > 5 else "") + "</ul>", unsafe_allow_html=True)
 
-    # POPPY RUN BUTTON
     st.markdown('<div class="run-zone">', unsafe_allow_html=True)
     clicked = st.button("🚀 Run", use_container_width=True, key="__run_btn__")
     st.markdown('</div>', unsafe_allow_html=True)
 
-    # Results HTML list with copy-all (ALWAYS preview links for best unfurl)
+    # Results HTML list with copy-all (Results tab should show hyperlink text "Open on Zillow")
     def results_list_with_copy_all(results: List[Dict[str, Any]], client_selected: bool):
         li_html = []
         for r in results:
@@ -1105,7 +1105,6 @@ with tab_run:
             if not href: continue
             safe_href = escape(href)
 
-            link_txt = r.get("input_address") or href
             badge_html = ""
             if client_selected:
                 if r.get("already_sent"):
@@ -1128,7 +1127,8 @@ with tab_run:
                     hlt = " ".join([f"<span class='hl'>{escape(h)}</span>" for h in (r.get("highlights") or [])])
                     detail_html += f"<div class='detail'>{escape(r.get('summary') or '')} {hlt}</div>"
 
-            li_html.append(f'<li><a href="{safe_href}" target="_blank" rel="noopener">{escape(link_txt)}</a>{badge_html}{detail_html}</li>')
+            # Link text specifically "Open on Zillow" in results
+            li_html.append(f'<li><a href="{safe_href}" target="_blank" rel="noopener">Open on Zillow</a>{badge_html}{detail_html}</li>')
 
         items_html = "\n".join(li_html) if li_html else "<li>(no results)</li>"
 
@@ -1191,7 +1191,6 @@ with tab_run:
         st.download_button("Export", data=payload, file_name=f"address_alchemist{tag}_{ts}.{fmt}", mime=mime, use_container_width=True)
         st.session_state["__results__"] = {"results": results, "fmt": fmt}
 
-        # Thumbs
         thumbs=[]
         for r in results:
             img = r.get("image_url")
@@ -1207,9 +1206,10 @@ with tab_run:
                     mls_id = (r.get("mls_id") or "").strip()
                     addr = (r.get("input_address") or "").strip()
                     url = r.get("preview_url") or r.get("zillow_url") or r.get("display_url") or "#"
+                    mls_html = f"<strong>MLS#: {escape(mls_id)}</strong>" if mls_id else ""
                     link_text = escape(addr) if addr else "View listing"
                     st.markdown(
-                        f"<div class='img-label'>{('<strong>MLS#: '+escape(mls_id)+'</strong><br/>' if mls_id else '')}<a href='{escape(url)}' target='_blank' rel='noopener'>{link_text}</a></div>",
+                        f"<div class='img-label'>{mls_html}<br/><a href='{escape(url)}' target='_blank' rel='noopener'>{link_text}</a></div>",
                         unsafe_allow_html=True
                     )
 
@@ -1308,10 +1308,6 @@ with tab_run:
 # ---------- Sent reports ----------
 @st.cache_data(ttl=120, show_spinner=False)
 def fetch_sent_for_client(client_norm: str, limit: int = 5000):
-    """
-    Fetch sent rows for a given normalized client name from Supabase.
-    Returns list of dicts: [{url, address, sent_at, campaign, mls_id, canonical, zpid}, ...]
-    """
     if not (_supabase_available() and client_norm.strip()):
         return []
     try:
@@ -1326,26 +1322,13 @@ def fetch_sent_for_client(client_norm: str, limit: int = 5000):
     except Exception:
         return []
 
-# Helper: derive human-readable address text from Zillow URL if DB 'address' missing
-def address_text_from_url(url: str) -> str:
-    if not url: return ""
-    u = unquote(url)
-    m = re.search(r"/homedetails/([^/]+)/\d{6,}_zpid/", u, re.I)
-    if m:
-        return re.sub(r"[-+]", " ", m.group(1)).strip().title()
-    m = re.search(r"/homes/([^/_]+)_rb/?", u, re.I)
-    if m:
-        return re.sub(r"[-+]", " ", m.group(1)).strip().title()
-    return ""
-
 def _render_client_report_view(client_display_name: str, client_norm: str):
-    """Render a report: address as hyperlink → Zillow, with Campaign filter and Search box."""
     st.markdown(f"### Report for {escape(client_display_name)}", unsafe_allow_html=True)
 
     colX, _ = st.columns([1,3])
     with colX:
         if st.button("Close report", key=f"__close_report_{client_norm}"):
-            _qp_set()  # clear query params
+            _qp_set()  # clear qp
             _safe_rerun()
 
     rows = fetch_sent_for_client(client_norm)
@@ -1390,10 +1373,11 @@ def _render_client_report_view(client_display_name: str, client_norm: str):
         st.info("No results match the current filters.")
         return
 
+    # Report: link text should be ADDRESS (not "Open on Zillow")
     items_html = []
     for r in rows_f:
         url = (r.get("url") or "").strip()
-        addr = (r.get("address") or "").strip() or address_text_from_url(url) or "Listing"
+        addr = (r.get("address") or "").strip() or "View on Zillow"
         sent_at = r.get("sent_at") or ""
         camp = (r.get("campaign") or "").strip()
         chip = ""
@@ -1422,64 +1406,104 @@ def _render_client_report_view(client_display_name: str, client_norm: str):
             use_container_width=False
         )
 
-# ---------- Clients tab — original 4 buttons style (▦ ✎ ⟳ ⌫) but reliable ----------
-def _client_row_icons(name: str, norm: str, cid: int, active: bool):
-    # left = name + status
-    st.markdown(
-        f"<div class='client-row'><div class='client-left'>"
-        f"<span class='client-name'>{escape(name)}</span>"
-        f"<span class='pill {'active' if active else ''}'>{'active' if active else 'inactive'}</span>"
-        f"</div><div class='iconbar' id='icons_{cid}'></div></div>",
-        unsafe_allow_html=True
+# ---------- Smooth-scroll helper ----------
+def _scroll_to(element_id: str):
+    components.html(
+        f"""
+        <script>
+          const el = parent.document.getElementById("{element_id}");
+          if (el) {{
+            el.scrollIntoView({{behavior: "smooth", block: "start"}});
+          }}
+        </script>
+        """,
+        height=0,
     )
 
-    # Mount the four icon-like buttons inline
-    cont = st.container()
-    with cont:
-        c1, c2, c3, c4, gap = st.columns([0.18,0.18,0.18,0.18,0.28])
-        # ▦ REPORT
-        if c1.button("▦", key=f"rep_{cid}", help="Open report"):
-            _qp_set(report=norm, scroll="1")
-            _safe_rerun()
+# ---------- Client row (INLINE buttons & pill) ----------
+def _client_row_html(name: str, norm: str, cid: int, active: bool):
+    status = "active" if active else "inactive"
+    toggle_label = "Deactivate" if active else "Activate"
 
-        # ✎ RENAME
-        if c2.button("✎", key=f"rn_btn_{cid}", help="Rename"):
-            st.session_state[f"__edit_{cid}"] = True
+    html = f"""
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  :root {{
+    --text: #0f172a; --muted:#64748b; --row-border: rgba(0,0,0,.08);
+    --ok-bg:#dcfce7; --ok-fg:#166534; --bad-bg:#fee2e2; --bad-fg:#991b1b;
+  }}
+  @media (prefers-color-scheme: dark) {{
+    :root {{
+      --text:#f8fafc; --muted:#94a3b8; --row-border: rgba(255,255,255,.08);
+      --ok-bg:#064e3b; --ok-fg:#a7f3d0; --bad-bg:#7f1d1d; --bad-fg:#fecaca;
+    }}
+  }}
+  html,body {{ margin:0; padding:0; font-family:-apple-system, Segoe UI, Roboto, Arial, sans-serif; color:var(--text); }}
+  .row {{
+    display:flex; align-items:center; justify-content:space-between;
+    padding:8px 6px; border-bottom:1px solid var(--row-border);
+    gap:12px; flex-wrap:nowrap;  /* keep inline */
+  }}
+  .left {{ display:flex; align-items:center; gap:8px; min-width:0; flex:1 1 auto; white-space:nowrap; }}
+  .name {{ font-weight:700; color:#fff; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; max-width: 60vw; }}
+  .pill {{ font-size:11px; font-weight:800; padding:2px 10px; border-radius:999px; }}
+  .pill.active {{
+    background: linear-gradient(180deg, var(--ok-bg) 0%, #bbf7d0 100%);
+    color: var(--ok-fg); border:1px solid rgba(5,150,105,.35); box-shadow: 0 4px 12px rgba(16,185,129,.25);
+  }}
+  .pill.inactive {{ background:var(--bad-bg); color:var(--bad-fg); }}
 
-        # ⟳ ACTIVATE/DEACTIVATE
-        if c3.button("⟳", key=f"tg_{cid}", help=("Deactivate" if active else "Activate")):
-            rows = SUPABASE.table("clients").select("active").eq("id", cid).limit(1).execute().data or []
-            cur = rows[0]["active"] if rows else active
-            toggle_client_active(cid, (not cur))
-            _safe_rerun()
-
-        # ⌫ DELETE (with confirm)
-        if c4.button("⌫", key=f"del_{cid}", help="Delete"):
-            st.session_state[f"__del_{cid}"] = True
-
-        # Inline rename editor
-        if st.session_state.get(f"__edit_{cid}"):
-            new_name = st.text_input("New name", value=name, key=f"rn_val_{cid}")
-            cc1, cc2 = st.columns([0.2,0.2])
-            if cc1.button("Save", key=f"rn_save_{cid}"):
-                ok, msg = rename_client(cid, new_name)
-                if not ok: st.warning(msg)
-                st.session_state[f"__edit_{cid}"] = False
-                _safe_rerun()
-            if cc2.button("Cancel", key=f"rn_cancel_{cid}"):
-                st.session_state[f"__edit_{cid}"] = False
-            st.markdown("<div class='inline-panel'></div>", unsafe_allow_html=True)
-
-        # Inline delete confirm
-        if st.session_state.get(f"__del_{cid}"):
-            dc1, dc2 = st.columns([0.2,0.2])
-            if dc1.button("Confirm delete", key=f"del_yes_{cid}"):
-                delete_client(cid)
-                st.session_state[f"__del_{cid}"] = False
-                _safe_rerun()
-            if dc2.button("Cancel", key=f"del_no_{cid}"):
-                st.session_state[f"__del_{cid}"] = False
-            st.markdown("<div class='inline-panel'></div>", unsafe_allow_html=True)
+  .icons {{ display:flex; align-items:center; gap:10px; white-space:nowrap; flex:0 0 auto; }}
+  .ic {{
+    font-size:14px; line-height:1; cursor:pointer; user-select:none;
+    color: var(--muted); padding: 0; margin:0; border:none; background:transparent;
+    display:inline-flex; align-items:center; justify-content:center;
+    transform: translateY(0);
+    transition: transform .08s ease, color .08s ease;
+    text-decoration:none;
+  }}
+  .ic:hover {{ color: var(--text); transform: translateY(-1px); }}
+  .ic:focus {{ outline: 2px solid #93c5fd; outline-offset: 2px; border-radius:6px; }}
+</style>
+</head>
+<body>
+  <div class="row">
+    <div class="left">
+      <span class="name">{escape(name)}</span>
+      <span class="pill {status}">{status}</span>
+    </div>
+    <div class="icons">
+      <a class="ic" title="Open report" href="?report={escape(norm)}&scroll=1" target="_parent">▦</a>
+      <span class="ic" role="button" tabindex="0" title="Rename"
+        onclick="
+          const newName = prompt('Rename client:', '{escape(name)}');
+          if (newName && newName.trim()) {{
+            const u = new URL(parent.location.href);
+            u.searchParams.set('act', 'rename');
+            u.searchParams.set('id', '{cid}');
+            u.searchParams.set('arg', newName.trim());
+            parent.location.search = u.search;
+          }}
+          return false;">✎</span>
+      <a class="ic" title="{toggle_label}" href="?act=toggle&id={cid}" target="_parent">⟳</a>
+      <span class="ic" role="button" tabindex="0" title="Delete"
+        onclick="
+          if (confirm('Delete {escape(name)}? This cannot be undone.')) {{
+            const u = new URL(parent.location.href);
+            u.searchParams.set('act', 'delete');
+            u.searchParams.set('id', '{cid}');
+            parent.location.search = u.search;
+          }}
+          return false;">⌫</span>
+    </div>
+  </div>
+</body>
+</html>
+"""
+    components.html(html, height=48, scrolling=False)
 
 # ---------- CLIENTS TAB ----------
 with tab_clients:
@@ -1501,7 +1525,7 @@ with tab_clients:
             st.write("_No active clients_")
         else:
             for c in active:
-                _client_row_icons(c["name"], c.get("name_norm",""), c["id"], active=True)
+                _client_row_html(c["name"], c.get("name_norm",""), c["id"], active=True)
 
     with colB:
         st.markdown("### Inactive", unsafe_allow_html=True)
@@ -1509,21 +1533,13 @@ with tab_clients:
             st.write("_No inactive clients_")
         else:
             for c in inactive:
-                _client_row_icons(c["name"], c.get("name_norm",""), c["id"], active=False)
+                _client_row_html(c["name"], c.get("name_norm",""), c["id"], active=False)
 
-    # ---- REPORT SECTION BELOW THE TABLES ----
     st.markdown('<div id="report_anchor"></div>', unsafe_allow_html=True)
     if report_norm_qp:
         display_name = next((c["name"] for c in all_clients if c.get("name_norm")==report_norm_qp), report_norm_qp)
         st.markdown("---")
         _render_client_report_view(display_name, report_norm_qp)
         if want_scroll:
-            components.html(
-                """
-                <script>
-                  const el = parent.document.getElementById("report_anchor");
-                  if (el) { el.scrollIntoView({behavior: "smooth", block: "start"}); }
-                </script>
-                """, height=0
-            )
+            _scroll_to("report_anchor")
             _qp_set(report=report_norm_qp)
