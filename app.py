@@ -120,14 +120,13 @@ html[data-theme="dark"], .stApp [data-theme="dark"] {
   --bad-bg:#7f1d1d; --bad-fg:#fecaca;
 }
 
-/* Status pill — match NEW style for ACTIVE */
+/* Status pill */
 .pill { font-size:11px; font-weight:800; padding:2px 10px; border-radius:999px; }
 .pill.active {
   background: linear-gradient(180deg, var(--ok-bg) 0%, #bbf7d0 100%);
   color: var(--ok-fg);
   border:1px solid rgba(5,150,105,.35);
   box-shadow: 0 4px 12px rgba(16,185,129,.25);
-  text-transform: uppercase;
 }
 html[data-theme="dark"] .pill.active,
 .stApp [data-theme="dark"] .pill.active {
@@ -136,7 +135,6 @@ html[data-theme="dark"] .pill.active,
   border-color: rgba(167,243,208,.35);
   box-shadow: 0 4px 12px rgba(6,95,70,.45);
 }
-.pill.inactive { background: var(--bad-bg); color: var(--bad-fg); }
 
 /* Run button pop */
 .run-zone .stButton > button {
@@ -157,46 +155,31 @@ html[data-theme="dark"] .pill.active,
 }
 .run-zone .stButton > button:active { transform: translateY(0) scale(.99) !important; }
 
-/* ===== Clients row ===== */
-.client-row { display:flex; align-items:center; justify-content:space-between; padding:10px 8px; border-bottom:1px solid var(--row-border); overflow:visible; }
+/* ===== Clients row: icon buttons (▦ ✎ ⟳ ⌫) ===== */
+.client-row { display:flex; align-items:center; justify-content:space-between; padding:10px 8px; border-bottom:1px solid var(--row-border); }
 .client-left { display:flex; align-items:center; gap:8px; min-width:0; }
+/* FORCE WHITE NAME */
 .client-name { font-weight:700; color:#ffffff !important; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
-.iconbar { display:flex; align-items:center; gap:10px; flex-shrink:0; }
-
-/* Tiny inline icons look */
-.ic {
-  font-size:14px; line-height:1; cursor:pointer; user-select:none;
-  color: #64748b; padding: 0 4px; margin:0; border:none; background:transparent;
-  display:inline-flex; align-items:center; justify-content:center; text-decoration:none;
-  transition: transform .08s ease, color .08s ease;
+.iconbar { display:flex; align-items:center; gap:8px; }
+.iconbar .stButton > button {
+  min-width: 28px; height: 28px; padding:0 8px;
+  border-radius: 8px; border:1px solid rgba(0,0,0,.08);
+  font-weight:700; line-height:1; cursor:pointer;
+  background:#f8fafc; color:#64748b;
+  transition: transform .08s ease, box-shadow .12s ease, filter .08s ease;
 }
-.ic:hover { color: var(--text-strong); transform: translateY(-1px); }
-.ic:focus { outline: 2px solid #93c5fd; outline-offset: 2px; border-radius:6px; }
+html[data-theme="dark"] .iconbar .stButton > button {
+  background:#0f172a; color:#cbd5e1; border-color:rgba(255,255,255,.08);
+}
+.iconbar .stButton > button:hover { transform: translateY(-1px); }
+.iconbar .stButton > button:active { transform: translateY(0) scale(.98); }
 
-/* inline editor container */
+/* Tiny inline confirms/editors */
 .inline-panel {
   margin-top:6px; padding:6px; border:1px dashed var(--row-border); border-radius:8px; background:rgba(148,163,184,.08);
 }
 </style>
 """, unsafe_allow_html=True)
-
-# >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
-# EXTRA CSS to guarantee white client names and inline icon polish
-st.markdown("""
-<style>
-.client-row .client-name {
-  color:#ffffff !important;
-  font-weight:700;
-  white-space:nowrap;
-  overflow:hidden;
-  text-overflow:ellipsis;
-}
-.client-row .iconbar .ic { opacity:0.9; }
-.client-row:hover .iconbar .ic { opacity:1; }
-.client-row:hover { background: var(--row-hover); }
-</style>
-""", unsafe_allow_html=True)
-# <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
 
 # ---------- Debug toggle ----------
 def _get_debug_mode() -> bool:
@@ -906,8 +889,9 @@ def rename_client(client_id: int, new_name: str):
     try:
         new_norm = _norm_tag(new_name)
         existing = SUPABASE.table("clients").select("id").eq("name_norm", new_norm).limit(1).execute().data or []
-        if existing and existing[0]["id"] != client_id:
-            return False, "A client with that (normalized) name already exists."
+        if existing and existing:
+            if existing[0]["id"] != client_id:
+                return False, "A client with that (normalized) name already exists."
         SUPABASE.table("clients").update({"name": new_name.strip(), "name_norm": new_norm}).eq("id", client_id).execute()
         invalidate_clients_cache()
         return True, "ok"
@@ -992,8 +976,8 @@ def build_output(rows: List[Dict[str, Any]], fmt: str, use_display: bool = True,
         for r in rows:
             u = pick_url(r)
             if not u: continue
-            # Results export keeps URL as anchor text for clarity
-            items.append(f'<li><a href="{escape(u)}" target="_blank" rel="noopener">{escape(u)}</a></li>')
+            txt = r.get("input_address") or u
+            items.append(f'<li><a href="{escape(u)}" target="_blank" rel="noopener">{escape(txt)}</a></li>')
         return "<ul>\n" + "\n".join(items) + "\n</ul>\n", "text/html"
 
     lines = []
@@ -1123,9 +1107,7 @@ with tab_run:
             if not href: continue
             safe_href = escape(href)
 
-            # Show the hyperlink as the URL text (not address)
-            link_txt = href
-
+            link_txt = r.get("input_address") or href
             badge_html = ""
             if client_selected:
                 if r.get("already_sent"):
@@ -1442,32 +1424,104 @@ def _render_client_report_view(client_display_name: str, client_norm: str):
             use_container_width=False
         )
 
-# ---------- CLIENTS TAB — NO IFRAME ROWS ----------
-def _client_row_html(name: str, norm: str, cid: int, active: bool):
+# ---------- Clients tab — inline row with working icon buttons (▦ ✎ ⟳ ⌫) ----------
+def _client_row_icons(name: str, norm: str, cid: int, active: bool):
     """
-    Renders a single client row directly in the main DOM (no iframe).
-    Uses plain links to your existing query-param router so actions 'just work':
-      ▦ → ?report=<norm>&scroll=1
-      ⟳ → ?act=toggle&id=<id>
-      ⌫ → ?act=delete&id=<id>
+    One-row layout:
+      [ Name + Status Pill ] [▦] [✎] [⟳] [⌫]
+
+    ▦ Report    -> sets ?report=<norm>&scroll=1 and reruns (shows inline report section)
+    ✎ Edit      -> toggles inline rename panel; Save renames via Supabase and reruns
+    ⟳ Toggle    -> activate/deactivate via Supabase and reruns (moves between columns)
+    ⌫ Delete    -> inline 2-step confirm; delete via Supabase and reruns
     """
     status = "active" if active else "inactive"
     toggle_label = "Deactivate" if active else "Activate"
 
-    html = f"""
-<div class="client-row">
-  <div class="client-left">
-    <span class="client-name">{escape(name)}</span>
-    <span class="pill {status}">{status.upper()}</span>
-  </div>
-  <div class="iconbar">
-    <a class="ic" title="Open report" href="?report={escape(norm)}&scroll=1">▦</a>
-    <a class="ic" title="{toggle_label}" href="?act=toggle&id={cid}">⟳</a>
-    <a class="ic" title="Delete" href="?act=delete&id={cid}" style="padding-right:6px;">⌫</a>
-  </div>
-</div>
-"""
-    st.markdown(html, unsafe_allow_html=True)
+    # stable per-row state keys
+    rename_flag_key = f"__rename_open_{cid}"
+    delete_flag_key = f"__delete_confirm_{cid}"
+    rename_input_key = f"__rename_input_{cid}"
+
+    if rename_flag_key not in st.session_state:
+        st.session_state[rename_flag_key] = False
+    if delete_flag_key not in st.session_state:
+        st.session_state[delete_flag_key] = False
+
+    # Inline single row
+    col_name, col_rep, col_edit, col_toggle, col_del = st.columns([8, 1, 1, 1, 1])
+
+    with col_name:
+        st.markdown(
+            f"""
+            <div class="client-row" style="padding:10px 0 6px 0; border-bottom:1px solid var(--row-border);">
+              <div class="client-left">
+                <span class="client-name">{escape(name)}</span>
+                <span class="pill {'active' if active else ''}">{status.upper()}</span>
+              </div>
+            </div>
+            """,
+            unsafe_allow_html=True
+        )
+
+    with col_rep:
+        if st.button("▦", key=f"rep_{cid}", help="Open report"):
+            _qp_set(report=norm, scroll="1")
+            _safe_rerun()
+
+    with col_edit:
+        if st.button("✎", key=f"edit_{cid}", help="Rename client"):
+            st.session_state[rename_flag_key] = not st.session_state[rename_flag_key]
+
+    with col_toggle:
+        if st.button("⟳", key=f"tog_{cid}", help=toggle_label):
+            ok, msg = toggle_client_active(cid, not active)
+            if not ok:
+                st.warning(f"Toggle failed: {msg}")
+            _safe_rerun()
+
+    with col_del:
+        if not st.session_state[delete_flag_key]:
+            if st.button("⌫", key=f"del_{cid}", help="Delete client"):
+                st.session_state[delete_flag_key] = True
+        else:
+            c1, c2 = st.columns(2)
+            with c1:
+                if st.button("✅", key=f"del_yes_{cid}", help="Confirm delete"):
+                    ok, msg = delete_client(cid)
+                    if not ok:
+                        st.warning(f"Delete failed: {msg}")
+                    _safe_rerun()
+            with c2:
+                if st.button("✖", key=f"del_no_{cid}", help="Cancel"):
+                    st.session_state[delete_flag_key] = False
+
+    # Inline rename panel
+    if st.session_state[rename_flag_key]:
+        with st.container():
+            st.markdown('<div class="inline-panel">', unsafe_allow_html=True)
+            new_name = st.text_input("New client name", value=name, key=rename_input_key, label_visibility="collapsed")
+            b1, b2 = st.columns([1,1])
+            with b1:
+                if st.button("Save", key=f"rn_save_{cid}"):
+                    new_name_clean = (new_name or "").strip()
+                    if not new_name_clean:
+                        st.warning("Name cannot be empty.")
+                    else:
+                        ok, msg = rename_client(cid, new_name_clean)
+                        if not ok:
+                            st.warning(f"Rename failed: {msg}")
+                        else:
+                            st.session_state[rename_flag_key] = False
+                            _safe_rerun()
+            with b2:
+                if st.button("Cancel", key=f"rn_cancel_{cid}"):
+                    st.session_state[rename_flag_key] = False
+            st.markdown('</div>', unsafe_allow_html=True)
+
+    # Optional styling hook under delete confirm
+    if st.session_state[delete_flag_key]:
+        st.markdown("<div class='inline-panel'></div>", unsafe_allow_html=True)
 
 # ---------- CLIENTS TAB ----------
 with tab_clients:
@@ -1489,7 +1543,7 @@ with tab_clients:
             st.write("_No active clients_")
         else:
             for c in active:
-                _client_row_html(c["name"], c.get("name_norm",""), c["id"], active=True)
+                _client_row_icons(c["name"], c.get("name_norm",""), c["id"], active=True)
 
     with colB:
         st.markdown("### Inactive", unsafe_allow_html=True)
@@ -1497,7 +1551,7 @@ with tab_clients:
             st.write("_No inactive clients_")
         else:
             for c in inactive:
-                _client_row_html(c["name"], c.get("name_norm",""), c["id"], active=False)
+                _client_row_icons(c["name"], c.get("name_norm",""), c["id"], active=False)
 
     # ---- REPORT SECTION BELOW THE TABLES ----
     st.markdown('<div id="report_anchor"></div>', unsafe_allow_html=True)
