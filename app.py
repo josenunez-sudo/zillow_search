@@ -1379,37 +1379,135 @@ def _scroll_to(element_id: str):
 # ---------- Tiny client row (icons inline; no button containers) ----------
 def _client_row_html(name: str, norm: str, cid: int, active: bool):
     """
-    Render a single client row directly in the main DOM (no iframe).
-    Report + Activate/Deactivate are real links updating the page query params.
-    Style/icons match the previous look.
+    Renders a single client row with tiny inline icons (no per-icon button container).
+    Report + Toggle now use JS (like Rename/Delete) to set parent query params reliably.
     """
     status = "active" if active else "inactive"
     toggle_label = "Deactivate" if active else "Activate"
 
-    # Inline styles mirror your original CSS so the look stays the same.
     html = f"""
-<div class="row" style="display:flex;align-items:center;justify-content:space-between;padding:10px 8px;border-bottom:1px solid var(--row-border);">
-  <div class="left" style="display:flex;align-items:center;gap:8px;min-width:0;">
-    <span class="name" style="font-weight:700;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">{escape(name)}</span>
-    <span class="pill {status}" style="font-size:11px;font-weight:700;padding:2px 8px;border-radius:999px;{'background:var(--ok-bg);color:var(--ok-fg);' if active else 'background:var(--bad-bg);color:var(--bad-fg);'}">{status}</span>
-  </div>
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  :root {{
+    --text: #0f172a;
+    --muted:#64748b;
+    --hover:#f8fafc;
+    --ok-bg:#dcfce7; --ok-fg:#166534; /* active = green pill */
+    --bad-bg:#fee2e2; --bad-fg:#991b1b;
+    --row-border: rgba(0,0,0,.08);
+  }}
+  @media (prefers-color-scheme: dark) {{
+    :root {{
+      --text:#f8fafc;
+      --muted:#94a3b8;
+      --hover:#0f172a;
+      --ok-bg:#064e3b; --ok-fg:#a7f3d0;
+      --bad-bg:#7f1d1d; --bad-fg:#fecaca;
+      --row-border: rgba(255,255,255,.08);
+    }}
+  }}
+  html,body {{
+    margin:0; padding:0;
+    font-family: -apple-system, Segoe UI, Roboto, Arial, sans-serif;
+    color: var(--text);
+  }}
+  .row {{
+    display:flex; align-items:center; justify-content:space-between;
+    padding:10px 8px; border-bottom:1px solid var(--row-border);
+  }}
+  .left {{
+    display:flex; align-items:center; gap:8px; min-width:0;
+  }}
+  .name {{
+    font-weight:700; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;
+  }}
+  /* Visible, green "active" pill */
+  .pill {{
+    font-size:11px; font-weight:700; padding:2px 8px; border-radius:999px;
+  }}
+  .pill.active {{ background:var(--ok-bg); color:var(--ok-fg); }}
+  .pill.inactive {{ background:var(--bad-bg); color:var(--bad-fg); }}
 
-  <div class="icons" style="display:flex;align-items:center;gap:10px;">
-    <!-- Report (real link in main DOM) -->
-    <a class="ic" title="Open report" href="?report={escape(norm)}&scroll=1"
-       style="font-size:14px;line-height:1;cursor:pointer;user-select:none;color:var(--muted);padding:0;margin:0;border:none;background:transparent;display:inline-flex;align-items:center;justify-content:center;text-decoration:none;transform:translateY(0);"
-       onmouseover="this.style.color='var(--text)';this.style.transform='translateY(-1px)';"
-       onmouseout="this.style.color='var(--muted)';this.style.transform='translateY(0)';">▦</a>
+  /* Tiny inline icons — no button container */
+  .icons {{
+    display:flex; align-items:center; gap:10px;
+  }}
+  .ic {{
+    font-size:14px; line-height:1; cursor:pointer; user-select:none;
+    color: var(--muted);
+    padding: 0; margin:0; border:none; background:transparent;
+    display:inline-flex; align-items:center; justify-content:center;
+    transform: translateY(0);
+    transition: transform .08s ease, color .08s ease;
+    text-decoration:none;
+  }}
+  .ic:hover {{ color: var(--text); transform: translateY(-1px); }}
+  .ic:focus {{ outline: 2px solid #93c5fd; outline-offset: 2px; border-radius:6px; }}
+</style>
+</head>
+<body>
+  <div class="row">
+    <div class="left">
+      <span class="name">{escape(name)}</span>
+      <span class="pill {status}">{status}</span>
+    </div>
 
-    <!-- Toggle active (real link in main DOM) -->
-    <a class="ic" title="{toggle_label}" href="?act=toggle&id={cid}"
-       style="font-size:14px;line-height:1;cursor:pointer;user-select:none;color:var(--muted);padding:0;margin:0;border:none;background:transparent;display:inline-flex;align-items:center;justify-content:center;text-decoration:none;transform:translateY(0);"
-       onmouseover="this.style.color='var(--text)';this.style.transform='translateY(-1px)';"
-       onmouseout="this.style.color='var(--muted)';this.style.transform='translateY(0)';">⟳</a>
+    <!-- inline icons (no container around each) -->
+    <div class="icons">
+      <!-- Report (now JS updates parent query) -->
+      <span class="ic" role="button" tabindex="0" title="Open report"
+        onclick="
+          const u = new URL(parent.location.href);
+          u.searchParams.set('report', '{escape(norm)}');
+          u.searchParams.set('scroll', '1');
+          parent.location.href = u.toString();
+          return false;
+        ">▦</span>
+
+      <!-- Rename (JS prompt) -->
+      <span class="ic" role="button" tabindex="0" title="Rename"
+        onclick="
+          const newName = prompt('Rename client:', '{escape(name)}');
+          if (newName && newName.trim()) {{
+            const u = new URL(parent.location.href);
+            u.searchParams.set('act', 'rename');
+            u.searchParams.set('id', '{cid}');
+            u.searchParams.set('arg', newName.trim());
+            parent.location.href = u.toString();
+          }}
+          return false;
+        ">✎</span>
+
+      <!-- Toggle active (now JS updates parent query) -->
+      <span class="ic" role="button" tabindex="0" title="{toggle_label}"
+        onclick="
+          const u = new URL(parent.location.href);
+          u.searchParams.set('act', 'toggle');
+          u.searchParams.set('id', '{cid}');
+          parent.location.href = u.toString();
+          return false;
+        ">⟳</span>
+
+      <!-- Delete (JS confirm) -->
+      <span class="ic" role="button" tabindex="0" title="Delete"
+        onclick="
+          if (confirm('Delete {escape(name)}? This cannot be undone.')) {{
+            const u = new URL(parent.location.href);
+            u.searchParams.set('act', 'delete');
+            u.searchParams.set('id', '{cid}');
+            parent.location.href = u.toString();
+          }}
+          return false;
+        ">⌫</span>
+    </div>
   </div>
-</div>
+</body>
+</html>
 """
-    st.markdown(html, unsafe_allow_html=True)
+    components.html(html, height=48, scrolling=False)
 
 # ---------- CLIENTS TAB ----------
 with tab_clients:
