@@ -180,6 +180,24 @@ html[data-theme="dark"] .pill.active,
 </style>
 """, unsafe_allow_html=True)
 
+# >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+# EXTRA CSS to guarantee white client names and inline icon polish
+st.markdown("""
+<style>
+.client-row .client-name {
+  color:#ffffff !important;
+  font-weight:700;
+  white-space:nowrap;
+  overflow:hidden;
+  text-overflow:ellipsis;
+}
+.client-row .iconbar .ic { opacity:0.9; }
+.client-row:hover .iconbar .ic { opacity:1; }
+.client-row:hover { background: var(--row-hover); }
+</style>
+""", unsafe_allow_html=True)
+# <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+
 # ---------- Debug toggle ----------
 def _get_debug_mode() -> bool:
     try:
@@ -1424,60 +1442,32 @@ def _render_client_report_view(client_display_name: str, client_norm: str):
             use_container_width=False
         )
 
-# ---------- Clients tab — INLINE HTML ROW (▦ ✎ ⟳ ⌫) with working links ----------
+# ---------- CLIENTS TAB — NO IFRAME ROWS ----------
 def _client_row_html(name: str, norm: str, cid: int, active: bool):
     """
-    Renders a single client row with inline icons (no Streamlit columns).
-    Documents and Activate/Deactivate are real links via query params (reliable).
-    Rename/Delete use prompt/confirm to set query params.
+    Renders a single client row directly in the main DOM (no iframe).
+    Uses plain links to your existing query-param router so actions 'just work':
+      ▦ → ?report=<norm>&scroll=1
+      ⟳ → ?act=toggle&id=<id>
+      ⌫ → ?act=delete&id=<id>
     """
     status = "active" if active else "inactive"
     toggle_label = "Deactivate" if active else "Activate"
 
     html = f"""
-<!DOCTYPE html>
-<html>
-<head><meta charset="utf-8"></head>
-<body style="margin:0;padding:0;">
-  <div class="client-row">
-    <div class="client-left">
-      <span class="client-name">{escape(name)}</span>
-      <span class="pill {status}">{status.upper()}</span>
-    </div>
-    <div class="iconbar">
-      <!-- Documents/Report -->
-      <a class="ic" title="Open report" href="?report={escape(norm)}&scroll=1" target="_parent">▦</a>
-      <!-- Rename -->
-      <a class="ic" href="#" title="Rename" onclick="
-        const n=prompt('Rename client:', '{escape(name)}');
-        if(n && n.trim()){{
-          const u=new URL(parent.location.href);
-          u.searchParams.set('act','rename');
-          u.searchParams.set('id','{cid}');
-          u.searchParams.set('arg', n.trim());
-          parent.location.search=u.search;
-        }}
-        return false;
-      ">✎</a>
-      <!-- Toggle active -->
-      <a class="ic" title="{toggle_label}" href="?act=toggle&id={cid}" target="_parent">⟳</a>
-      <!-- Delete with confirm -->
-      <a class="ic" href="#" title="Delete" onclick="
-        if(confirm('Delete {escape(name)}? This cannot be undone.')){{
-          const u=new URL(parent.location.href);
-          u.searchParams.set('act','delete');
-          u.searchParams.set('id','{cid}');
-          parent.location.search=u.search;
-        }}
-        return false;
-      " style="padding-right:6px;">⌫</a>
-    </div>
+<div class="client-row">
+  <div class="client-left">
+    <span class="client-name">{escape(name)}</span>
+    <span class="pill {status}">{status.upper()}</span>
   </div>
-</body>
-</html>
+  <div class="iconbar">
+    <a class="ic" title="Open report" href="?report={escape(norm)}&scroll=1">▦</a>
+    <a class="ic" title="{toggle_label}" href="?act=toggle&id={cid}">⟳</a>
+    <a class="ic" title="Delete" href="?act=delete&id={cid}" style="padding-right:6px;">⌫</a>
+  </div>
+</div>
 """
-    # Slightly taller to avoid clipping last icon
-    components.html(html, height=56, scrolling=False)
+    st.markdown(html, unsafe_allow_html=True)
 
 # ---------- CLIENTS TAB ----------
 with tab_clients:
