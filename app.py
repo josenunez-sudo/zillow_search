@@ -106,33 +106,27 @@ html[data-theme="dark"], .stApp [data-theme="dark"] {
 /* Section heading */
 .clients-h3 { color: var(--text-muted); font-weight: 700; margin: 8px 0 6px; }
 
-/* Clients list row (native Streamlit version, mimics your old iframe styling) */
-.client-row { border-bottom:1px solid var(--row-border); padding:10px 8px 8px; }
-.client-row-inner { display:flex; align-items:center; justify-content:space-between; gap:8px; }
-.client-left { display:flex; align-items:center; gap:8px; min-width:0; }
-.client-name { color: var(--text-strong); font-weight:700; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
-.pill { font-size:11px; font-weight:700; padding:2px 8px; border-radius:999px; }
-.pill.active { background: var(--chip-active-bg); color: var(--chip-active-fg); }
-.pill.inactive { background: var(--chip-inactive-bg); color: var(--chip-inactive-fg); }
+/* For any non-iframe client rows you might render in the future */
+.client-row { padding: 10px 8px 8px; border-bottom: 1px solid var(--row-border); }
+.client-name { color: #ffffff !important; font-weight: 700; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; } /* ALWAYS WHITE */
+.client-status.active   { background: var(--chip-active-bg);   color: var(--chip-active-fg); }
+.client-status.inactive { background: var(--chip-inactive-bg); color: var(--chip-inactive-fg); }
 
-/* Icon buttons (style Streamlit buttons to look like inline icons) */
-.ic-bar { display:flex; align-items:center; gap:10px; }
-.ic-bar .stButton > button {
+/* Icon-bar styling for native Streamlit buttons (side-by-side inline icons) */
+.icon-row { display:flex; align-items:center; gap:10px; justify-content:flex-end; }
+.icon-row .stButton { margin:0 !important; padding:0 !important; }
+.icon-row .stButton > button {
   font-size:14px !important; line-height:1 !important; cursor:pointer; user-select:none;
   color: var(--text-muted) !important;
   padding:0 !important; margin:0 !important; border:none !important; background:transparent !important;
+  min-width:auto !important; height:auto !important; width:auto !important;
   display:inline-flex !important; align-items:center !important; justify-content:center !important;
   transform: translateY(0); transition: transform .08s ease, color .08s ease;
-  min-width:auto !important; height:auto !important;
 }
-.ic-bar .stButton > button:hover { color: var(--text-strong) !important; transform: translateY(-1px); }
-.ic-bar .stButton > button:focus { outline: 2px solid #93c5fd !important; outline-offset: 2px !important; border-radius:6px !important; }
-</style>
-""", unsafe_allow_html=True)
+.icon-row .stButton > button:hover { color: var(--text-strong) !important; transform: translateY(-1px); }
+.icon-row .stButton > button:focus { outline: 2px solid #93c5fd !important; outline-offset: 2px !important; border-radius:6px !important; }
 
-# Extra theme-safe overrides for legibility
-st.markdown("""
-<style>
+/* Extra theme-safe overrides for legibility */
 :root {
   --aa-text-strong: #0b1220;
   --aa-text-muted:  #475569;
@@ -145,7 +139,10 @@ html[data-theme="dark"], .stApp [data-theme="dark"] {
   --aa-chip-active-bg:  #064e3b; --aa-chip-active-fg:#a7f3d0;
   --aa-chip-inactive-bg: #7f1d1d; --aa-chip-inactive-fg:#fecaca;
 }
-.client-name { color: var(--aa-text-strong) !important; }
+@media (prefers-color-scheme: dark) {
+  :root { --aa-text-strong: #f8fafc; --aa-text-muted: #cbd5e1; }
+}
+.client-status { color: var(--aa-text-strong) !important; font-size:11px !important; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -744,6 +741,11 @@ def _supabase_available():
 
 @st.cache_data(ttl=300, show_spinner=False)
 def get_already_sent_maps(client_tag: str):
+    """
+    Returns:
+      canon_set, zpid_set, canon_info, zpid_info
+    where *_info map -> {"sent_at": "...", "url": "..."} for tooltip context.
+    """
     if not (_supabase_available() and client_tag.strip()):
         return set(), set(), {}, {}
     try:
@@ -1266,6 +1268,10 @@ with tab_run:
 # ---------- Sent reports ----------
 @st.cache_data(ttl=120, show_spinner=False)
 def fetch_sent_for_client(client_norm: str, limit: int = 5000):
+    """
+    Fetch sent rows for a given normalized client name from Supabase.
+    Returns list of dicts: [{url, address, sent_at, campaign, mls_id, canonical, zpid}, ...]
+    """
     if not (_supabase_available() and client_norm.strip()):
         return []
     try:
@@ -1281,8 +1287,10 @@ def fetch_sent_for_client(client_norm: str, limit: int = 5000):
         return []
 
 def _render_client_report_view(client_display_name: str, client_norm: str):
+    """Render a report: address as hyperlink → Zillow, with Campaign filter and Search box."""
     st.markdown(f"### Report for {escape(client_display_name)}", unsafe_allow_html=True)
 
+    # Close report button
     colX, _ = st.columns([1,3])
     with colX:
         if st.button("Close report", key=f"__close_report_{client_norm}"):
@@ -1363,46 +1371,58 @@ def _render_client_report_view(client_display_name: str, client_norm: str):
             use_container_width=False
         )
 
-# ---------- Client rows (native Streamlit; no iframes) ----------
+# ---------- Smooth-scroll helper ----------
+def _scroll_to(element_id: str):
+    components.html(
+        f"""
+        <script>
+          const el = parent.document.getElementById("{element_id}");
+          if (el) {{
+            el.scrollIntoView({{behavior: "smooth", block: "start"}});
+          }}
+        </script>
+        """,
+        height=0,
+    )
+
+# ---------- Client row (native Streamlit buttons; same styling; name always white) ----------
 def _client_row_native(name: str, norm: str, cid: int, active: bool):
+    """
+    Renders a single client row with inline icon buttons using native Streamlit widgets,
+    so clicks work reliably. Name is always white via CSS above.
+    """
     status = "active" if active else "inactive"
     toggle_label = "Deactivate" if active else "Activate"
 
     with st.container():
-        # whole row wrapper
-        st.markdown('<div class="client-row">', unsafe_allow_html=True)
-        # two columns: left = name + pill, right = icons
-        col_left, col_right = st.columns([0.7, 0.3], vertical_alignment="center")
+        # Layout: left = name + pill, right = 4 icon buttons side-by-side
+        col_left, col_right = st.columns([0.72, 0.28], vertical_alignment="center")
 
         with col_left:
-            # render name & pill inline using your classes
             st.markdown(
-                f"""<div class="client-row-inner">
-                        <div class="client-left">
-                            <span class="client-name">{escape(name)}</span>
-                            <span class="pill {status}">{status}</span>
-                        </div>
-                    </div>""",
+                f"""
+                <div style="display:flex;align-items:center;gap:10px;">
+                    <span class="client-name">{escape(name)}</span>
+                    <span class="pill {status}">{status}</span>
+                </div>
+                """,
                 unsafe_allow_html=True
             )
 
         with col_right:
-            # icon buttons side-by-side
-            st.markdown('<div class="ic-bar">', unsafe_allow_html=True)
-            c1, c2, c3, c4 = st.columns([1,1,1,1], vertical_alignment="center")
-            with c1:
+            cc1, cc2, cc3, cc4 = st.columns(4)
+            with cc1:
                 b_report = st.button("▦", key=f"rep_{cid}", help="Open report")
-            with c2:
+            with cc2:
                 b_rename = st.button("✎", key=f"ren_{cid}", help="Rename")
-            with c3:
+            with cc3:
                 b_toggle = st.button("⟳", key=f"tog_{cid}", help=toggle_label)
-            with c4:
+            with cc4:
                 b_delete = st.button("⌫", key=f"del_{cid}", help="Delete")
-            st.markdown('</div>', unsafe_allow_html=True)
+            # scope the icon styling to this button row (purely cosmetic)
+            st.markdown('<div class="icon-row"></div>', unsafe_allow_html=True)
 
-        st.markdown('</div>', unsafe_allow_html=True)  # /client-row
-
-    # Actions
+    # Actions (using server-side functions; then rerun)
     if b_report:
         _qp_set(report=norm, scroll="1")
         _safe_rerun()
@@ -1410,7 +1430,7 @@ def _client_row_native(name: str, norm: str, cid: int, active: bool):
     if b_toggle:
         rows = SUPABASE.table("clients").select("active").eq("id", cid).limit(1).execute().data or []
         cur = rows[0]["active"] if rows else active
-        toggle_client_active(cid, (not cur))
+        toggle_client_active(cid, not cur)
         _safe_rerun()
 
     if b_rename:
@@ -1418,7 +1438,7 @@ def _client_row_native(name: str, norm: str, cid: int, active: bool):
 
     if st.session_state.get(f"__rename_open_{cid}"):
         new_val = st.text_input("New name", value=name, key=f"__rename_val_{cid}")
-        csa, csb = st.columns([1,1])
+        csa, csb = st.columns(2)
         with csa:
             if st.button("Save", key=f"__rename_save_{cid}"):
                 ok, msg = rename_client(cid, new_val)
@@ -1438,27 +1458,11 @@ def _client_row_native(name: str, norm: str, cid: int, active: bool):
             st.session_state[f"__confirm_del_{cid}"] = True
         else:
             ok, msg = delete_client(cid)
+            st.session_state.pop(f"__confirm_del_{cid}", None)
             if ok:
-                st.session_state.pop(f"__confirm_del_{cid}", None)
                 _safe_rerun()
             else:
                 st.error(msg)
-                st.session_state.pop(f"__confirm_del_{cid}", None)
-
-
-# ---------- Smooth-scroll helper ----------
-def _scroll_to(element_id: str):
-    components.html(
-        f"""
-        <script>
-          const el = parent.document.getElementById("{element_id}");
-          if (el) {{
-            el.scrollIntoView({{behavior: "smooth", block: "start"}});
-          }}
-        </script>
-        """,
-        height=0,
-    )
 
 # ---------- CLIENTS TAB ----------
 with tab_clients:
