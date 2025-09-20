@@ -60,6 +60,10 @@ def _safe_rerun():
         try: st.experimental_rerun()
         except Exception: pass
 
+# >>> Keep app on the Tours tab after actions that trigger a rerun
+def _stay_on_tours():
+    st.session_state["__active_tab__"] = "Tours"
+
 def _norm_tag(s: str) -> str:
     return re.sub(r"\s+", " ", (s or "").strip()).lower()
 
@@ -164,7 +168,7 @@ def _status_in_window(txt: str) -> str:
     u = (txt or "").upper()
     if "CANCELLED" in u or "CANCELED" in u: return "canceled"
     if "CONFIRMED" in u: return "confirmed"
-    return ""  # will be normalized to 'scheduled' later if empty
+    return ""  # will be normalized later if empty
 
 # ---------- Parse core ----------
 def _parse_tour_text(txt: str) -> Dict[str, Any]:
@@ -324,7 +328,7 @@ def _build_repeat_map(client_norm: str) -> Dict[tuple, int]:
     ids = [t["id"] for t in tours]
     if not ids: return {}
     sq = SUPABASE.table("tour_stops").select("tour_id,address_slug").in_("tour_id", ids).limit(50000).execute()
-    stops = sq.data or []  # <- ensure list
+    stops = sq.data or []  # ensure list
     t2s: Dict[int, List[str]] = {}
     for s in stops:
         t2s.setdefault(s["tour_id"], []).append(s["address_slug"])
@@ -391,6 +395,7 @@ def render_tours_tab(state: dict):
     if do_clear:
         _set_parsed({})
         st.success("Cleared.")
+        _stay_on_tours()
         _safe_rerun()
 
     if do_parse:
@@ -401,6 +406,7 @@ def render_tours_tab(state: dict):
             if not parsed.get("stops"):
                 st.warning("No stops found. Double-check that this is a ShowingTime tour Print page or the exported Tour PDF.")
             _set_parsed(parsed)
+            _stay_on_tours()
             _safe_rerun()
 
     parsed = _get_parsed()
@@ -502,6 +508,8 @@ def render_tours_tab(state: dict):
                     if also_mark_sent and chosen_norm:
                         _insert_sent_for_stops(chosen_norm, stops, tdate_obj)
                     st.success(f"Added {n} stop(s) to {client_display} for {tdate_obj}.")
+                    _stay_on_tours()
+                    _safe_rerun()
                 except Exception as e:
                     st.error(f"Could not add stops. {e}")
 
