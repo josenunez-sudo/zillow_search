@@ -49,7 +49,6 @@ def _address_to_deeplink(addr: str) -> str:
     return f"https://www.zillow.com/homes/{_slug_addr(addr)}_rb/"
 
 def _canonicalize_zillow(url: str) -> Tuple[str, Optional[str]]:
-    """Returns (canonical_url, zpid_if_any). Works for /homes/ and /homedetails/."""
     if not url:
         return "", None
     base = re.sub(r"[?#].*$", "", url.strip())
@@ -93,8 +92,18 @@ def fetch_clients():
         return []
 
 # ========= Parsing (robust, no raw logs displayed) =========
+# Stricter street-type list to avoid matching junk like "00 Beds ..."
+_STREET_TYPES = r"(?:St|Street|Ave|Avenue|Dr|Drive|Ln|Lane|Rd|Road|Blvd|Boulevard|Ct|Court|Pl|Place|Ter|Terrace|Way|Cir|Circle|Pkwy|Parkway|Hwy|Highway)"
+# Capture groups: 1=street part, 2=city, 3=state, 4=zip
+_ADDR_RE = re.compile(
+    rf"\b("                                   # 1: full street part
+    r"\d{{1,6}}\s+[A-Za-z0-9.\-']+(?:\s+[A-Za-z0-9.\-']+)*\s+{_STREET_TYPES}"  # 123 N Main St
+    r"(?:\s+[A-Za-z0-9.\-']+)?"               # optional extra like 'NW' or 'Unit'
+    r")\s*,\s*([A-Za-z .'\-]+)\s*,\s*([A-Z]{{2}})\s*(\d{{5}}(?:-\d{{4}})?)\b",
+    re.I
+)
+
 _TIME_RE = re.compile(r'(\d{1,2}:\d{2}\s*(?:AM|PM))\s*[-–]\s*(\d{1,2}:\d{2}\s*(?:AM|PM))', re.I)
-_ADDR_RE = re.compile(r'\b\d{1,6}\s+[^\n,]+,\s+[A-Za-z .\'-]+,\s*[A-Z]{2}\s*\d{5}\b')
 _DATE_HEADER_RE = re.compile(r'(?:Buyer|Agent)[^\n]{0,80}Tour\s*-\s*[A-Za-z]+,\s*([A-Za-z]+)\s*(\d{1,2}),\s*(\d{4})', re.I)
 _GENERIC_DATE_RE = re.compile(r'([A-Za-z]+)\s+(\d{1,2}),\s*(\d{4})')
 
@@ -144,8 +153,7 @@ def _parse_tour_text(txt: str) -> Dict[str, Any]:
             mon, day, year = m2.group(1), int(m2.group(2)), int(m2.group(3))
             tdate = date(int(year), _month_to_num(mon), int(day))
 
-    # Gather times near addresses
-    addr_iter = list(_ADDR_RE.finditer(txt))
+    # Times (we’ll assign nearest time window after the address)
     time_iter = list(_TIME_RE.finditer(txt))
     times_by_pos: List[Tuple[int, Tuple[str,str]]] = []
     for tm in time_iter:
@@ -168,18 +176,24 @@ def _parse_tour_text(txt: str) -> Dict[str, Any]:
         return ""
 
     stops: List[Dict[str, Any]] = []
-    for am in addr_iter:
-        addr = am.group(0).strip()
+    for am in _ADDR_RE.finditer(txt):
+        # Rebuild the clean address strictly from capture groups
+        street = am.group(1).strip()
+        city   = am.group(2).strip()
+        state  = am.group(3).strip()
+        zipc   = am.group(4).strip()
+        addr_clean = f"{street}, {city}, {state} {zipc}"
+
         t1, t2 = nearest_time(am.start())
         stat = status_around(am.start(), am.end())
         starts = t1.replace("AM", " AM").replace("PM", " PM").strip()
         ends   = t2.replace("AM", " AM").replace("PM", " PM").strip()
         stops.append({
-            "address": addr,
+            "address": addr_clean,
             "start": starts,
             "end": ends,
-            "deeplink": _address_to_deeplink(addr),
-            "status": stat  # tag only; we *never* render any raw detailed text
+            "deeplink": _address_to_deeplink(addr_clean),
+            "status": stat  # tag only (no verbose lines)
         })
 
     return {
@@ -222,7 +236,7 @@ def _create_or_get_tour(client_norm: str, client_display: str, tour_url: Optiona
         "client_display": client_display,
         "url": (tour_url or None),
         "tour_date": tour_date.isoformat(),
-        "status": "imported",  # use an allowed status per your constraint
+        "status": "imported",
     }).execute()
     if not ins.data:
         raise RuntimeError("Create tour failed.")
@@ -246,6 +260,7 @@ def _insert_stops(tour_id: int, stops: List[Dict[str, Any]]) -> int:
             "start": (s.get("start") or None),
             "end":   (s.get("end") or None),
             "deeplink": (s.get("deeplink") or _address_to_deeplink(addr)),
+            "status": (s.get("status") or None),
         })
         seen.add(slug)
     if not rows:
@@ -282,7 +297,6 @@ def _insert_sent_for_stops(client_norm: str, stops: List[Dict[str, Any]], tour_d
         ins = SUPABASE.table("sent").insert(rows).execute()
         return len(ins.data or [])
     except Exception:
-        # swallow errors to avoid user-visible log spam
         return 0
 
 def _build_repeat_map(client_norm: str) -> Dict[tuple, int]:
@@ -315,7 +329,6 @@ def _set_parsed(payload: Dict[str, Any]):
 
 # ========= Small HTML helpers =========
 def _date_badge_html(d: str) -> str:
-    # High-contrast inline style so it always shows
     return (
         "<span style='display:inline-block;padding:2px 10px;border-radius:9999px;"
         "background:#1d4ed8;color:#fff;font-weight:800;border:1px solid rgba(0,0,0,.15);'>"
@@ -324,14 +337,18 @@ def _date_badge_html(d: str) -> str:
 
 def _status_tag_html(stat_upper: str) -> str:
     if stat_upper == "CONFIRMED":
-        return "<span style='margin-left:.4rem;padding:2px 8px;border-radius:9999px;font-size:11px;font-weight:800;background:#166534;color:#ecfdf5;border:1px solid #16a34a;'>Confirmed</span>"
+        return "<span style='padding:2px 8px;border-radius:9999px;font-size:11px;font-weight:800;background:#166534;color:#ecfdf5;border:1px solid #16a34a;white-space:nowrap;'>Confirmed</span>"
     if stat_upper in ("CANCELED","CANCELLED"):
-        return "<span style='margin-left:.4rem;padding:2px 8px;border-radius:9999px;font-size:11px;font-weight:800;background:#7f1d1d;color:#fee2e2;border:1px solid #ef4444;'>Canceled</span>"
+        return "<span style='padding:2px 8px;border-radius:9999px;font-size:11px;font-weight:800;background:#7f1d1d;color:#fee2e2;border:1px solid #ef4444;white-space:nowrap;'>Canceled</span>"
     return ""
+
+def _time_badge_html(when: str) -> str:
+    if not when: return ""
+    return "<span style='padding:2px 8px;border-radius:9999px;font-size:11px;font-weight:800;background:#0ea5e9;color:#ffffff;border:1px solid rgba(0,0,0,.15);white-space:nowrap;'>" + escape(when) + "</span>"
 
 def _repeat_tag_html(n: int) -> str:
     if n >= 2:
-        return "<span style='margin-left:.4rem;padding:2px 8px;border-radius:9999px;font-size:11px;font-weight:800;background:#92400e;color:#fff7ed;border:1px solid #f59e0b;'>2nd+ showing</span>"
+        return "<span style='padding:2px 8px;border-radius:9999px;font-size:11px;font-weight:800;background:#92400e;color:#fff7ed;border:1px solid #f59e0b;white-space:nowrap;'>2nd+ showing</span>"
     return ""
 
 # ========= Renderer =========
@@ -388,14 +405,24 @@ def render_tours_tab(state: dict):
                 end   = (s.get("end") or "").strip()
                 when  = f"{start}–{end}" if (start and end) else (start or end or "")
                 stat  = (s.get("status") or "").upper()
+
+                right_badges = []
+                if stat:
+                    right_badges.append(_status_tag_html(stat))
+                if when:
+                    right_badges.append(_time_badge_html(when))
+
                 lis.append(
-                    "<li>"
-                    + (f"<span style='font-weight:800;margin-right:.35rem;'>{escape(when)}</span> " if when else "")
+                    "<li style='display:flex;justify-content:space-between;align-items:center;gap:12px;padding:6px 0;border-bottom:1px solid var(--row-border);'>"
+                    + "<div style='min-width:0;'>"
                     + f"<a href='{escape(href)}' target='_blank' rel='noopener'>{escape(addr)}</a>"
-                    + _status_tag_html(stat)
+                    + "</div>"
+                    + "<div style='flex:0 0 auto;display:flex;align-items:center;gap:8px;'>"
+                    + "".join(right_badges)
+                    + "</div>"
                     + "</li>"
                 )
-            st.markdown("<ul style='margin:.25rem 0 .5rem 1.2rem;padding:0;'>" + "\n".join(lis) + "</ul>", unsafe_allow_html=True)
+            st.markdown("<ul style='margin:.25rem 0 .5rem 0;padding:0;list-style:none;'>" + "\n".join(lis) + "</ul>", unsafe_allow_html=True)
         else:
             st.info("No stops to preview.")
 
@@ -435,7 +462,7 @@ def render_tours_tab(state: dict):
         )
         chosen_norm = add_norms[idx_add]
 
-        # 3) Also mark as "toured" in Sent (so client/run views can tag toured)
+        # 3) Also mark as "toured" in Sent
         also_mark_sent = st.checkbox("Also mark these stops as “toured” in Sent", value=True)
 
         colAA, colBB = st.columns([0.35, 0.65])
@@ -444,8 +471,8 @@ def render_tours_tab(state: dict):
             add_clicked = st.button("Add all stops", use_container_width=True, disabled=not can_add)
             if add_clicked:
                 try:
-                    # Create/attach to the display client's tour (owner)
                     tdate_obj = datetime.fromisoformat(tdate).date() if tdate else date.today()
+                    # Create/attach tour under display client
                     tour_id = _create_or_get_tour(
                         client_norm=client_display_norm,
                         client_display=client_display,
@@ -453,7 +480,7 @@ def render_tours_tab(state: dict):
                         tour_date=tdate_obj
                     )
                     n = _insert_stops(tour_id, stops)
-                    # Optional: also log to sent (for toured indicator)
+                    # Optional: also log to sent for chosen client
                     if also_mark_sent and chosen_norm:
                         _insert_sent_for_stops(chosen_norm, stops, tdate_obj)
                     st.success(f"Added {n} stop(s) to {client_display} for {tdate_obj}.")
@@ -507,7 +534,7 @@ def _render_client_tours_report(client_display: str, client_norm: str):
     for t in tours:
         td = t["tour_date"]
         st.markdown(f"#### {escape(client_display)} {_date_badge_html(td)}", unsafe_allow_html=True)
-        sq = SUPABASE.table("tour_stops").select("address,address_slug,start,end,deeplink").eq("tour_id", t["id"]).order("start", desc=False).limit(500).execute()
+        sq = SUPABASE.table("tour_stops").select("address,address_slug,start,end,deeplink,status").eq("tour_id", t["id"]).order("start", desc=False).limit(500).execute()
         stops = sq.data or []
         if not stops:
             st.caption("_(No stops logged for this date.)_")
@@ -522,11 +549,24 @@ def _render_client_tours_report(client_display: str, client_norm: str):
             end   = (s.get("end") or "").strip()
             when  = f"{start}–{end}" if (start and end) else (start or end or "")
             visit = repeat_map.get((slug, td), 1)
+            stat  = (s.get("status") or "").upper()
+
+            right_badges = []
+            if stat:
+                right_badges.append(_status_tag_html(stat))
+            if when:
+                right_badges.append(_time_badge_html(when))
+            rep_tag = _repeat_tag_html(visit)
+
             items.append(
-                "<li>"
-                + (f"<span style='font-weight:800;margin-right:.35rem;'>{escape(when)}</span> " if when else "")
+                "<li style='display:flex;justify-content:space-between;align-items:center;gap:12px;padding:6px 0;border-bottom:1px solid var(--row-border);'>"
+                + "<div style='min-width:0;'>"
                 + f"<a href='{escape(href)}' target='_blank' rel='noopener'>{escape(addr)}</a>"
-                + _repeat_tag_html(visit)
+                + (rep_tag if rep_tag else "")
+                + "</div>"
+                + "<div style='flex:0 0 auto;display:flex;align-items:center;gap:8px;'>"
+                + "".join(right_badges)
+                + "</div>"
                 + "</li>"
             )
-        st.markdown("<ul style='margin:.25rem 0 .5rem 1.2rem;padding:0;'>" + "\n".join(items) + "</ul>", unsafe_allow_html=True)
+        st.markdown("<ul style='margin:.25rem 0 .5rem 0;padding:0;list-style:none;'>" + "\n".join(items) + "</ul>", unsafe_allow_html=True)
