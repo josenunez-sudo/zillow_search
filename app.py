@@ -40,30 +40,39 @@ if "__active_tab__" not in st.session_state:
     st.session_state["__active_tab__"] = "Run"
 
 with tab_run:
-    # Do NOT set __active_tab__ here; actions in the Run tab can set it just-in-time if they rerun
+    # Do NOT set __active_tab__ here; each tab sets it right before actions that rerun.
     render_run_tab(state=st.session_state)
 
 with tab_clients:
-    # Do NOT set __active_tab__ here; Clients tab actions will set it just before st.rerun()
     render_clients_tab()
 
 with tab_tours:
-    # Tours tab already sets __active_tab__ = "Tours" before calling st.rerun() in its actions
     render_tours_tab(state=st.session_state)
 
-# Re-select the remembered tab after reruns while keeping visible order fixed
+# Re-select the remembered tab after reruns while keeping visible order fixed.
+# Hide the tab bar until the correct tab is selected to prevent visible flicker.
 wanted = st.session_state.get("__active_tab__", "Run")
 st.components.v1.html(
     """
+    <style>
+      /* hide tab bar until selection applied */
+      :root #tabs-ready-flag { display:none }
+      ._aa_tabbar_mask { visibility:hidden }
+    </style>
     <script>
     (function() {
       const wanted = %s;
       let tries = 0;
       function pick() {
         const doc = window.parent.document;
+        // First time: wrap the tablist in a mask so it's hidden until we click the right tab.
+        const tablists = doc.querySelectorAll('[role="tablist"]');
+        if (tablists && tablists.length) {
+          for (const tl of tablists) { tl.classList.add('_aa_tabbar_mask'); }
+        }
         const btns = doc.querySelectorAll('button[role="tab"]');
         if (!btns || !btns.length) {
-          if (tries++ < 60) setTimeout(pick, 50);
+          if (tries++ < 80) setTimeout(pick, 25);
           return;
         }
         for (const b of btns) {
@@ -74,7 +83,13 @@ st.components.v1.html(
             break;
           }
         }
+        // Unhide the tab bar after selection applied (small delay to allow click to take effect)
+        setTimeout(function(){
+          const tablists2 = doc.querySelectorAll('[role="tablist"]');
+          for (const tl of tablists2) { tl.classList.remove('_aa_tabbar_mask'); }
+        }, 0);
       }
+      // run asap
       setTimeout(pick, 0);
     })();
     </script>
