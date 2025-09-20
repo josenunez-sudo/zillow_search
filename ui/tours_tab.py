@@ -1,6 +1,7 @@
 # ui/tours_tab.py
 # Tours tab: Parse ShowingTime Print URL or Tour PDF → preview → save to Supabase
-# Also logs to 'sent' so Clients can show "TOURED".
+# Also logs to 'sent' (silently) so Clients can tag as TOURED.
+
 import os, re, io
 from datetime import datetime, date
 from typing import Dict, Any, List, Optional, Tuple
@@ -11,9 +12,9 @@ import requests
 
 # Optional: PDF parsing
 try:
-    import PyPDF2  # pip install PyPDF2
+    import PyPDF2  # make sure it's in requirements.txt
 except Exception:
-    PyPDF2 = None  # We'll show a helpful error if PDF upload is used
+    PyPDF2 = None
 
 # ---------- Supabase ----------
 from supabase import create_client, Client
@@ -31,7 +32,7 @@ def get_supabase() -> Optional[Client]:
 
 SUPABASE = get_supabase()
 
-# ---------- Secrets/env ----------
+# ---------- HTTP ----------
 REQUEST_TIMEOUT = 12
 UA_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36",
@@ -51,13 +52,11 @@ def _slug(s: str) -> str:
     return s.strip("-")
 
 def _address_slug(addr: str) -> str:
-    # Conservative: keep digits + letters; squash whitespace; hyphenate
     a = re.sub(r"[^\w\s,-/#]", "", (addr or "").lower())
     a = re.sub(r"\s+", " ", a).strip()
     return _slug(a)
 
 def _zillow_deeplink_from_full_address(addr: str) -> str:
-    # Build a simple Zillow "homes" deeplink that unfurls nicely
     core = re.sub(r"[,]+", "", (addr or "")).strip()
     slug = _slug(core)
     return f"https://www.zillow.com/homes/{slug}_rb/"
@@ -74,11 +73,17 @@ def _safe_rerun():
 # ---------- Clients ----------
 @st.cache_data(ttl=60, show_spinner=False)
 def fetch_clients(include_inactive: bool = True) -> List[Dict[str, Any]]:
+    """
+    Load clients and HIDE any whose normalized name equals 'test test'.
+    """
     if not SUPABASE:
         return []
     try:
         rows = SUPABASE.table("clients").select("id,name,name_norm,active")\
             .order("name", desc=False).execute().data or []
+        # Hide "test test"
+        hide_norm = _norm_tag("test test")
+        rows = [r for r in rows if _norm_tag(r.get("name_norm","")) != hide_norm]
         return rows if include_inactive else [r for r in rows if r.get("active")]
     except Exception:
         return []
@@ -86,22 +91,40 @@ def fetch_clients(include_inactive: bool = True) -> List[Dict[str, Any]]:
 # ---------- DB write helpers ----------
 def create_tour(*, client_norm: str, client_display: str, tour_date: date,
                 source_url: str = "", buyer: Optional[str] = None) -> Tuple[bool, Any]:
+    """
+    Insert into 'tours' and return (True, id). Compatible with older supabase-py
+    that doesn't support .select() after .insert().
+    """
     if not SUPABASE:
         return False, "Supabase not configured."
     try:
+        now_iso = datetime.utcnow().isoformat(timespec="seconds") + "Z"
         payload = {
             "client": client_norm,
             "client_display": client_display,
             "tour_date": tour_date.isoformat(),
-            "url": source_url or "",  # keep not-null if your DB requires it
+            # Keep NOT NULL url satisfied; fall back to 'manual' if empty:
+            "url": (source_url or "manual"),
             "buyer": buyer or None,
             "status": "requested",
+            "created_at": now_iso,  # helps us refetch if needed
         }
-        res = SUPABASE.table("tours").insert(payload).select("id").execute()
-        tid = (res.data or [{}])[0].get("id")
-        if not tid:
-            return False, "Insert returned no id."
-        return True, tid
+        res = SUPABASE.table("tours").insert(payload).execute()
+        data = getattr(res, "data", None) or []
+        if isinstance(data, list) and data and isinstance(data[0], dict) and "id" in data[0]:
+            return True, data[0]["id"]
+        # Fallback: query most recent matching record
+        q = SUPABASE.table("tours").select("id")\
+            .eq("client", client_norm)\
+            .eq("client_display", client_display)\
+            .eq("tour_date", tour_date.isoformat())\
+            .order("created_at", desc=True)\
+            .limit(1)\
+            .execute()
+        qd = getattr(q, "data", None) or []
+        if qd and "id" in qd[0]:
+            return True, qd[0]["id"]
+        return False, "Insert ok but could not retrieve tour id."
     except Exception as e:
         return False, str(getattr(e, "args", [e])[0])
 
@@ -126,10 +149,13 @@ def insert_tour_stops(*, tour_id: int, stops: List[Dict[str, Any]]) -> Tuple[boo
     except Exception as e:
         return False, str(getattr(e, "args", [e])[0])
 
-def log_sent_for_stops(*, client_norm: str, stops: List[Dict[str, Any]], tour_date: date) -> Tuple[bool, str]:
-    """Also log each stop into 'sent' so the Clients tab can tag as TOURED."""
+def log_sent_for_stops_silent(*, client_norm: str, stops: List[Dict[str, Any]], tour_date: date) -> None:
+    """
+    Silently log each stop into 'sent' so the Clients tab can tag as TOURED.
+    No UI messages are shown.
+    """
     if not SUPABASE:
-        return False, "Supabase not configured."
+        return
     try:
         now_iso = datetime.utcnow().isoformat(timespec="seconds") + "Z"
         rows = []
@@ -143,19 +169,14 @@ def log_sent_for_stops(*, client_norm: str, stops: List[Dict[str, Any]], tour_da
                 "mls_id": None,
                 "address": s.get("address") or "",
                 "sent_at": now_iso,
-                # (Optional) If you added these columns:
-                # "toured": True,
-                # "toured_at": tour_date.isoformat(),
             })
         if rows:
             SUPABASE.table("sent").insert(rows).execute()
-        return True, "ok"
-    except Exception as e:
-        return False, str(getattr(e, "args", [e])[0])
+    except Exception:
+        pass  # silent
 
 # ---------- Parsing ----------
 DATE_PATTERNS = [
-    # e.g. "Buyer's Tour - Monday, September 22, 2025"
     r"Buyer['’]s\s+Tour\s*-\s*([A-Za-z]+,\s+[A-Za-z]+\s+\d{1,2},\s+\d{4})",
     r"Tour\s+Date\s*[:\-]\s*([A-Za-z]+,\s+[A-Za-z]+\s+\d{1,2},\s+\d{4})",
 ]
@@ -163,7 +184,6 @@ TIME_RANGE_RE = re.compile(
     r"(\d{1,2}:\d{2}\s?(?:AM|PM))\s*-\s*(\d{1,2}:\d{2}\s?(?:AM|PM))",
     re.I
 )
-# Loose address line (number + street, city, ST, ZIP)
 ADDR_LINE_RE = re.compile(
     r"(\d{1,6}\s+[^\n,]+?,\s*[A-Za-z .'\-]+?,\s*[A-Z]{2}\s*\d{5})",
     re.I
@@ -185,25 +205,19 @@ def _parse_buyer_from_text(text: str) -> Optional[str]:
     m = re.search(r"Buyer['’]s\s+name\s*:\s*([^\n\r]+)", text, re.I)
     if m:
         return m.group(1).strip()
-    # sometimes "Buyer's Tour - ... <Buyer Name> 9 Stops"
     m2 = re.search(r"Buyer['’]s\s+Tour.*?\b([A-Z][A-Za-z]+(?:\s+[A-Z][A-Za-z]+)+)\b.*?\d+\s+Stops", text, re.I | re.S)
     if m2:
         return m2.group(1).strip()
     return None
 
 def _parse_stops_from_text(text: str) -> List[Dict[str, str]]:
-    """
-    Look for address lines and the nearest following time range.
-    """
     stops: List[Dict[str, str]] = []
     for m in ADDR_LINE_RE.finditer(text):
         addr = re.sub(r"\s+", " ", m.group(1)).strip()
-        # look ahead up to ~300 chars for a time range
-        tail = text[m.end(): m.end() + 400]
+        tail = text[m.end(): m.end() + 500]
         mt = TIME_RANGE_RE.search(tail)
         if not mt:
-            # Sometimes the time is before the address (rare). Look behind a bit.
-            head = text[max(0, m.start()-200): m.start()]
+            head = text[max(0, m.start()-250): m.start()]
             mt = TIME_RANGE_RE.search(head)
         if mt:
             start, end = mt.group(1).strip(), mt.group(2).strip()
@@ -216,12 +230,12 @@ def _parse_stops_from_text(text: str) -> List[Dict[str, str]]:
             "address_slug": _address_slug(addr),
             "deeplink": _zillow_deeplink_from_full_address(addr),
         })
-    # de-dup preserving order
+    # De-dup preserving order
     seen = set()
     uniq: List[Dict[str, str]] = []
     for s in stops:
         k = (s["address"], s["start"], s["end"])
-        if k in seen: 
+        if k in seen:
             continue
         seen.add(k)
         uniq.append(s)
@@ -235,7 +249,6 @@ def parse_from_print_url(url: str) -> Tuple[Optional[date], Optional[str], List[
         if not r.ok:
             return None, None, [], f"Fetch failed: {r.status_code}"
         html = r.text
-        # Make it plain-ish text for regexes
         text = re.sub(r"<[^>]+>", " ", html)
         text = re.sub(r"\s+", " ", text)
         d = _parse_date_from_text(text)
@@ -260,7 +273,6 @@ def parse_from_pdf(uploaded_file) -> Tuple[Optional[date], Optional[str], List[D
             except Exception:
                 pass
         text = "\n".join(raw)
-        # Normalize whitespace
         text = re.sub(r"[ \t]+", " ", text)
         d = _parse_date_from_text(text)
         buyer = _parse_buyer_from_text(text)
@@ -271,7 +283,7 @@ def parse_from_pdf(uploaded_file) -> Tuple[Optional[date], Optional[str], List[D
     except Exception as e:
         return None, None, [], f"PDF parse error: {e}"
 
-# ---------- UI (stateful) ----------
+# ---------- UI state ----------
 STATE_KEY = "__tour_parse__"
 
 def _set_parsed(payload: Dict[str, Any]):
@@ -280,30 +292,17 @@ def _set_parsed(payload: Dict[str, Any]):
 def _get_parsed() -> Dict[str, Any]:
     return st.session_state.get(STATE_KEY, {})
 
+# ---------- Main renderer ----------
 def render_tours_tab(state: dict):
-    # Styles (high-contrast pills like Run/Clients)
-    st.markdown("""
-    <style>
-      .tour-card { 
-        padding: 8px 10px; border:1px solid rgba(0,0,0,.08); border-radius:10px; 
-        margin: 6px 0; display:flex; align-items:center; justify-content:space-between; gap:8px;
-      }
-      .tour-pill {
-        font-size: 12px; font-weight: 800; padding: 2px 8px; border-radius: 999px;
-        background: linear-gradient(180deg, #0ea5e9 0%, #0284c7 100%); color: #fff;
-        white-space: nowrap;
-      }
-      html[data-theme="dark"] .tour-pill { 
-        background: linear-gradient(180deg, #075985 0%, #0ea5e9 100%); color: #e2f3ff;
-      }
-    </style>
-    """, unsafe_allow_html=True)
-
     st.subheader("Import Tours")
+    st.caption("Paste a ShowingTime Print URL or upload its Tour PDF, preview, then add all included stops.")
+
     col_u, col_p = st.columns([1.3, 1])
     with col_u:
-        print_url = st.text_input("ShowingTime Print URL",
-                                  placeholder="https://scheduling.showingtime.com/(S(...))/Tour/Print/30235965")
+        print_url = st.text_input(
+            "ShowingTime Print URL",
+            placeholder="https://scheduling.showingtime.com/(S(...))/Tour/Print/30235965"
+        )
     with col_p:
         pdf_file = st.file_uploader("or upload Tour PDF", type=["pdf"])
 
@@ -345,8 +344,25 @@ def render_tours_tab(state: dict):
             if parsed.get("date"):  subtitle.append(parsed["date"])
             st.success(f"Parsed {len(stops)} stop(s)" + ((" • " + " • ".join(subtitle)) if subtitle else ""))
 
-    # If we have a parsed tour in state, show preview with persistent flags
+    # Preview section
     if parsed.get("stops"):
+        st.markdown("""
+        <style>
+          .tour-card { 
+            padding: 8px 10px; border:1px solid rgba(0,0,0,.08); border-radius:10px; 
+            margin: 6px 0; display:flex; align-items:center; justify-content:space-between; gap:8px;
+          }
+          .tour-pill {
+            font-size: 12px; font-weight: 800; padding: 2px 8px; border-radius: 999px;
+            background: linear-gradient(180deg, #0ea5e9 0%, #0284c7 100%); color: #fff;
+            white-space: nowrap;
+          }
+          html[data-theme="dark"] .tour-pill { 
+            background: linear-gradient(180deg, #075985 0%, #0ea5e9 100%); color: #e2f3ff;
+          }
+        </style>
+        """, unsafe_allow_html=True)
+
         st.markdown("#### Preview")
         new_flags = []
         for i, s in enumerate(parsed["stops"]):
@@ -369,7 +385,7 @@ def render_tours_tab(state: dict):
         parsed["flags"] = new_flags
         _set_parsed(parsed)
 
-        # Client picker (sentinel LAST as requested)
+        # Client picker (No client sentinel LAST, per your preference)
         clients = fetch_clients(include_inactive=True)
         names = [c["name"] for c in clients]
         name_to_norm = {c["name"]: c.get("name_norm","") for c in clients}
@@ -419,9 +435,7 @@ def render_tours_tab(state: dict):
                 st.error(f"Insert stops failed: {msg_s}")
                 st.stop()
 
-            ok_l, msg_l = log_sent_for_stops(client_norm=client_norm, stops=final_stops, tour_date=tdate)
-            if not ok_l:
-                st.warning(f"Logged to 'sent' skipped/failed: {msg_l}")
+            # Silent logging to 'sent' (no UI message)
+            log_sent_for_stops_silent(client_norm=client_norm, stops=final_stops, tour_date=tdate)
 
             st.success(f"Saved {len(final_stops)} stop(s) to {client_display} for {tdate}.")
-            st.toast("Tour created.", icon="✅")
