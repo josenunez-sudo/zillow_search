@@ -2,14 +2,14 @@
 import os, re, io
 from datetime import datetime
 from html import escape
-from typing import List, Dict, Any, Optional, Tuple
+from typing import List, Dict, Any, Optional, Tuple, OrderedDict
 from urllib.parse import unquote
 
 import streamlit as st
 from supabase import create_client, Client
 
 # =========================
-# Core: Supabase client
+# Supabase
 # =========================
 @st.cache_resource
 def get_supabase() -> Optional[Client]:
@@ -36,10 +36,54 @@ def _sb_ok() -> bool:
 def _norm_tag(s: str) -> str:
     return re.sub(r"\s+", " ", (s or "").strip()).lower()
 
-def _slug_addr(addr: str) -> str:
-    a = (addr or "").strip().lower()
+def _slug_simple(s: str) -> str:
+    a = (s or "").strip().lower()
     a = re.sub(r"[^\w\s,-]", "", a).replace(",", "")
     return re.sub(r"\s+", "-", a).strip("-")
+
+# Robust address normalizer so "St" == "Street", directions unify, etc.
+SUFFIX_MAP = {
+    "st": "street", "street": "street",
+    "rd": "road", "road": "road",
+    "ave": "avenue", "av": "avenue", "avenue": "avenue",
+    "blvd": "boulevard", "boulevard": "boulevard",
+    "dr": "drive", "drive": "drive",
+    "ln": "lane", "lane": "lane",
+    "ct": "court", "court": "court",
+    "pl": "place", "place": "place",
+    "ter": "terrace", "terrace": "terrace",
+    "way": "way",
+    "pkwy": "parkway", "parkway": "parkway",
+    "cir": "circle", "circle": "circle",
+    "hwy": "highway", "highway": "highway",
+}
+DIR_MAP = {"n":"north","s":"south","e":"east","w":"west","north":"north","south":"south","east":"east","west":"west"}
+
+def _normalize_addr_for_slug(addr: str) -> str:
+    """
+    Collapse common differences: "St" vs "Street", "E" vs "East", punctuation/case.
+    Also normalizes "NC" vs "Nc" etc. End result is slug-safe.
+    """
+    s = (addr or "").strip().lower()
+    s = unquote(s)
+    s = re.sub(r"[^\w\s,-]", " ", s)  # drop punctuation except , and -
+    s = re.sub(r"\s+", " ", s).strip()
+
+    # token-by-token normalization
+    tokens = s.replace(",", " ").split()
+    out = []
+    for tok in tokens:
+        if tok in DIR_MAP:
+            out.append(DIR_MAP[tok])
+        elif tok in SUFFIX_MAP:
+            out.append(SUFFIX_MAP[tok])
+        else:
+            out.append(tok)
+    norm = " ".join(out)
+
+    # collapse multiple spaces and hyphenate
+    norm = re.sub(r"\s+", " ", norm).strip()
+    return _slug_simple(norm)
 
 def address_text_from_url(url: str) -> str:
     """Human title from Zillow URL when DB 'address' missing."""
@@ -52,6 +96,26 @@ def address_text_from_url(url: str) -> str:
     if m:
         return re.sub(r"[-+]", " ", m.group(1)).strip().title()
     return ""
+
+# Pretty timestamp in America/New_York
+def _pretty_sent_at(iso_str: str) -> str:
+    if not iso_str:
+        return ""
+    try:
+        # Python can parse '...+00:00' and '...Z' (replace Z)
+        s = iso_str.replace("Z", "+00:00")
+        dt = datetime.fromisoformat(s)
+        try:
+            # Convert to ET if zoneinfo exists
+            from zoneinfo import ZoneInfo  # py>=3.9
+            dt_local = dt.astimezone(ZoneInfo("America/New_York"))
+        except Exception:
+            dt_local = dt  # fallback: leave as-is
+        return dt_local.strftime("%b %-d, %Y • %-I:%M %p")
+    except Exception:
+        # Fallback: show date only
+        m = re.match(r"^(\d{4}-\d{2}-\d{2})", iso_str)
+        return (m.group(1) if m else iso_str)
 
 # =========================
 # Clients CRUD (minimal)
@@ -106,7 +170,7 @@ def delete_client(client_id: int):
         return False, str(e)
 
 # =========================
-# Query param helpers
+# Query params + rerun
 # =========================
 def _qp_get(name, default=None):
     try:
@@ -145,7 +209,10 @@ def _safe_rerun():
 # =========================
 @st.cache_data(ttl=120, show_spinner=False)
 def fetch_sent_for_client(client_norm: str, limit: int = 5000):
-    """sent rows: url, address, sent_at, campaign, mls_id, canonical, zpid"""
+    """
+    Returns rows ordered by most recent first.
+    Columns: url,address,sent_at,campaign,mls_id,canonical,zpid
+    """
     if not (_sb_ok() and client_norm.strip()):
         return []
     try:
@@ -178,7 +245,8 @@ def fetch_tour_address_slugs(client_norm: str) -> Dict[str, int]:
         sq = SUPABASE.table("tour_stops").select("address,address_slug").in_("tour_id", ids).limit(50000).execute()
         rows = sq.data or []
         for r in rows:
-            slug = (r.get("address_slug") or _slug_addr(r.get("address") or "")).strip()
+            addr = (r.get("address") or "").strip()
+            slug = (r.get("address_slug") or _normalize_addr_for_slug(addr)).strip()
             if slug:
                 out[slug] = out.get(slug, 0) + 1
         return out
@@ -186,7 +254,7 @@ def fetch_tour_address_slugs(client_norm: str) -> Dict[str, int]:
         return out
 
 # =========================
-# UI pieces
+# UI rows
 # =========================
 def _client_row(name: str, norm: str, cid: int, active: bool):
     col_name, col_rep, col_ren, col_tog, col_del, col_sp = st.columns([8, 1, 1, 1, 1, 2])
@@ -202,11 +270,9 @@ def _client_row(name: str, norm: str, cid: int, active: bool):
             unsafe_allow_html=True
         )
 
-    # REPORT (▦)
     with col_rep:
         if st.button("▦", key=f"rep_{cid}", help="Open report"):
-            # <<< prevent tab flicker: remember Clients BEFORE rerun >>>
-            st.session_state["__active_tab__"] = "Clients"
+            st.session_state["__active_tab__"] = "Clients"   # stop tab flicker
             _qp_set(report=norm, scroll="1")
             _safe_rerun()
 
@@ -267,17 +333,18 @@ def _render_client_report_view(client_display_name: str, client_norm: str):
             _qp_set()  # clear query params
             _safe_rerun()
 
+    # Base rows (most recent first)
     rows = fetch_sent_for_client(client_norm)
     total = len(rows)
 
-    # Build campaigns list
-    seen = []
+    # Campaign list
+    seen_camps = []
     for r in rows:
         c = (r.get("campaign") or "").strip()
-        if c not in seen:
-            seen.append(c)
-    campaign_labels = ["All campaigns"] + [("— no campaign —" if c == "" else c) for c in seen]
-    campaign_keys   = [None] + seen
+        if c not in seen_camps:
+            seen_camps.append(c)
+    campaign_labels = ["All campaigns"] + [("— no campaign —" if c == "" else c) for c in seen_camps]
+    campaign_keys   = [None] + seen_camps
 
     colF1, colF2, colF3 = st.columns([1.2, 1.8, 1])
     with colF1:
@@ -290,10 +357,11 @@ def _render_client_report_view(client_display_name: str, client_norm: str):
     with colF3:
         st.caption(f"{total} total logged")
 
-    # Cross-check: tour address slugs for this client
+    # Cross-check: toured slugs
     toured_slugs = fetch_tour_address_slugs(client_norm)  # dict slug -> count
     toured_set = set(toured_slugs.keys())
 
+    # Filter rows by campaign/search
     def _match(row) -> bool:
         if sel_campaign is not None:
             if (row.get("campaign") or "").strip() != sel_campaign:
@@ -306,29 +374,60 @@ def _render_client_report_view(client_display_name: str, client_norm: str):
         return (q_norm in addr) or (q_norm in mls) or (q_norm in url)
 
     rows_f = [r for r in rows if _match(r)]
-    count = len(rows_f)
-    st.caption(f"{count} matching listing{'s' if count!=1 else ''}")
 
-    if not rows_f:
+    # ======= HARD DEDUPE (no repeats ever) =======
+    # key priority: canonical → zpid → normalized address slug (robust)
+    def _dedupe_key(r: Dict[str, Any]) -> str:
+        canon = (r.get("canonical") or "").strip().lower()
+        if canon:
+            return "c:" + canon
+        zpid = (r.get("zpid") or "").strip().lower()
+        if zpid:
+            return "z:" + zpid
+        # derive address text then normalized slug
+        addr = (r.get("address") or "").strip()
+        if not addr:
+            addr = address_text_from_url((r.get("url") or "").strip())
+        slug = _normalize_addr_for_slug(addr)
+        return "a:" + slug
+
+    deduped: Dict[str, Dict[str, Any]] = {}
+    # rows_f is already newest-first; keep the FIRST we see for each key
+    for r in rows_f:
+        k = _dedupe_key(r)
+        if k not in deduped:
+            deduped[k] = r
+    rows_u = list(deduped.values())
+
+    count = len(rows_u)
+    st.caption(f"{count} unique listing{'s' if count!=1 else ''}")
+
+    if not rows_u:
         st.info("No results match the current filters.")
         return
 
-    # Render list with TOURED badge if slug intersects
+    # Render
     items_html = []
-    for r in rows_f:
+    for r in rows_u:
         url = (r.get("url") or "").strip()
         addr = (r.get("address") or "").strip()
         if not addr:
             addr = address_text_from_url(url) or "Listing"
-        slug = _slug_addr(addr)
+
+        slug = _normalize_addr_for_slug(addr)
         toured = slug in toured_set
         toured_count = toured_slugs.get(slug, 0)
 
-        sent_at = r.get("sent_at") or ""
+        sent_at = _pretty_sent_at(r.get("sent_at") or "")
         camp = (r.get("campaign") or "").strip()
+
         camp_chip = ""
         if sel_campaign is None and camp:
-            camp_chip = f"<span style='font-size:11px; font-weight:700; padding:2px 6px; border-radius:999px; background:#e2e8f0; margin-left:6px;'>{escape(camp)}</span>"
+            # Show campaign chip (more subtle) only in "All campaigns"
+            camp_chip = (
+                f"<span style='font-size:11px;font-weight:700;padding:2px 6px;border-radius:999px;"
+                f"background:#e2e8f0;margin-left:6px;'>{escape(camp)}</span>"
+            )
 
         toured_chip = ""
         if toured:
@@ -341,25 +440,29 @@ def _render_client_report_view(client_display_name: str, client_norm: str):
                 "</span>"
             )
 
+        time_chip = f"<span style='color:#64748b;font-size:12px;margin-left:6px;'>{escape(sent_at)}</span>" if sent_at else ""
+
         items_html.append(
             f"""<li style="margin:0.25rem 0;">
                   <a href="{escape(url)}" target="_blank" rel="noopener">{escape(addr)}</a>
-                  {toured_chip}
-                  <span style="color:#64748b; font-size:12px; margin-left:6px;">{escape(sent_at)}</span>
-                  {camp_chip}
+                  {toured_chip}{time_chip}{camp_chip}
                 </li>"""
         )
 
-    st.markdown("<ul style='margin:0 0 .5rem 1.2rem; padding:0; list-style:disc;'>"
-                + "\n".join(items_html) + "</ul>", unsafe_allow_html=True)
+    st.markdown(
+        "<ul style='margin:0 0 .5rem 1.2rem; padding:0; list-style:disc;'>"
+        + "\n".join(items_html) +
+        "</ul>",
+        unsafe_allow_html=True
+    )
 
-    # Export section
+    # Export filtered+deduped
     with st.expander("Export filtered report"):
         import pandas as pd
-        df = pd.DataFrame(rows_f)
+        df = pd.DataFrame(rows_u)
         buf = io.StringIO(); df.to_csv(buf, index=False)
         st.download_button(
-            "Download CSV",
+            "Download CSV (unique only)",
             data=buf.getvalue(),
             file_name=f"client_report_{client_norm}_{datetime.utcnow().strftime('%Y%m%d%H%M%S')}.csv",
             mime="text/csv",
@@ -411,6 +514,5 @@ def render_clients_tab():
                 """,
                 height=0
             )
-            # Keep Clients tab selected on subsequent reruns
             st.session_state["__active_tab__"] = "Clients"
             _qp_set(report=report_norm_qp)
