@@ -1,9 +1,10 @@
 # ui/tours_tab.py
 # Tours tab: import (Print URL or PDF), preview, add to client, and manage tours.
-import os, re, io, requests, html
+import os, re, io, requests
 from datetime import datetime
 from typing import List, Dict, Any, Optional, Tuple
 from html import escape
+import html as ihtml  # for unescape
 
 import streamlit as st
 
@@ -61,7 +62,7 @@ def fetch_clients(include_inactive: bool = True):
     try:
         cols = "id,name,name_norm,active"
         rows = SUPABASE.table("clients").select(cols).order("name", desc=False).execute().data or []
-        # hide the test sentinel (same behavior as your Run tab)
+        # hide the test sentinel (same behavior as Run tab)
         rows = [r for r in rows if (r.get("name_norm") or "").strip().lower() != _norm_tag("test test")]
         return rows if include_inactive else [r for r in rows if r.get("active")]
     except Exception:
@@ -77,9 +78,9 @@ def _invalidate_tours_cache():
 
 def create_tour(client_norm: str, client_display: str, tour_date, source_url: Optional[str] = None):
     """
-    Creates a row in public.tours. Tolerates older schemas (no client_display) and
-    stricter schemas (url NOT NULL). If url is required and missing, we fall back
-    to an empty string so the insert still succeeds.
+    Creates a row in public.tours. Handles:
+    - older schemas (no client_display)
+    - stricter schemas (url NOT NULL) → falls back to empty string if needed.
     """
     if not _sb_ok():
         return False, "Supabase not configured"
@@ -176,7 +177,7 @@ def delete_stop(stop_id: int):
 # ---------- Sent logging (to tag as TOURED later) ----------
 def log_sent_for_stops(client_norm: str, stops: List[Dict[str,str]], tour_date: datetime.date):
     """
-    Insert each stop as a row in 'sent' so your existing clients/report views can
+    Insert each stop as a row in 'sent' so clients/report views can
     detect them via address matching. Uses campaign="tour:YYYYMMDD".
     """
     if not (_sb_ok() and client_norm and stops):
@@ -201,8 +202,8 @@ def log_sent_for_stops(client_norm: str, stops: List[Dict[str,str]], tour_date: 
     except Exception as e:
         return False, str(e)
 
-# ---------- Parsing (Print URL / PDF) ----------
-# Allow various dash types between times
+# ---------- OLD (simpler) Parsing (Print URL / PDF) ----------
+# Keep it close to the version that worked for you:
 DASH = r"[-\u2013\u2014\u2212]"  # -, –, —, −
 
 DATE_PAT = re.compile(
@@ -211,21 +212,16 @@ DATE_PAT = re.compile(
 )
 DATE_FALLBACK = re.compile(r"([A-Za-z]+\s+\d{1,2},\s*\d{4})")
 
-# Main address+time pattern
-STOP_PAT = re.compile(
-    rf"(\d{{1,6}}\s+[A-Za-z0-9\.\-'/\s]+?,\s*[A-Za-z\.\-'\s]+?,\s*[A-Z]{{2}}\s*\d{{5}}(?:-\d{{4}})?)\s+"
-    rf"(\d{{1,2}}:\d{{2}}\s*[AP]M)\s*{DASH}\s*(\d{{1,2}}:\d{{2}}\s*[AP]M)",
+# Classic: small gap between address and time, then a slightly larger fallback.
+STOP_PAT_A = re.compile(
+    rf"(\d{{1,6}}\s+[A-Za-z0-9\.\-'/\s]{{3,120}},\s*[A-Za-z\.\-'\s]{{2,80}},\s*[A-Z]{{2}}\s*\d{{5}}(?:-\d{{4}})?)\s{{0,60}}(\d{{1,2}}:\d{{2}}\s*[AP]M)\s*{DASH}\s*(\d{{1,2}}:\d{{2}}\s*[AP]M)",
     re.I
 )
-
-# More tolerant: allow lots of HTML noise between address and times
-STOP_PAT2 = re.compile(
-    rf"(\d{{1,6}}\s+[A-Za-z0-9\.\-'/\s]+?,\s*[A-Za-z\.\-'\s]+?,\s*[A-Z]{{2}}\s*\d{{5}}(?:-\d{{4}})?)"
-    rf".{{0,400}}?(\d{{1,2}}:\d{{2}}\s*[AP]M)\s*{DASH}\s*(\d{{1,2}}:\d{{2}}\s*[AP]M)",
+STOP_PAT_B = re.compile(
+    rf"(\d{{1,6}}\s+[A-Za-z0-9\.\-'/\s]{{3,120}},\s*[A-Za-z\.\-'\s]{{2,80}},\s*[A-Z]{{2}}\s*\d{{5}}(?:-\d{{4}})?)"
+    rf".{{0,220}}?(\d{{1,2}}:\d{{2}}\s*[AP]M)\s*{DASH}\s*(\d{{1,2}}:\d{{2}}\s*[AP]M)",
     re.I | re.S
 )
-
-TIME_WIN = re.compile(rf"(\d{{1,2}}:\d{{2}}\s*[AP]M)\s*{DASH}\s*(\d{{1,2}}:\d{{2}}\s*[AP]M)", re.I)
 
 def _coerce_date(s: str):
     for fmt in ("%B %d, %Y", "%b %d, %Y"):
@@ -236,24 +232,29 @@ def _coerce_date(s: str):
     return None
 
 def _flatten_text(txt: str) -> str:
-    # normalize whitespace & unify dashes so regex is robust
     if not txt: return ""
     t = txt.replace("\xa0", " ")
-    # unify common dashes to hyphen to help both patterns
+    # normalize dashes, then collapse spaces
     t = t.replace("\u2013", "-").replace("\u2014", "-").replace("\u2212", "-")
     t = re.sub(r"\s+", " ", t).strip()
     return t
 
+def _strip_tags(html_text: str) -> str:
+    # Remove scripts/styles quickly then drop tags; unescape entities; flatten.
+    s = re.sub(r"(?is)<(script|style)[^>]*>.*?</\1>", " ", html_text)
+    s = re.sub(r"(?s)<[^>]+>", " ", s)
+    s = ihtml.unescape(s)
+    return _flatten_text(s)
+
 def _normalize_time(tok: str) -> str:
     tok = tok.upper().replace(" ", "")
-    # insert single space before AM/PM
     tok = re.sub(r"(AM|PM)$", r" \1", tok)
     return tok
 
 def _extract_stops(flat_text: str) -> Tuple[Optional[datetime.date], Optional[str], List[Dict[str,str]]]:
     date_obj = None
-    stops: List[Dict[str,str]] = []
     buyer_name = None
+    stops: List[Dict[str,str]] = []
 
     dm = DATE_PAT.search(flat_text)
     if dm:
@@ -263,20 +264,20 @@ def _extract_stops(flat_text: str) -> Tuple[Optional[datetime.date], Optional[st
         if dm2:
             date_obj = _coerce_date(dm2.group(1))
 
-    # Buyer name (optional, not used yet)
+    # Optional: buyer name
     m_buyer = re.search(r"Buyer'?s?\s+name\s*:\s*([A-Za-z][A-Za-z\-\s']+)", flat_text, re.I)
     if m_buyer:
         buyer_name = m_buyer.group(1).strip()
 
-    matches = list(STOP_PAT.finditer(flat_text))
+    matches = list(STOP_PAT_A.finditer(flat_text))
     if not matches:
-        matches = list(STOP_PAT2.finditer(flat_text))
+        matches = list(STOP_PAT_B.finditer(flat_text))
 
     for m in matches:
         addr = re.sub(r"\s+", " ", m.group(1)).strip()
         start = _normalize_time(m.group(2))
         end   = _normalize_time(m.group(3))
-        # guard: ensure we really have ", City, ST ZIP"
+        # sanity check ", City, ST 12345"
         if not re.search(r",\s*[A-Za-z\.\-'\s]+,\s*[A-Z]{2}\s*\d{5}", addr):
             continue
         stops.append({
@@ -287,31 +288,7 @@ def _extract_stops(flat_text: str) -> Tuple[Optional[datetime.date], Optional[st
             "deeplink": zillow_deeplink_from_address(addr),
         })
 
-    # Fallback: find time windows, then scan left for a US address tail and expand
-    if not stops:
-        for tw in TIME_WIN.finditer(flat_text):
-            start_t = _normalize_time(tw.group(1))
-            end_t   = _normalize_time(tw.group(2))
-            left_span = flat_text[max(0, tw.start()-500):tw.start()]
-            # look for ", City, ST 12345"
-            tail = re.search(r"([A-Za-z\.\-'\s]+,\s*[A-Z]{2}\s*\d{5}(?:-\d{4})?)\s*$", left_span, re.I)
-            if not tail: 
-                continue
-            # expand left to capture number + street
-            left2 = left_span[:tail.start()]
-            head = re.search(r"(\d{1,6}\s+[A-Za-z0-9\.\-'/\s]{3,120})\s*$", left2, re.I)
-            if not head: 
-                continue
-            addr = (head.group(1) + ", " + tail.group(1)).strip()
-            stops.append({
-                "address": re.sub(r"\s+", " ", addr),
-                "start": start_t,
-                "end":   end_t,
-                "address_slug": slugify_address(addr),
-                "deeplink": zillow_deeplink_from_address(addr),
-            })
-
-    # de-dupe while keeping order
+    # de-dup keep order
     seen = set(); uniq=[]
     for s in stops:
         k = (s["address_slug"], s["start"], s["end"])
@@ -319,22 +296,16 @@ def _extract_stops(flat_text: str) -> Tuple[Optional[datetime.date], Optional[st
         seen.add(k); uniq.append(s)
     return date_obj, buyer_name, uniq
 
-def _strip_tags_and_unescape(html_text: str) -> str:
-    # remove tags then unescape entities (e.g., &nbsp;)
-    no_tags = re.sub(r"<[^>]+>", " ", html_text)
-    return html.unescape(no_tags)
-
 def parse_from_print_url(url: str) -> Tuple[Optional[datetime.date], Optional[str], List[Dict[str,str]], str]:
     try:
         r = requests.get(url, headers=UA_HEADERS, timeout=REQUEST_TIMEOUT)
         if not r.ok:
             return None, None, [], "Could not fetch Print page."
-        raw = _strip_tags_and_unescape(r.text)
-        text = _flatten_text(raw)
-        date_obj, buyer_name, stops = _extract_stops(text)
-        if not stops:
+        flat = _strip_tags(r.text)  # (this is what the old parser effectively did)
+        d, b, s = _extract_stops(flat)
+        if not s:
             return None, None, [], "No stops found. Double-check that this is a ShowingTime tour Print page."
-        return date_obj, buyer_name, stops, ""
+        return d, b, s, ""
     except Exception as e:
         return None, None, [], f"Fetch/parse error: {e}"
 
@@ -346,10 +317,10 @@ def parse_from_pdf(file) -> Tuple[Optional[datetime.date], Optional[str], List[D
         pdf = PyPDF2.PdfReader(io.BytesIO(content))
         pages = [page.extract_text() or "" for page in pdf.pages]
         text = _flatten_text(" ".join(pages))
-        date_obj, buyer_name, stops = _extract_stops(text)
-        if not stops:
+        d, b, s = _extract_stops(text)
+        if not s:
             return None, None, [], "No stops found. Double-check that this is a ShowingTime tour PDF."
-        return date_obj, buyer_name, stops, ""
+        return d, b, s, ""
     except Exception as e:
         return None, None, [], f"PDF parse error: {e}"
 
@@ -373,7 +344,7 @@ html[data-theme="dark"] .tour-pill, .stApp [data-theme="dark"] .tour-pill {
 def render_tours_tab(state: dict):
     st.markdown(STYLE, unsafe_allow_html=True)
 
-    # --- Import section (up top) ---
+    # --- Import (at top) ---
     st.subheader("Import Tour")
     col_u, col_p = st.columns([1.2, 1])
     with col_u:
@@ -381,7 +352,6 @@ def render_tours_tab(state: dict):
     with col_p:
         pdf_file = st.file_uploader("or upload Tour PDF", type=["pdf"])
 
-    # Parse button
     parse_clicked = st.button("Parse tour", use_container_width=True)
 
     parsed_date: Optional[datetime.date] = None
@@ -400,19 +370,13 @@ def render_tours_tab(state: dict):
             st.error(err)
         else:
             parsed_date, parsed_buyer, parsed_stops = d, b, s
-
             st.success(f"Parsed {len(parsed_stops)} stop(s)" + (f" • {parsed_buyer}" if parsed_buyer else "") + (f" • {parsed_date}" if parsed_date else ""))
 
             # Preview with include checkboxes
             st.markdown("#### Preview")
             include_flags = []
             for i, s in enumerate(parsed_stops):
-                chk = st.checkbox(
-                    label="",
-                    value=True,
-                    key=f"__inc_{i}",
-                    help="Uncheck to exclude this stop before saving."
-                )
+                chk = st.checkbox("", value=True, key=f"__inc_{i}", help="Uncheck to exclude this stop before saving.")
                 include_flags.append(chk)
                 addr = s["address"]
                 link = s["deeplink"]
@@ -427,13 +391,11 @@ def render_tours_tab(state: dict):
                     unsafe_allow_html=True
                 )
 
-            # --- Choose client & add all ---
+            # Choose client & add all (sentinel LAST in this tab)
             clients = fetch_clients(include_inactive=True)
             names = [c["name"] for c in clients]
             name_to_norm = {c["name"]: c.get("name_norm","") for c in clients}
-
-            # Put sentinel LAST in this tab
-            options = (["— Choose client —"] + names + ["➤ No client (show ALL, no logging)"])
+            options = ["— Choose client —"] + names + ["➤ No client (show ALL, no logging)"]
             sel = st.selectbox("Add all included stops to client", options, index=0)
 
             add_clicked = st.button("Add all included stops", use_container_width=True)
@@ -449,13 +411,12 @@ def render_tours_tab(state: dict):
                 client_norm = name_to_norm.get(sel, _norm_tag(sel))
                 tour_date = parsed_date or datetime.utcnow().date()
 
-                # Filter included
                 final_stops = [s for s, inc in zip(parsed_stops, include_flags) if inc]
                 if not final_stops:
                     st.warning("No stops selected.")
                     st.stop()
 
-                # Create tour row (record source url or pdf:<name>)
+                # Record source (url or pdf:<name>)
                 src_url = print_url.strip() if print_url else (f"pdf:{pdf_file.name}" if pdf_file else "")
                 ok_t, tour_id_or_err = create_tour(client_norm=client_norm, client_display=client_display, tour_date=tour_date, source_url=src_url)
                 if not ok_t:
@@ -463,13 +424,12 @@ def render_tours_tab(state: dict):
                     st.stop()
                 tour_id = tour_id_or_err
 
-                # Save stops
                 ok_s, msg_s = insert_tour_stops(tour_id=int(tour_id), stops=final_stops)
                 if not ok_s:
                     st.error(f"Insert stops failed: {msg_s}")
                     st.stop()
 
-                # Also log into 'sent' (so clients tab can mark as TOURED)
+                # Also log into 'sent' so Clients tab can tag as TOURED
                 ok_l, msg_l = log_sent_for_stops(client_norm=client_norm, stops=final_stops, tour_date=tour_date)
                 if not ok_l:
                     st.warning(f"Logged to 'sent' skipped/failed: {msg_l}")
@@ -486,13 +446,10 @@ def render_tours_tab(state: dict):
     names_all = [c["name"] for c in clients_all]
     name_to_norm_all = {c["name"]: c.get("name_norm","") for c in clients_all}
 
-    # Client selector for management (includes All + sentinel last)
     mgmt_options = ["All clients"] + names_all + ["➤ No client (show ALL, no logging)"]
     sel_mgmt = st.selectbox("View tours for", mgmt_options, index=0)
-    if sel_mgmt == "All clients":
+    if sel_mgmt == "All clients" or sel_mgmt == "➤ No client (show ALL, no logging)":
         sel_norm = "__all__"
-    elif sel_mgmt == "➤ No client (show ALL, no logging)":
-        sel_norm = "__all__"  # same effect for viewing; just no writes.
     else:
         sel_norm = name_to_norm_all.get(sel_mgmt, _norm_tag(sel_mgmt))
 
@@ -511,7 +468,6 @@ def render_tours_tab(state: dict):
         if t_url:
             st.caption(f"Source: {t_url}")
 
-        # stops list with delete
         for s in stops:
             addr = s.get("address","")
             link = s.get("deeplink","")
@@ -533,7 +489,6 @@ def render_tours_tab(state: dict):
                     else:
                         st.experimental_rerun()
 
-        # tour actions
         st.write("")
         if st.button("Delete tour", key=f"del_tour_{t_id}", help="Delete this tour and all its stops"):
             ok, msg = delete_tour(t_id)
