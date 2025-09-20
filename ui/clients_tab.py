@@ -1,32 +1,61 @@
+# -*- coding: utf-8 -*-
 # ui/clients_tab.py
+#
+# Standalone Clients tab:
+# - Inline icon row: name + ▦ ✎ ⟳ ⌫
+# - Opens inline report below the lists via ?report=<name_norm>
+# - Rename/Delete inline editors
+# - No imports from ui.run_tab (prevents circular imports)
+
+from __future__ import annotations
+
+import os
+import io
 import re
-from datetime import datetime, date
-from typing import List, Dict, Any
+from datetime import datetime
 from html import escape
+from typing import Any, Dict, List, Optional
 
 import streamlit as st
 import streamlit.components.v1 as components
+from supabase import create_client, Client
+from urllib.parse import unquote
 
-# Break the circular import by using service modules (NOT ui.run_tab)
-from services.clients import (
-    fetch_clients, rename_client, toggle_client_active, delete_client, get_already_sent_maps
-)
-from services.resolver_light import (
-    is_probable_url,
-    canonicalize_zillow,
-    make_preview_url,
-    upgrade_to_homedetails_if_needed,
-    resolve_from_source_url,
-)
+# ---------------- Supabase bootstrap ----------------
 
-# Optional tours manager (if you added it earlier). If not using tours, you can remove these imports/usage.
-try:
-    from services.tours import fetch_tours, upsert_tours, update_tour_status, update_tour_meta, delete_tour
-    TOURS_ENABLED = True
-except Exception:
-    TOURS_ENABLED = False
+@st.cache_resource(show_spinner=False)
+def _get_supabase() -> Optional[Client]:
+    try:
+        url = os.getenv("SUPABASE_URL", st.secrets.get("SUPABASE_URL", ""))
+        key = os.getenv("SUPABASE_SERVICE_ROLE", st.secrets.get("SUPABASE_SERVICE_ROLE", ""))
+        if not url or not key:
+            return None
+        return create_client(url, key)
+    except Exception:
+        return None
 
-# ---------- Query param helpers ----------
+SUPABASE = _get_supabase()
+
+def _sb_ok() -> bool:
+    try:
+        return bool(SUPABASE)
+    except NameError:
+        return False
+
+# ---------------- Utils ----------------
+
+def _safe_rerun():
+    try:
+        st.rerun()
+    except Exception:
+        try:
+            st.experimental_rerun()
+        except Exception:
+            pass
+
+def _norm_tag(s: str) -> str:
+    return re.sub(r"\s+", " ", (s or "").strip()).lower()
+
 def _qp_get(name, default=None):
     try:
         qp = st.query_params
@@ -50,28 +79,97 @@ def _qp_set(**kwargs):
         else:
             st.experimental_set_query_params()
 
-# ---------- Sent report ----------
+# ---------------- Clients CRUD (local, no cross-imports) ----------------
+
+@st.cache_data(ttl=60, show_spinner=False)
+def fetch_clients(include_inactive: bool = False) -> List[Dict[str, Any]]:
+    if not _sb_ok():
+        return []
+    try:
+        rows = (
+            SUPABASE.table("clients")
+            .select("id,name,name_norm,active")
+            .order("name", desc=False)
+            .execute()
+            .data
+            or []
+        )
+        rows = [r for r in rows if r.get("name_norm") != _norm_tag("test test")]
+        return rows if include_inactive else [r for r in rows if r.get("active")]
+    except Exception:
+        return []
+
+def invalidate_clients_cache():
+    try:
+        fetch_clients.clear()  # type: ignore[attr-defined]
+    except Exception:
+        pass
+
+def toggle_client_active(client_id: int, new_active: bool):
+    if not _sb_ok() or not client_id:
+        return False, "Not configured"
+    try:
+        SUPABASE.table("clients").update({"active": new_active}).eq("id", client_id).execute()
+        invalidate_clients_cache()
+        return True, "ok"
+    except Exception as e:
+        return False, str(e)
+
+def rename_client(client_id: int, new_name: str):
+    if not _sb_ok() or not client_id or not (new_name or "").strip():
+        return False, "Bad input"
+    try:
+        new_norm = _norm_tag(new_name)
+        existing = (
+            SUPABASE.table("clients")
+            .select("id")
+            .eq("name_norm", new_norm)
+            .limit(1)
+            .execute()
+            .data
+            or []
+        )
+        if existing and existing[0]["id"] != client_id:
+            return False, "A client with that (normalized) name already exists."
+        SUPABASE.table("clients").update({"name": new_name.strip(), "name_norm": new_norm}).eq("id", client_id).execute()
+        invalidate_clients_cache()
+        return True, "ok"
+    except Exception as e:
+        return False, str(e)
+
+def delete_client(client_id: int):
+    if not _sb_ok() or not client_id:
+        return False, "Not configured"
+    try:
+        SUPABASE.table("clients").delete().eq("id", client_id).execute()
+        invalidate_clients_cache()
+        return True, "ok"
+    except Exception as e:
+        return False, str(e)
+
+# ---------------- Sent logs & report ----------------
+
 @st.cache_data(ttl=120, show_spinner=False)
 def fetch_sent_for_client(client_norm: str, limit: int = 5000):
-    from services.clients import get_supabase
-    SUPABASE = get_supabase()
-    if not SUPABASE or not client_norm.strip():
+    if not (_sb_ok() and client_norm.strip()):
         return []
     try:
         cols = "url,address,sent_at,campaign,mls_id,canonical,zpid"
-        resp = SUPABASE.table("sent")\
-            .select(cols)\
-            .eq("client", client_norm.strip())\
-            .order("sent_at", desc=True)\
-            .limit(limit)\
+        resp = (
+            SUPABASE.table("sent")
+            .select(cols)
+            .eq("client", client_norm.strip())
+            .order("sent_at", desc=True)
+            .limit(limit)
             .execute()
+        )
         return resp.data or []
     except Exception:
         return []
 
 def address_text_from_url(url: str) -> str:
-    from urllib.parse import unquote
-    if not url: return ""
+    if not url:
+        return ""
     u = unquote(url)
     m = re.search(r"/homedetails/([^/]+)/\d{6,}_zpid/", u, re.I)
     if m:
@@ -84,30 +182,41 @@ def address_text_from_url(url: str) -> str:
 def _render_client_report_view(client_display_name: str, client_norm: str):
     st.markdown(f"### Report for {escape(client_display_name)}", unsafe_allow_html=True)
 
-    colX, _ = st.columns([1,3])
+    colX, _ = st.columns([1, 3])
     with colX:
         if st.button("Close report", key=f"__close_report_{client_norm}"):
-            _qp_set()  # clear qp
-            st.rerun()
+            _qp_set()  # clear query params
+            _safe_rerun()
 
     rows = fetch_sent_for_client(client_norm)
     total = len(rows)
 
-    seen = []
+    # Campaign filter options
+    seen: List[str] = []
     for r in rows:
         c = (r.get("campaign") or "").strip()
         if c not in seen:
             seen.append(c)
     campaign_labels = ["All campaigns"] + [("— no campaign —" if c == "" else c) for c in seen]
-    campaign_keys   = [None] + seen
+    campaign_keys = [None] + seen
 
     colF1, colF2, colF3 = st.columns([1.2, 1.8, 1])
     with colF1:
-        sel_idx = st.selectbox("Filter by campaign", list(range(len(campaign_labels))),
-                               format_func=lambda i: campaign_labels[i], index=0, key=f"__camp_{client_norm}")
+        sel_idx = st.selectbox(
+            "Filter by campaign",
+            list(range(len(campaign_labels))),
+            format_func=lambda i: campaign_labels[i],
+            index=0,
+            key=f"__camp_{client_norm}",
+        )
         sel_campaign = campaign_keys[sel_idx]
     with colF2:
-        q = st.text_input("Search address / MLS / URL", value="", placeholder="e.g. 407 Woodall, 2501234, /homedetails/", key=f"__q_{client_norm}")
+        q = st.text_input(
+            "Search address / MLS / URL",
+            value="",
+            placeholder="e.g. 407 Woodall, 2501234, /homedetails/",
+            key=f"__q_{client_norm}",
+        )
         q_norm = q.strip().lower()
     with colF3:
         st.caption(f"{total} total logged")
@@ -119,14 +228,14 @@ def _render_client_report_view(client_display_name: str, client_norm: str):
         if not q_norm:
             return True
         addr = (row.get("address") or "").lower()
-        mls  = (row.get("mls_id") or "").lower()
-        url  = (row.get("url") or "").lower()
+        mls = (row.get("mls_id") or "").lower()
+        url = (row.get("url") or "").lower()
         return (q_norm in addr) or (q_norm in mls) or (q_norm in url)
 
     rows_f = [r for r in rows if _match(r)]
     count = len(rows_f)
 
-    st.caption(f"{count} matching listing{'s' if count!=1 else ''}")
+    st.caption(f"{count} matching listing{'s' if count != 1 else ''}")
 
     if not rows_f:
         st.info("No results match the current filters.")
@@ -140,7 +249,11 @@ def _render_client_report_view(client_display_name: str, client_norm: str):
         camp = (r.get("campaign") or "").strip()
         chip = ""
         if sel_campaign is None and camp:
-            chip = f"<span style='font-size:11px; font-weight:700; padding:2px 6px; border-radius:999px; background:#e2e8f0; margin-left:6px;'>{escape(camp)}</span>"
+            chip = (
+                "<span style='font-size:11px; font-weight:700; padding:2px 6px; "
+                "border-radius:999px; background:#e2e8f0; margin-left:6px;'>"
+                f"{escape(camp)}</span>"
+            )
         items_html.append(
             f"""<li>
                   <a href="{escape(url)}" target="_blank" rel="noopener">{escape(addr)}</a>
@@ -151,155 +264,131 @@ def _render_client_report_view(client_display_name: str, client_norm: str):
     html = "<ul class='link-list'>" + "\n".join(items_html) + "</ul>"
     st.markdown(html, unsafe_allow_html=True)
 
-# ---------- Optional: tours (kept compact). If not using tours, you can delete this block ----------
-def _cross_check_tour_candidates(client_norm: str, raw_items: List[str]) -> List[Dict[str, Any]]:
-    """
-    Lightweight cross-check: resolve URLs (follows redirects → try homedetails),
-    compute canonical/zpid, and flag against 'sent' + 'tours'.
-    Non-URLs are ignored (use Run tab to resolve plain addresses first).
-    """
-    resolved: List[Dict[str, Any]] = []
-    for item in raw_items:
-        item = item.strip()
-        if not item:
-            continue
-        if not is_probable_url(item):
-            # skip non-URL here to avoid importing the full resolver; you can paste Zillow links directly
-            continue
-        zurl, _ = resolve_from_source_url(item)
-        zurl = upgrade_to_homedetails_if_needed(zurl)
-        prev = make_preview_url(zurl) if zurl else ""
-        canon, zpid = canonicalize_zillow(zurl or "")
-        resolved.append({
-            "input_address": "",
-            "zillow_url": zurl,
-            "preview_url": prev,
-            "canonical": canon,
-            "zpid": zpid,
-        })
+    with st.expander("Export filtered report"):
+        import pandas as pd
 
-    # 'already sent'
-    canon_set, zpid_set, _, _ = get_already_sent_maps(client_norm)
+        csv_buf = io.StringIO()
+        pd.DataFrame(rows_f).to_csv(csv_buf, index=False)
+        st.download_button(
+            "Download CSV",
+            data=csv_buf.getvalue(),
+            file_name=f"client_report_{client_norm}_{datetime.utcnow().strftime('%Y%m%d%H%M%S')}.csv",
+            mime="text/csv",
+            use_container_width=False,
+        )
 
-    # 'already on tours'
-    tour_canon = set(); tour_zpid = set()
-    if TOURS_ENABLED:
-        for r in fetch_tours(client_norm):
-            c = (r.get("canonical") or "").strip()
-            z = (r.get("zpid") or "").strip()
-            if c: tour_canon.add(c)
-            if z: tour_zpid.add(z)
+# ---------------- Row UI (inline icons) ----------------
 
-    out = []
-    for r in resolved:
-        canon = (r.get("canonical") or "").strip()
-        zpid  = (r.get("zpid") or "").strip()
-        already_sent = (canon and canon in canon_set) or (zpid and zpid in zpid_set)
-        on_tour      = (canon and canon in tour_canon) or (zpid and zpid in tour_zpid)
-        out.append({
-            **r,
-            "already_sent": bool(already_sent),
-            "on_tour": bool(on_tour),
-            "display_url": r.get("preview_url") or r.get("zillow_url") or ""
-        })
-    return out
+def _client_row_icons(name: str, norm: str, cid: int, active: bool):
+    # Single row using columns so widgets are inline with the name
+    col_name, col_rep, col_ren, col_tog, col_del, _ = st.columns([8, 1, 1, 1, 1, 2])
 
-def _render_tours_panel(client_display_name: str, client_norm: str):
-    st.markdown(f"#### 🗓️ Tours for {escape(client_display_name)}", unsafe_allow_html=True)
-    st.caption("Paste Zillow (or other) listing links below. For plain addresses, resolve them via the Run tab first, then paste the Zillow links here.")
+    with col_name:
+        st.markdown(
+            f"<span class='client-name'>{escape(name)}</span> "
+            f"<span class='pill {'active' if active else ''}'>{'active' if active else 'inactive'}</span>",
+            unsafe_allow_html=True,
+        )
 
-    paste = st.text_area(
-        "Paste links (one per line)",
-        placeholder="https://www.zillow.com/homedetails/...\nhttps://l.hms.pt/short/... (will resolve)",
-        height=120
+    with col_rep:
+        if st.button("▦", key=f"rep_{cid}", help="Open report"):
+            _qp_set(report=norm, scroll="1")
+            _safe_rerun()
+
+    with col_ren:
+        if st.button("✎", key=f"rn_btn_{cid}", help="Rename"):
+            st.session_state[f"__edit_{cid}"] = True
+
+    with col_tog:
+        if st.button("⟳", key=f"tg_{cid}", help=("Deactivate" if active else "Activate")):
+            if _sb_ok():
+                rows = SUPABASE.table("clients").select("active").eq("id", cid).limit(1).execute().data or []
+                cur = rows[0]["active"] if rows else active
+                toggle_client_active(cid, (not cur))
+            _safe_rerun()
+
+    with col_del:
+        if st.button("⌫", key=f"del_{cid}", help="Delete"):
+            st.session_state[f"__del_{cid}"] = True
+
+    # Inline rename editor
+    if st.session_state.get(f"__edit_{cid}"):
+        st.markdown("<div class='inline-panel'>", unsafe_allow_html=True)
+        new_name = st.text_input("New name", value=name, key=f"rn_val_{cid}")
+        cc1, cc2 = st.columns([0.2, 0.2])
+        if cc1.button("Save", key=f"rn_save_{cid}"):
+            ok, msg = rename_client(cid, new_name)
+            if not ok:
+                st.warning(msg)
+            st.session_state[f"__edit_{cid}"] = False
+            _safe_rerun()
+        if cc2.button("Cancel", key=f"rn_cancel_{cid}"):
+            st.session_state[f"__edit_{cid}"] = False
+        st.markdown("</div>", unsafe_allow_html=True)
+
+    # Inline delete confirm
+    if st.session_state.get(f"__del_{cid}"):
+        st.markdown("<div class='inline-panel'>", unsafe_allow_html=True)
+        dc1, dc2 = st.columns([0.25, 0.25])
+        if dc1.button("Confirm delete", key=f"del_yes_{cid}"):
+            delete_client(cid)
+            st.session_state[f"__del_{cid}"] = False
+            _safe_rerun()
+        if dc2.button("Cancel", key=f"del_no_{cid}"):
+            st.session_state[f"__del_{cid}"] = False
+        st.markdown("</div>", unsafe_allow_html=True)
+
+    # subtle divider under each row
+    st.markdown(
+        "<div style='border-bottom:1px solid var(--row-border); margin:4px 0 2px 0;'></div>",
+        unsafe_allow_html=True,
     )
-    c1, c2 = st.columns([1,1])
-    with c1:
-        tour_date = st.date_input("Tour date (optional)", value=None, format="YYYY-MM-DD")
-    with c2:
-        notes_default = st.text_input("Notes (optional)", value="")
 
-    if st.button("Cross-check", use_container_width=True, key=f"__cross_{client_norm}"):
-        raw_lines = [ln.strip() for ln in (paste or "").splitlines() if ln.strip()]
-        checked = _cross_check_tour_candidates(client_norm, raw_lines)
+# ---------------- Public entrypoint ----------------
 
-        if not checked:
-            st.info("Nothing to check.")
-            return
+def render_clients_tab():
+    st.subheader("Clients")
+    st.caption("Manage active and inactive clients. “test test” is always hidden.")
 
-        lis = []
-        for r in checked:
-            url = r.get("display_url") or r.get("zillow_url") or ""
-            if not url:
-                continue
-            badge = ""
-            if r.get("on_tour"):
-                badge = ' <span class="badge dup" title="Already on this client’s tour list">ON TOUR</span>'
-            elif r.get("already_sent"):
-                badge = ' <span class="badge dup" title="Already sent to this client">Duplicate</span>'
-            else:
-                badge = ' <span class="badge new" title="New for this client">NEW</span>'
-            lis.append(f'<li style="margin:0.25rem 0;"><a href="{escape(url)}" target="_blank" rel="noopener">{escape(url)}</a>{badge}</li>')
+    report_norm_qp = _qp_get("report", "")
+    want_scroll = _qp_get("scroll", "") in ("1", "true", "yes")
 
-        html = "<ul class='link-list'>" + "\n".join(lis) + "</ul>"
-        st.markdown(html, unsafe_allow_html=True)
+    all_clients = fetch_clients(include_inactive=True)
+    active = [c for c in all_clients if c.get("active")]
+    inactive = [c for c in all_clients if not c.get("active")]
 
-        if TOURS_ENABLED:
-            new_items = []
-            for r in checked:
-                if not r.get("on_tour"):
-                    new_items.append({
-                        "url": r.get("display_url") or r.get("zillow_url") or "",
-                        "address": "",
-                        "notes": (notes_default or "").strip(),
-                        "status": "requested",
-                        "tour_date": tour_date if isinstance(tour_date, date) else None
-                    })
-            if new_items:
-                if st.button(f"Add {len(new_items)} to Tours", type="primary", use_container_width=True, key=f"__add_tours_{client_norm}"):
-                    ok, msg = upsert_tours(client_norm, new_items)
-                    if ok:
-                        st.success("Added to Tours.")
-                        st.rerun()
-                    else:
-                        st.error(f"Add failed: {msg}")
+    colA, colB = st.columns(2)
 
-    if TOURS_ENABLED:
-        st.markdown("##### Current tour list")
-        rows = fetch_tours(client_norm)
-        if not rows:
-            st.caption("_No tour items yet_")
+    with colA:
+        st.markdown("### Active", unsafe_allow_html=True)
+        if not active:
+            st.write("_No active clients_")
         else:
-            for r in rows:
-                col1, col2, col3, col4, col5 = st.columns([4, 1.6, 1.6, 2.2, 0.8])
-                with col1:
-                    url = r.get("url") or ""
-                    addr = (r.get("address") or "") or address_text_from_url(url) or "Listing"
-                    st.markdown(f'<a href="{escape(url)}" target="_blank" rel="noopener">{escape(addr)}</a>', unsafe_allow_html=True)
-                with col2:
-                    st.caption(r.get("status") or "requested")
-                    new_status = st.selectbox(
-                        "Status", ["requested","scheduled","seen","offered","lost","canceled"],
-                        index=["requested","scheduled","seen","offered","lost","canceled"].index(r.get("status") or "requested"),
-                        key=f"__stat_{r['id']}"
-                    )
-                with col3:
-                    cur_date = r.get("tour_date")
-                    new_date = st.date_input("Tour date", value=(date.fromisoformat(cur_date) if cur_date else None),
-                                             key=f"__date_{r['id']}", format="YYYY-MM-DD")
-                with col4:
-                    new_notes = st.text_input("Notes", value=r.get("notes") or "", key=f"__notes_{r['id']}")
-                with col5:
-                    if st.button("Save", key=f"__sav_{r['id']}"):
-                        ok1, _ = update_tour_status(r["id"], new_status)
-                        ok2, _ = update_tour_meta(r["id"], notes=new_notes, tour_date=new_date)
-                        st.success("Saved" if (ok1 and ok2) else "Save failed")
-                    if st.button("⌫", key=f"__del_{r['id']}"):
-                        ok, _ = delete_tour(r["id"])
-                        if ok:
-                            st.success("Deleted")
-                            st.rerun()
-                st.markdown("<div style='border-bottom:1px solid var(--row-border); margin:4px 0 2px 0;'></div>", unsafe_allow_html=True)
+            for c in active:
+                _client_row_icons(c["name"], c.get("name_norm", ""), c["id"], active=True)
 
-# ---------- Client row + main renderer ----------
-def _client_row_icons(name: str, norm: str, cid: int, active:_
+    with colB:
+        st.markdown("### Inactive", unsafe_allow_html=True)
+        if not inactive:
+            st.write("_No inactive clients_")
+        else:
+            for c in inactive:
+                _client_row_icons(c["name"], c.get("name_norm", ""), c["id"], active=False)
+
+    # ---- REPORT SECTION ----
+    st.markdown('<div id="report_anchor"></div>', unsafe_allow_html=True)
+    if report_norm_qp:
+        display_name = next((c["name"] for c in all_clients if c.get("name_norm") == report_norm_qp), report_norm_qp)
+        st.markdown("---")
+        _render_client_report_view(display_name, report_norm_qp)
+        if want_scroll:
+            components.html(
+                """
+                <script>
+                  const el = parent.document.getElementById("report_anchor");
+                  if (el) { el.scrollIntoView({behavior: "smooth", block: "start"}); }
+                </script>
+                """,
+                height=0,
+            )
+            _qp_set(report=report_norm_qp)
