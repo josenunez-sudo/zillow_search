@@ -1,6 +1,6 @@
 # ui/tours_tab.py
 # Tours tab: import (Print URL or PDF), preview, add to client, and manage tours.
-import os, re, io, requests
+import os, re, io, requests, html
 from datetime import datetime
 from typing import List, Dict, Any, Optional, Tuple
 from html import escape
@@ -61,6 +61,8 @@ def fetch_clients(include_inactive: bool = True):
     try:
         cols = "id,name,name_norm,active"
         rows = SUPABASE.table("clients").select(cols).order("name", desc=False).execute().data or []
+        # hide the test sentinel (same behavior as your Run tab)
+        rows = [r for r in rows if (r.get("name_norm") or "").strip().lower() != _norm_tag("test test")]
         return rows if include_inactive else [r for r in rows if r.get("active")]
     except Exception:
         return []
@@ -209,23 +211,21 @@ DATE_PAT = re.compile(
 )
 DATE_FALLBACK = re.compile(r"([A-Za-z]+\s+\d{1,2},\s*\d{4})")
 
-# Address + time window (captures address, start, end)
-# - more permissive characters in street/city
-# - flexible dash and optional spaces around times (e.g., 9:00AM–9:30AM)
+# Main address+time pattern
 STOP_PAT = re.compile(
-    rf"(\d{{1,6}}\s+[A-Za-z0-9\.\-'/\s]+?,\s*[A-Za-z\.\-'\s]+?,\s*[A-Z]{{2}}\s*\d{{5}}(?:-\d{{4}})?)\s+(\d{{1,2}}:\d{{2}}\s*[AP]M)\s*{DASH}\s*(\d{{1,2}}:\d{{2}}\s*[AP]M)",
+    rf"(\d{{1,6}}\s+[A-Za-z0-9\.\-'/\s]+?,\s*[A-Za-z\.\-'\s]+?,\s*[A-Z]{{2}}\s*\d{{5}}(?:-\d{{4}})?)\s+"
+    rf"(\d{{1,2}}:\d{{2}}\s*[AP]M)\s*{DASH}\s*(\d{{1,2}}:\d{{2}}\s*[AP]M)",
     re.I
 )
 
-# Extra tolerant fallback: allow tight AM/PM (no space) and noise between address/time
+# More tolerant: allow lots of HTML noise between address and times
 STOP_PAT2 = re.compile(
     rf"(\d{{1,6}}\s+[A-Za-z0-9\.\-'/\s]+?,\s*[A-Za-z\.\-'\s]+?,\s*[A-Z]{{2}}\s*\d{{5}}(?:-\d{{4}})?)"
-    rf".{{0,60}}?(\d{{1,2}}:\d{{2}}\s*[AP]M)\s*{DASH}\s*(\d{{1,2}}:\d{{2}}\s*[AP]M)",
-    re.I
+    rf".{{0,400}}?(\d{{1,2}}:\d{{2}}\s*[AP]M)\s*{DASH}\s*(\d{{1,2}}:\d{{2}}\s*[AP]M)",
+    re.I | re.S
 )
 
-# Buyer name (optional)
-BUYER_PAT = re.compile(r"Buyer'?s?\s+name\s*:\s*([A-Za-z][A-Za-z\-\s']+)", re.I)
+TIME_WIN = re.compile(rf"(\d{{1,2}}:\d{{2}}\s*[AP]M)\s*{DASH}\s*(\d{{1,2}}:\d{{2}}\s*[AP]M)", re.I)
 
 def _coerce_date(s: str):
     for fmt in ("%B %d, %Y", "%b %d, %Y"):
@@ -263,9 +263,10 @@ def _extract_stops(flat_text: str) -> Tuple[Optional[datetime.date], Optional[st
         if dm2:
             date_obj = _coerce_date(dm2.group(1))
 
-    bm = BUYER_PAT.search(flat_text)
-    if bm:
-        buyer_name = bm.group(1).strip()
+    # Buyer name (optional, not used yet)
+    m_buyer = re.search(r"Buyer'?s?\s+name\s*:\s*([A-Za-z][A-Za-z\-\s']+)", flat_text, re.I)
+    if m_buyer:
+        buyer_name = m_buyer.group(1).strip()
 
     matches = list(STOP_PAT.finditer(flat_text))
     if not matches:
@@ -286,6 +287,30 @@ def _extract_stops(flat_text: str) -> Tuple[Optional[datetime.date], Optional[st
             "deeplink": zillow_deeplink_from_address(addr),
         })
 
+    # Fallback: find time windows, then scan left for a US address tail and expand
+    if not stops:
+        for tw in TIME_WIN.finditer(flat_text):
+            start_t = _normalize_time(tw.group(1))
+            end_t   = _normalize_time(tw.group(2))
+            left_span = flat_text[max(0, tw.start()-500):tw.start()]
+            # look for ", City, ST 12345"
+            tail = re.search(r"([A-Za-z\.\-'\s]+,\s*[A-Z]{2}\s*\d{5}(?:-\d{4})?)\s*$", left_span, re.I)
+            if not tail: 
+                continue
+            # expand left to capture number + street
+            left2 = left_span[:tail.start()]
+            head = re.search(r"(\d{1,6}\s+[A-Za-z0-9\.\-'/\s]{3,120})\s*$", left2, re.I)
+            if not head: 
+                continue
+            addr = (head.group(1) + ", " + tail.group(1)).strip()
+            stops.append({
+                "address": re.sub(r"\s+", " ", addr),
+                "start": start_t,
+                "end":   end_t,
+                "address_slug": slugify_address(addr),
+                "deeplink": zillow_deeplink_from_address(addr),
+            })
+
     # de-dupe while keeping order
     seen = set(); uniq=[]
     for s in stops:
@@ -294,12 +319,18 @@ def _extract_stops(flat_text: str) -> Tuple[Optional[datetime.date], Optional[st
         seen.add(k); uniq.append(s)
     return date_obj, buyer_name, uniq
 
+def _strip_tags_and_unescape(html_text: str) -> str:
+    # remove tags then unescape entities (e.g., &nbsp;)
+    no_tags = re.sub(r"<[^>]+>", " ", html_text)
+    return html.unescape(no_tags)
+
 def parse_from_print_url(url: str) -> Tuple[Optional[datetime.date], Optional[str], List[Dict[str,str]], str]:
     try:
         r = requests.get(url, headers=UA_HEADERS, timeout=REQUEST_TIMEOUT)
         if not r.ok:
             return None, None, [], "Could not fetch Print page."
-        text = _flatten_text(r.text)
+        raw = _strip_tags_and_unescape(r.text)
+        text = _flatten_text(raw)
         date_obj, buyer_name, stops = _extract_stops(text)
         if not stops:
             return None, None, [], "No stops found. Double-check that this is a ShowingTime tour Print page."
