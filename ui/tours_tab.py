@@ -10,12 +10,12 @@ from supabase import create_client, Client
 
 # ---------- Optional PDF support ----------
 try:
-    import PyPDF2  # make sure "PyPDF2" is in requirements.txt
+    import PyPDF2  # ensure "PyPDF2" is in requirements.txt
 except Exception:
     PyPDF2 = None
 
 
-# ---------- Styles (App Store / macOS Mail blue buttons) ----------
+# ---------- Styles (macOS/App Store blue buttons) ----------
 st.markdown("""
 <style>
 .blue-btn-zone .stButton > button {
@@ -99,7 +99,6 @@ def fetch_clients():
 # ---------- ShowingTime parsing ----------
 _BAD_AFTER_NUM = r"(?:Beds?|Baths?|Sqft|Canceled|Cancelled|Confirmed|Reason|Presented|Access|Alarm|Instructions|Agent|Buyer)\b"
 _STREET_TYPES = r"(?:St|Street|Ave|Avenue|Dr|Drive|Ln|Lane|Rd|Road|Blvd|Boulevard|Ct|Court|Pl|Place|Ter|Terrace|Way|Cir|Circle|Pkwy|Parkway|Hwy|Highway)"
-# Safer address regex: house number + up to 4 street words + street type (+ optional post word), then ", City, ST ZIP"
 ADDR_RE = re.compile(
     rf"""\b
     (?P<num>\d{{1,6}})\s+(?!{_BAD_AFTER_NUM})
@@ -176,7 +175,7 @@ def _parse_tour_text(txt: str) -> Dict[str, Any]:
 
     stops: List[Dict[str, Any]] = []
     for am in ADDR_RE.finditer(txt):
-        # Rebuild a clean, address-only string from groups to avoid “00 Beds…” noise
+        # Assemble clean address-only text
         num   = am.group("num").strip()
         name  = re.sub(r'\s+', ' ', am.group("name").strip())
         stype = am.group("stype").strip()
@@ -187,7 +186,7 @@ def _parse_tour_text(txt: str) -> Dict[str, Any]:
 
         addr_clean = f"{num} {name} {stype}" + (f" {post}" if post else "") + f", {city}, {state} {zcode}"
 
-        # Time/status: prefer a small look-behind window so we don’t capture unrelated tokens
+        # Time/status window near the address
         win_start = max(0, am.start() - 140)
         win_end   = min(len(txt), am.end() + 80)
         window = txt[win_start:win_end]
@@ -202,7 +201,7 @@ def _parse_tour_text(txt: str) -> Dict[str, Any]:
         stat = _status_in_window(window)
 
         stops.append({
-            "address": addr_clean,                               # <-- address-only
+            "address": addr_clean,
             "start": t1.replace("AM"," AM").replace("PM"," PM").strip(),
             "end":   t2.replace("AM"," AM").replace("PM"," PM").strip(),
             "deeplink": _address_to_deeplink(addr_clean),
@@ -252,7 +251,12 @@ def _create_or_get_tour(client_norm: str, client_display: str, tour_url: Optiona
     return ins.data[0]["id"]
 
 def _insert_stops(tour_id: int, stops: List[Dict[str, Any]]) -> int:
+    """
+    Insert stops for a tour. NOTE: Do NOT insert 'address_slug' if your table defines it as
+    a GENERATED column. We compute a slug in-memory for dedupe only, but we DO NOT send it.
+    """
     if not SUPABASE: return 0
+    # Fetch existing slugs for dedupe (DB will provide generated slugs)
     existing = SUPABASE.table("tour_stops").select("address_slug").eq("tour_id", tour_id).limit(50000).execute().data or []
     seen = {e["address_slug"] for e in existing if e.get("address_slug")}
     rows = []
@@ -260,11 +264,12 @@ def _insert_stops(tour_id: int, stops: List[Dict[str, Any]]) -> int:
         addr = (s.get("address") or "").strip()
         if not addr: continue
         slug = _slug_addr(addr)
-        if slug in seen: continue
+        if slug in seen:  # dedupe against existing
+            continue
         rows.append({
             "tour_id": tour_id,
             "address": addr,
-            "address_slug": slug,
+            # DO NOT include address_slug here (generated column)
             "start": (s.get("start") or None),
             "end":   (s.get("end") or None),
             "deeplink": (s.get("deeplink") or _address_to_deeplink(addr)),
@@ -319,7 +324,7 @@ def _build_repeat_map(client_norm: str) -> Dict[tuple, int]:
     for t in tours:
         td = t["tour_date"]
         for slug in t2s.get(t["id"], []):
-            seen_count[slug] = seen_count.get( slug, 0) + 1
+            seen_count[slug] = seen_count.get(slug, 0) + 1
             rep[(slug, td)] = seen_count[slug]
     return rep
 
@@ -375,7 +380,7 @@ def render_tours_tab(state: dict):
         st.markdown("</div>", unsafe_allow_html=True)
     with cC:
         st.markdown("<div class='blue-btn-zone'>", unsafe_allow_html=True)
-        view_report = st.button("View report", use_container_width=True, key="__view_report__")
+        view_report_top = st.button("View report", use_container_width=True, key="__view_report_top__")
         st.markdown("</div>", unsafe_allow_html=True)
 
     if do_clear:
@@ -437,6 +442,11 @@ def render_tours_tab(state: dict):
         else:
             st.info("No stops to preview.")
 
+        # Secondary View report button (visible near preview)
+        st.markdown("<div class='blue-btn-zone'>", unsafe_allow_html=True)
+        view_report_mid = st.button("View report", use_container_width=False, key="__view_report_mid__")
+        st.markdown("</div>", unsafe_allow_html=True)
+
         st.markdown("<div style='border-bottom:1px solid var(--row-border); margin:.5rem 0;'></div>", unsafe_allow_html=True)
 
         # ===== Add all stops flow =====
@@ -459,7 +469,7 @@ def render_tours_tab(state: dict):
             client_display = ""
             client_display_norm = ""
 
-        # Add all stops to client (first = No logging)
+        # Add all stops to client (first option is No logging)
         NO_CLIENT = "➤ No client (show ALL, no logging)"
         add_names = [NO_CLIENT] + client_names
         add_norms = [""         ] + client_norms
@@ -473,7 +483,7 @@ def render_tours_tab(state: dict):
         chosen_norm = add_norms[idx_add]
         also_mark_sent = st.checkbox("Also mark these stops as “toured” in Sent", value=True)
 
-        colAA, colBB = st.columns([0.35, 0.65])
+        colAA, colBB, colCC = st.columns([0.35, 0.35, 0.30])
         with colAA:
             can_add = bool(stops) and bool(tdate) and bool(client_display and client_display_norm)
             st.markdown("<div class='blue-btn-zone'>", unsafe_allow_html=True)
@@ -496,34 +506,30 @@ def render_tours_tab(state: dict):
                     st.error(f"Could not add stops. {e}")
 
         with colBB:
+            # Top-level report button again for convenience
+            st.markdown("<div class='blue-btn-zone'>", unsafe_allow_html=True)
+            view_report_bottom = st.button("View report", use_container_width=True, key="__view_report_bottom__")
+            st.markdown("</div>", unsafe_allow_html=True)
+
+        with colCC:
             st.caption("Tip: choose **No client** if you only want to parse/preview without logging.")
+
+        # Any of the three "View report" buttons scroll down:
+        if view_report_top or view_report_mid or view_report_bottom:
+            st.components.v1.html(
+                """
+                <script>
+                  const el = parent.document.querySelector('#report_anchor');
+                  if (el) { el.scrollIntoView({behavior: "smooth", block: "start"}); }
+                </script>
+                """,
+                height=0
+            )
 
     st.markdown("---")
     st.markdown('<div id="report_anchor"></div>', unsafe_allow_html=True)
 
-    # If the top "View report" button was pressed, scroll here (stay on Tours tab).
-    if st.session_state.get("__view_report__scroll__"):
-        st.session_state["__view_report__scroll__"] = False
-
-    # Inject smooth scroll when user clicks "View report"
-    if 'VIEW_REPORT_SCROLL_DONE' not in st.session_state:
-        st.session_state['VIEW_REPORT_SCROLL_DONE'] = False
-    if st.session_state['VIEW_REPORT_SCROLL_DONE'] is False:
-        # Bind a little script to the button click using a hidden element
-        pass
-    if view_report:
-        st.session_state['VIEW_REPORT_SCROLL_DONE'] = True
-        st.components.v1.html(
-            """
-            <script>
-              const el = parent.document.querySelector('#report_anchor');
-              if (el) { el.scrollIntoView({behavior: "smooth", block: "start"}); }
-            </script>
-            """,
-            height=0
-        )
-
-    # ===== Tours report (inline; the button above just scrolls here) =====
+    # ===== Tours report (inline) =====
     st.markdown("### Tours report")
     clients2 = fetch_clients()
     names2 = [c["name"] for c in clients2]
