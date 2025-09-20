@@ -54,6 +54,22 @@ def fetch_clients(include_inactive: bool = True) -> List[Dict[str, Any]]:
     except Exception:
         return []
 
+def upsert_client(name: str, active: bool = True, notes: Optional[str] = None) -> Tuple[bool, str]:
+    if not _sb_ok() or not (name or "").strip():
+        return False, "Not configured or empty name"
+    try:
+        payload = {"name": name.strip(), "name_norm": _norm_tag(name), "active": active}
+        if notes is not None:
+            payload["notes"] = notes
+        SUPABASE.table("clients").upsert(payload, on_conflict="name_norm").execute()
+        try:
+            fetch_clients.clear()  # type: ignore[attr-defined]
+        except Exception:
+            pass
+        return True, "ok"
+    except Exception as e:
+        return False, str(e)
+
 def _address_slug(addr: str) -> str:
     s = (addr or "").lower()
     s = re.sub(r"[^a-z0-9\s,]", " ", s)
@@ -62,7 +78,6 @@ def _address_slug(addr: str) -> str:
     return s
 
 def _zillow_deeplink_from_full_address(addr: str) -> str:
-    # Build a Zillow /homes/ ... _rb/ deeplink
     s = (addr or "").lower()
     s = re.sub(r"[^a-z0-9\s,]", "", s).replace(",", "")
     s = re.sub(r"\s+", "-", s.strip())
@@ -70,14 +85,11 @@ def _zillow_deeplink_from_full_address(addr: str) -> str:
 
 # ------ Strict parsing regexes ------
 TIME_RANGE_RE = re.compile(r"\b(\d{1,2}:\d{2}\s*(?:AM|PM))\s*-\s*(\d{1,2}:\d{2}\s*(?:AM|PM))\b", re.I)
-
 STREET_SUFFIX = r"(?:Street|St|Avenue|Ave|Boulevard|Blvd|Road|Rd|Drive|Dr|Lane|Ln|Way|Terrace|Ter|Court|Ct|Place|Pl|Parkway|Pkwy|Square|Sq|Circle|Cir|Highway|Hwy|Route|Rt|Trail|Trl)"
-
 ADDRESS_RE = re.compile(
     rf"\b(\d{{1,6}})\s+([A-Za-z0-9.\-']+(?:\s+[A-Za-z0-9.\-']+){{0,6}})\s+({STREET_SUFFIX})\b[^\n,]*,\s*([A-Za-z .'\-]+),\s*([A-Z]{{2}})\s*(\d{{5}}(?:-\d{{4}})?)\b",
     re.I,
 )
-
 DATE_FANCY_RE = re.compile(r"\b(?:Tour\s*-\s*)?([A-Za-z]+,\s+[A-Za-z]+\s+\d{1,2},\s+\d{4})\b", re.I)
 DATE_NUMERIC_RE = re.compile(r"\b(\d{1,2}/\d{1,2}/\d{2,4})\b")
 
@@ -233,7 +245,7 @@ def _insert_tour_and_stops(client_norm: str, client_display: str, tour_date: Opt
     except Exception as e:
         return False, f"Create tour failed: {e}", None
 
-def _log_stops_to_sent(client_norm: str, client_display: str, stops: List[Dict[str, str]]):
+def _log_stops_to_sent(client_norm: str, client_display: str, stops: List[Dict, str]):
     if not (_sb_ok() and client_norm and stops):
         return False, "skip"
     now_iso = datetime.utcnow().isoformat(timespec="seconds") + "Z"
@@ -350,7 +362,7 @@ def render_tours_tab(state: dict):
         dt_label = (tour_dt.strftime("%Y-%m-%d") if isinstance(tour_dt, datetime) else "—")
         st.markdown(f"**Preview:** {len(stops)} stop(s) • Date: <span class='t-badge'>{escape(dt_label)}</span>", unsafe_allow_html=True)
 
-        # preview list
+        # preview list (hyperlink + time + CONFIRMED/CANCELLED tag)
         items = []
         for s in stops:
             u = s.get("deeplink") or "#"
@@ -369,36 +381,73 @@ def render_tours_tab(state: dict):
         all_clients = fetch_clients(include_inactive=True)
         client_names = [c["name"] for c in all_clients]
 
-        NO_CLIENT = "➤ No client (show ALL, no logging)"
-        add_options = [NO_CLIENT] + client_names  # FIRST option is "No client"
-        sel_idx = st.selectbox("Add all stops to client (optional)", list(range(len(add_options))),
-                               format_func=lambda i: add_options[i], index=0, key="__tour_client_sel__")
+        # Inline add-client if empty:
+        if not client_names:
+            with st.expander("Add a client to save this tour"):
+                nn = st.text_input("Client name")
+                if st.button("Add client"):
+                    okc, msgc = upsert_client(nn, active=True)
+                    if okc:
+                        st.success("Client added.")
+                        try:
+                            fetch_clients.clear()  # type: ignore[attr-defined]
+                        except Exception:
+                            pass
+                        try:
+                            st.rerun()
+                        except Exception:
+                            st.experimental_rerun()
+                    else:
+                        st.error(msgc)
 
-        # Client display name dropdown (clients only; excludes No client & any test test already filtered)
-        # Default to guessed client if present, otherwise the first real client.
-        default_display_idx = 0
-        if client_guess:
-            for i, nm in enumerate(client_names):
-                if _norm_tag(nm) == _norm_tag(client_guess):
-                    default_display_idx = i
-                    break
+        NO_CLIENT = "➤ No client (show ALL, no logging)"   # first item stays 'no logging'
+        add_options = [NO_CLIENT] + client_names
+
+        # Default selection: first REAL client if any; otherwise 0 (No client)
+        default_idx = 1 if len(add_options) > 1 else 0
+        sel_idx = st.selectbox(
+            "Add all stops to client (optional)",
+            list(range(len(add_options))),
+            format_func=lambda i: add_options[i],
+            index=default_idx,
+            key="__tour_client_sel__"
+        )
+
+        # Client display name dropdown (real clients only)
+        # Default to guessed client if present; else mirror the selected real client.
+        display_default = 0
+        if client_names:
+            guessed_idx = next((i for i, nm in enumerate(client_names) if _norm_tag(nm) == _norm_tag(client_guess)), None)
+            if guessed_idx is not None:
+                display_default = guessed_idx
+            else:
+                # if a real client is selected (sel_idx >= 1), mirror it
+                if sel_idx >= 1:
+                    display_default = sel_idx - 1
         display_choice = st.selectbox(
             "Client display name (for the tour record)",
-            client_names,
-            index=default_display_idx if client_names else 0,
+            client_names if client_names else ["—"],
+            index=display_default if client_names else 0,
             key="__tour_display_sel__"
         )
 
-        can_save = (add_options[sel_idx] != NO_CLIENT) and bool(stops)
-        add_clicked = st.button("Add all stops to selected client", use_container_width=True, disabled=not can_save, key="__add_all_btn__")
+        # Button is ALWAYS clickable now; we validate selection on click.
+        add_clicked = st.button("Add all stops to selected client", use_container_width=True, key="__add_all_btn__")
 
-        if add_clicked and can_save:
-            chosen_client = add_options[sel_idx]
-            client_norm = _norm_tag(chosen_client)
+        if add_clicked:
+            chosen_label = add_options[sel_idx]
+            if chosen_label == NO_CLIENT:
+                st.error("Pick a client to save this tour.")
+                return
+            if not client_names:
+                st.error("No clients available. Please add a client first.")
+                return
+
+            client_norm = _norm_tag(chosen_label)
             # Save tour + stops
             ok, msg, tour_id = _insert_tour_and_stops(
                 client_norm=client_norm,
-                client_display=display_choice or chosen_client,
+                client_display=display_choice or chosen_label,
                 tour_date=tour_dt if isinstance(tour_dt, datetime) else None,
                 print_url=parsed.get("source_url") or "",
                 stops=stops
@@ -408,8 +457,7 @@ def render_tours_tab(state: dict):
                 return
 
             # Also log to 'sent'
-            _log_stops_to_sent(client_norm, display_choice or chosen_client, stops)
-
+            _log_stops_to_sent(client_norm, display_choice or chosen_label, stops)
             st.success("Tour saved.")
 
             # Manage quickly: show saved tour and allow removing stops
@@ -417,8 +465,8 @@ def render_tours_tab(state: dict):
             if tour and live_stops:
                 st.markdown("---")
                 st.markdown(
-                    f"**Saved Tour** • {escape(tour.get('client_display') or chosen_client)} • "
-                    f"<span class='t-badge'>{escape(tour.get('tour_date') or dt_label)}</span>",
+                    f"**Saved Tour** • {escape(tour.get('client_display') or chosen_label)} • "
+                    f"<span class='t-badge'>{escape(tour.get('tour_date') or (tour_dt.strftime('%Y-%m-%d') if isinstance(tour_dt, datetime) else '—'))}</span>",
                     unsafe_allow_html=True
                 )
                 for s in live_stops:
