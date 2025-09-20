@@ -12,7 +12,11 @@ from services.clients import (
     fetch_clients, rename_client, toggle_client_active, delete_client, get_already_sent_maps
 )
 from services.resolver_light import (
-    is_probable_url, canonicalize_zillow, make_preview_url, upgrade_to_homedetails_if_needed, resolve_from_source_url
+    is_probable_url,
+    canonicalize_zillow,
+    make_preview_url,
+    upgrade_to_homedetails_if_needed,
+    resolve_from_source_url,
 )
 
 # Optional tours manager (if you added it earlier). If not using tours, you can remove these imports/usage.
