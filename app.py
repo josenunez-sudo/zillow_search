@@ -5,7 +5,7 @@ import sys
 import json
 import streamlit as st
 
-# Path shim (robust for different working dirs)
+# Path shim (robust for different working dirs/Cloud)
 HERE = os.path.dirname(os.path.abspath(__file__))
 if HERE not in sys.path:
     sys.path.insert(0, HERE)
@@ -27,28 +27,28 @@ except Exception:
     spec.loader.exec_module(mod)  # type: ignore
     render_tours_tab = getattr(mod, "render_tours_tab")
 
-# UI
+# ---------- UI ----------
 apply_page_base()
 st.markdown('<h2 class="app-title">Address Alchemist</h2>', unsafe_allow_html=True)
 st.markdown('<p class="app-sub">Paste addresses or <em>any listing links</em> -> verified Zillow links</p>', unsafe_allow_html=True)
 
-# Fixed tab order: Run, Clients, Tours
+# Fixed tab order (do NOT set __active_tab__ here; tabs will set it themselves before reruns)
 tab_run, tab_clients, tab_tours = st.tabs(["Run", "Clients", "Tours"])
 
-# Remember last active tab across reruns
+# Ensure we have a default remembered tab
 if "__active_tab__" not in st.session_state:
     st.session_state["__active_tab__"] = "Run"
 
 with tab_run:
-    st.session_state["__active_tab__"] = "Run"
+    # Don't set __active_tab__ here; let Run tab set it right before it triggers any rerun
     render_run_tab(state=st.session_state)
 
 with tab_clients:
-    st.session_state["__active_tab__"] = "Clients"
+    # Don't set __active_tab__ here; Clients tab will set just-in-time before reruns
     render_clients_tab()
 
 with tab_tours:
-    st.session_state["__active_tab__"] = "Tours"
+    # Tours tab already sets __active_tab__ = "Tours" before calling st.rerun() in its actions
     render_tours_tab(state=st.session_state)
 
 # Re-select the remembered tab after reruns while keeping visible order fixed
