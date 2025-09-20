@@ -1,9 +1,7 @@
 # ui/tours_tab.py
-# Import Tours: parse ShowingTime Print URL or PDF → preview → save to Supabase
-# Also shows a Client Tours Report (with Confirmed/Cancelled per stop).
-# Notes:
-# - Status (confirmed/cancelled) is stored ONLY in tour_stops.status and ONLY displayed in this tab’s report.
-# - We still log stops to 'sent' silently (no status there) for your other tabs.
+# Import Tours: parse ShowingTime Print URL or PDF → preview (address link + time + status tag) → save to Supabase
+# Also shows a Client Tours Report with the same minimal format.
+# No logs printed under the Parse button.
 
 import os, re, io
 from datetime import datetime, date
@@ -13,9 +11,9 @@ from html import escape
 import streamlit as st
 import requests
 
-# Optional PDF parsing
+# Optional PDF parsing (make sure PyPDF2 is in requirements.txt)
 try:
-    import PyPDF2  # ensure PyPDF2 is in requirements.txt
+    import PyPDF2
 except Exception:
     PyPDF2 = None
 
@@ -76,7 +74,7 @@ def _safe_rerun():
 # ---------- Clients ----------
 @st.cache_data(ttl=60, show_spinner=False)
 def fetch_clients(include_inactive: bool = True) -> List[Dict[str, Any]]:
-    """Load clients and HIDE any whose normalized name is 'test test'."""
+    """Load clients and HIDE 'test test'."""
     if not SUPABASE:
         return []
     try:
@@ -91,7 +89,7 @@ def fetch_clients(include_inactive: bool = True) -> List[Dict[str, Any]]:
 # ---------- DB write helpers ----------
 def create_tour(*, client_norm: str, client_display: str, tour_date: date,
                 source_url: str = "", buyer: Optional[str] = None) -> Tuple[bool, Any]:
-    """Insert into 'tours' and return (True, id). Works with older supabase-py (no .select() after insert)."""
+    """Insert into 'tours' and return (True, id)."""
     if not SUPABASE:
         return False, "Supabase not configured."
     try:
@@ -100,8 +98,7 @@ def create_tour(*, client_norm: str, client_display: str, tour_date: date,
             "client": client_norm,
             "client_display": client_display,
             "tour_date": tour_date.isoformat(),
-            # satisfy NOT NULL if present:
-            "url": (source_url or "manual"),
+            "url": (source_url or "manual"),  # avoid NOT NULL failures
             "buyer": buyer or None,
             "status": "requested",
             "created_at": now_iso,
@@ -110,7 +107,7 @@ def create_tour(*, client_norm: str, client_display: str, tour_date: date,
         data = getattr(res, "data", None) or []
         if isinstance(data, list) and data and isinstance(data[0], dict) and "id" in data[0]:
             return True, data[0]["id"]
-        # Fallback: fetch most recent created for that client/date
+        # Fallback fetch
         q = SUPABASE.table("tours").select("id")\
             .eq("client", client_norm)\
             .eq("client_display", client_display)\
@@ -137,7 +134,7 @@ def insert_tour_stops(*, tour_id: int, stops: List[Dict[str, Any]]) -> Tuple[boo
                 "address_slug": s.get("address_slug") or _address_slug(s.get("address","")),
                 "start": s.get("start") or "",
                 "end":   s.get("end") or "",
-                "status": s.get("status") or "unknown",  # <-- persist status here
+                "status": s.get("status") or "unknown",
                 "deeplink": s.get("deeplink") or _zillow_deeplink_from_full_address(s.get("address","")),
             })
         SUPABASE.table("tour_stops").insert(rows).execute()
@@ -146,7 +143,7 @@ def insert_tour_stops(*, tour_id: int, stops: List[Dict[str, Any]]) -> Tuple[boo
         return False, str(getattr(e, "args", [e])[0])
 
 def log_sent_for_stops_silent(*, client_norm: str, stops: List[Dict[str, Any]], tour_date: date) -> None:
-    """Silently log each stop into 'sent' (no status here)."""
+    """Silently log each stop into 'sent' (no extra logs)."""
     if not SUPABASE:
         return
     try:
@@ -166,7 +163,7 @@ def log_sent_for_stops_silent(*, client_norm: str, stops: List[Dict[str, Any]], 
         if rows:
             SUPABASE.table("sent").insert(rows).execute()
     except Exception:
-        pass  # silent
+        pass  # intentionally silent
 
 # ---------- DB read helpers (report) ----------
 @st.cache_data(ttl=60, show_spinner=False)
@@ -213,21 +210,9 @@ def _parse_date_from_text(text: str) -> Optional[date]:
                     pass
     return None
 
-def _parse_buyer_from_text(text: str) -> Optional[str]:
-    m = re.search(r"Buyer['’]s\s+name\s*:\s*([^\n\r]+)", text, re.I)
-    if m:
-        return m.group(1).strip()
-    m2 = re.search(r"Buyer['’]s\s+Tour.*?\b([A-Z][A-Za-z]+(?:\s+[A-Z][A-Za-z]+)+)\b.*?\d+\s+Stops", text, re.I | re.S)
-    if m2:
-        return m2.group(1).strip()
-    return None
-
 def _nearest_status_around(text: str, start_idx: int, end_idx: int) -> str:
-    """
-    Look for CANCELLED or CONFIRMED within a window around the address block.
-    Priority: CANCELLED > CONFIRMED > unknown.
-    """
-    W = 400  # chars window before/after
+    """Status near address block: CANCELLED > CONFIRMED > unknown."""
+    W = 400
     seg = text[max(0, start_idx - W): min(len(text), end_idx + W)]
     if re.search(r"\bCANCELLED\b", seg, re.I):
         return "cancelled"
@@ -236,6 +221,7 @@ def _nearest_status_around(text: str, start_idx: int, end_idx: int) -> str:
     return "unknown"
 
 def _parse_stops_from_text(text: str) -> List[Dict[str, str]]:
+    """Return minimal structured stops: address, start, end, status, address_slug, deeplink."""
     stops: List[Dict[str, str]] = []
     for m in ADDR_LINE_RE.finditer(text):
         addr = re.sub(r"\s+", " ", m.group(1)).strip()
@@ -255,7 +241,7 @@ def _parse_stops_from_text(text: str) -> List[Dict[str, str]]:
             "address": addr,
             "start": start_t,
             "end": end_t,
-            "status": status,  # <-- captured here
+            "status": status,
             "address_slug": _address_slug(addr),
             "deeplink": _zillow_deeplink_from_full_address(addr),
         })
@@ -263,38 +249,36 @@ def _parse_stops_from_text(text: str) -> List[Dict[str, str]]:
     seen = set(); uniq = []
     for s in stops:
         key = (s["address"], s["start"], s["end"])
-        if key in seen: 
+        if key in seen:
             continue
         seen.add(key); uniq.append(s)
     return uniq
 
 def _strip_html_to_text(html: str) -> str:
-    # Replace tags with spaces and squeeze whitespace
     text = re.sub(r"<[^>]+>", " ", html)
     text = re.sub(r"\s+", " ", text)
     return text
 
-def parse_from_print_url(url: str) -> Tuple[Optional[date], Optional[str], List[Dict[str, str]], Optional[str]]:
+def parse_from_print_url(url: str) -> Tuple[Optional[date], List[Dict[str, str]], Optional[str]]:
     if not url or "Tour/Print" not in url:
-        return None, None, [], "Provide a valid ShowingTime Tour Print URL."
+        return None, [], "Provide a valid ShowingTime Tour Print URL."
     try:
         r = requests.get(url, headers=UA_HEADERS, timeout=REQUEST_TIMEOUT)
         if not r.ok:
-            return None, None, [], f"Fetch failed: {r.status_code}"
+            return None, [], f"Fetch failed: {r.status_code}"
         html = r.text
         text = _strip_html_to_text(html)
         d = _parse_date_from_text(text)
-        buyer = _parse_buyer_from_text(text)
         stops = _parse_stops_from_text(text)
         if not stops:
-            return d, buyer, [], "No stops found. Double-check that this is a ShowingTime tour Print page."
-        return d, buyer, stops, None
+            return d, [], "No stops found. Double-check that this is a ShowingTime tour Print page."
+        return d, stops, None
     except Exception as e:
-        return None, None, [], f"Parse error: {e}"
+        return None, [], f"Parse error: {e}"
 
-def parse_from_pdf(uploaded_file) -> Tuple[Optional[date], Optional[str], List[Dict[str, str]], Optional[str]]:
+def parse_from_pdf(uploaded_file) -> Tuple[Optional[date], List[Dict[str, str]], Optional[str]]:
     if not PyPDF2:
-        return None, None, [], "PyPDF2 not installed. Add PyPDF2 to requirements.txt."
+        return None, [], "PyPDF2 not installed. Add PyPDF2 to requirements.txt."
     try:
         data = uploaded_file.read()
         reader = PyPDF2.PdfReader(io.BytesIO(data))
@@ -307,13 +291,12 @@ def parse_from_pdf(uploaded_file) -> Tuple[Optional[date], Optional[str], List[D
         text = "\n".join(raw)
         text = re.sub(r"[ \t]+", " ", text)
         d = _parse_date_from_text(text)
-        buyer = _parse_buyer_from_text(text)
         stops = _parse_stops_from_text(text)
         if not stops:
-            return d, buyer, [], "No stops found in PDF."
-        return d, buyer, stops, None
+            return d, [], "No stops found in PDF."
+        return d, stops, None
     except Exception as e:
-        return None, None, [], f"PDF parse error: {e}"
+        return None, [], f"PDF parse error: {e}"
 
 # ---------- UI state ----------
 STATE_KEY = "__tour_parse__"
@@ -324,7 +307,7 @@ def _set_parsed(payload: Dict[str, Any]):
 def _get_parsed() -> Dict[str, Any]:
     return st.session_state.get(STATE_KEY, {})
 
-# ---------- Styles for badges (times + status) ----------
+# ---------- Styles (time + status badges) ----------
 BADGE_CSS = """
 <style>
 .badge-time {
@@ -343,8 +326,8 @@ BADGE_CSS = """
   font-size: 11px; font-weight: 900; padding: 2px 8px; border-radius: 999px;
   background: #e2e8f0; color: #334155; text-transform: uppercase;
 }
-.tour-card { 
-  padding: 8px 10px; border:1px solid rgba(0,0,0,.08); border-radius:10px; 
+.tour-card {
+  padding: 8px 10px; border:1px solid rgba(0,0,0,.08); border-radius:10px;
   margin: 6px 0; display:flex; align-items:center; justify-content:space-between; gap:10px;
 }
 </style>
@@ -352,18 +335,16 @@ BADGE_CSS = """
 
 def _status_badge_html(status: str) -> str:
     s = (status or "unknown").lower()
-    cls = "badge-status-unknown"
-    label = "Unknown"
-    if s == "confirmed":
-        cls = "badge-status-confirmed"; label = "Confirmed"
-    elif s == "cancelled":
-        cls = "badge-status-cancelled"; label = "Cancelled"
+    cls = "badge-status-unknown"; label = "Unknown"
+    if s == "confirmed":  cls, label = "badge-status-confirmed", "Confirmed"
+    elif s == "cancelled": cls, label = "badge-status-cancelled", "Cancelled"
     return f'<span class="{cls}">{escape(label)}</span>'
 
 # ---------- Main renderer ----------
 def render_tours_tab(state: dict):
     st.subheader("Import Tours")
     st.caption("Paste a ShowingTime Print URL or upload its Tour PDF, preview, then add all included stops.")
+    st.markdown(BADGE_CSS, unsafe_allow_html=True)
 
     # Import UI
     col_u, col_p = st.columns([1.3, 1])
@@ -387,35 +368,30 @@ def render_tours_tab(state: dict):
 
     if parse_clicked:
         if print_url:
-            d, buyer, stops, err = parse_from_print_url(print_url.strip())
+            d, stops, err = parse_from_print_url(print_url.strip())
             source = print_url.strip()
         elif pdf_file is not None:
-            d, buyer, stops, err = parse_from_pdf(pdf_file)
+            d, stops, err = parse_from_pdf(pdf_file)
             source = f"pdf:{pdf_file.name}"
         else:
-            d, buyer, stops, err = None, None, [], "Provide a Print URL or a Tour PDF."
+            d, stops, err = None, [], "Provide a Print URL or a Tour PDF."
             source = ""
 
         if err:
             st.error(err)
         else:
-            flags = [True] * len(stops)
             _set_parsed({
                 "date": d.isoformat() if isinstance(d, date) else None,
-                "buyer": buyer,
                 "stops": stops,     # [{address, start, end, status, address_slug, deeplink}]
                 "source": source,
-                "flags": flags,
+                "flags": [True] * len(stops),
             })
+            # Minimal, clean success message (no logs / extra text)
+            st.success(f"Parsed {len(stops)} stop(s).")
             parsed = _get_parsed()
-            subtitle = []
-            if parsed.get("buyer"): subtitle.append(parsed["buyer"])
-            if parsed.get("date"):  subtitle.append(parsed["date"])
-            st.success(f"Parsed {len(stops)} stop(s)" + ((" • " + " • ".join(subtitle)) if subtitle else ""))
 
-    # Preview section (NOTE: we do NOT show status here, per your request)
+    # Preview (hyperlink + time + status tag only)
     if parsed.get("stops"):
-        st.markdown(BADGE_CSS, unsafe_allow_html=True)
         st.markdown("#### Preview")
         new_flags = []
         for i, s in enumerate(parsed["stops"]):
@@ -430,7 +406,10 @@ def render_tours_tab(state: dict):
                     f"""
                     <div class="tour-card">
                       <a href="{escape(s["deeplink"])}" target="_blank" rel="noopener">{escape(s["address"])}</a>
-                      <span class="badge-time">{escape(time_str) if time_str else "—"}</span>
+                      <div style="display:flex; gap:8px; align-items:center;">
+                        <span class="badge-time">{escape(time_str) if time_str else "—"}</span>
+                        {_status_badge_html(s.get("status","unknown"))}
+                      </div>
                     </div>
                     """,
                     unsafe_allow_html=True
@@ -456,8 +435,8 @@ def render_tours_tab(state: dict):
 
             client_display = sel
             client_norm = name_to_norm.get(sel, _norm_tag(sel))
+
             # Tour date
-            tdate: date
             if parsed.get("date"):
                 try:
                     tdate = datetime.fromisoformat(parsed["date"]).date()
@@ -476,24 +455,24 @@ def render_tours_tab(state: dict):
                 client_display=client_display,
                 tour_date=tdate,
                 source_url=parsed.get("source",""),
-                buyer=parsed.get("buyer")
+                buyer=None  # not displaying buyer anywhere to avoid noisy logs
             )
             if not ok_t:
-                st.error(f"Create tour failed: {tour_id_or_err}")
+                st.error(f"Create tour failed.")
                 st.stop()
             tour_id = tour_id_or_err
 
             ok_s, msg_s = insert_tour_stops(tour_id=int(tour_id), stops=final_stops)
             if not ok_s:
-                st.error(f"Insert stops failed: {msg_s}")
+                st.error(f"Insert stops failed.")
                 st.stop()
 
-            # Silent logging to 'sent' (no status included)
+            # Silent logging to 'sent'
             log_sent_for_stops_silent(client_norm=client_norm, stops=final_stops, tour_date=tdate)
 
-            st.success(f"Saved {len(final_stops)} stop(s) to {client_display} for {tdate}.")
+            st.success(f"Saved {len(final_stops)} stop(s).")
 
-    # -------- Client Tours Report (status only visible here) --------
+    # -------- Client Tours Report (same clean format) --------
     st.markdown("### Client Tours Report")
     clients_all = fetch_clients(include_inactive=True)
     if not clients_all:
@@ -513,27 +492,22 @@ def render_tours_tab(state: dict):
         st.markdown(BADGE_CSS, unsafe_allow_html=True)
         for t in tours:
             tdate = (t.get("tour_date") or "")[:10]
-            buyer = t.get("buyer") or ""
-            subtitle_bits = [tdate]
-            if buyer: subtitle_bits.append(buyer)
-            st.markdown(f"**Tour — {' • '.join([escape(x) for x in subtitle_bits if x])}**")
+            st.markdown(f"**Tour — {escape(tdate)}**")
 
             stops = fetch_stops_for_tour(int(t["id"]))
             if not stops:
                 st.caption("_No stops saved for this tour._")
                 continue
 
-            # Render stops with TIME + STATUS
             for s in stops:
                 time_str = f'{s.get("start","")} – {s.get("end","")}'.strip(" –")
-                status_html = _status_badge_html(s.get("status","unknown"))
                 st.markdown(
                     f"""
                     <div class="tour-card">
                       <a href="{escape(s.get('deeplink',''))}" target="_blank" rel="noopener">{escape(s.get('address',''))}</a>
                       <div style="display:flex; gap:8px; align-items:center;">
                         <span class="badge-time">{escape(time_str) if time_str else "—"}</span>
-                        {status_html}
+                        {_status_badge_html(s.get("status","unknown"))}
                       </div>
                     </div>
                     """,
