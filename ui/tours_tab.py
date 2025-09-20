@@ -1,8 +1,9 @@
 # ui/tours_tab.py
 # Tours tab: parse ShowingTime print URL or PDF -> stops with date/time + address.
 # Cross-check with Supabase 'sent' by address slug, optional store to tours/tour_stops.
+# Includes de-glitching of PDF text like "W ashington" -> "Washington", "V arina" -> "Varina", "W est" -> "West".
 
-import os, re, io, json, datetime
+import os, re, io, datetime
 from typing import List, Dict, Any, Optional, Tuple
 from html import escape
 
@@ -94,6 +95,33 @@ def _zillow_deeplink_for_address(addr: str) -> str:
     slug = _address_slug(addr)
     return f"https://www.zillow.com/homes/{slug}_rb/"
 
+# ---- NEW: Normalize glitched text like "W ashington", "V arina", "W est", "W inchester" ----
+def _normalize_glitched_text(text: str) -> str:
+    if not text:
+        return text
+    # Keep newlines; collapse horizontal whitespace only
+    text = re.sub(r"[ \t]+", " ", text)
+    text = text.replace("\r", "")
+
+    # Pass 1: merge capital single-letter + lowercase cluster: "W ashington" -> "Washington", "V arina" -> "Varina"
+    text = re.sub(r"\b([A-Z])\s+([a-z]{2,})\b", r"\1\2", text)
+
+    # Pass 2: merge repeated glitches inside same word: e.g., after pass1, "N W est" -> still has "W est"
+    text = re.sub(r"\b([A-Z])\s+([a-z]{2,})\b", r"\1\2", text)
+
+    # Pass 3: very common street words that sometimes split mid-word
+    common_words = ["Washington", "Winchester", "Watauga", "Varina", "West", "Jackson", "Atlantic", "Longfellow", "Saturn", "Pine"]
+    for w in common_words:
+        # Turn things like "W ashington" / "W   ashington" into "Washington"
+        first = w[0]
+        rest = w[1:]
+        pat = rf"\b{first}\s+{rest}\b"
+        text = re.sub(pat, w, text, flags=re.I)
+
+    # Tighten excessive newlines
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text
+
 def _extract_text_from_pdf(file_bytes: bytes) -> str:
     if not PyPDF2:
         raise RuntimeError("PyPDF2 not installed")
@@ -105,7 +133,8 @@ def _extract_text_from_pdf(file_bytes: bytes) -> str:
                 parts.append(p.extract_text() or "")
             except Exception:
                 continue
-        return "\n".join(parts)
+        raw = "\n".join(parts)
+        return _normalize_glitched_text(raw)
 
 def _fetch_print_html(url: str) -> str:
     r = requests.get(url, headers=UA_HEADERS, timeout=15)
@@ -123,7 +152,6 @@ def _parse_date(text: str) -> Optional[str]:
         m = re.search(p, text, re.I)
         if m:
             raw = m.group(1).strip()
-            # Normalize to YYYY-MM-DD for sorting/consistency; keep display as raw too
             try:
                 dt = None
                 if re.match(r"^\d{1,2}/\d{1,2}/\d{2,4}$", raw):
@@ -131,7 +159,6 @@ def _parse_date(text: str) -> Optional[str]:
                     yy = yy if yy > 99 else (2000 + yy)
                     dt = datetime.date(yy, mm, dd)
                 else:
-                    # e.g. "Friday, September 19, 2025"
                     dt = datetime.datetime.strptime(raw, "%A, %B %d, %Y").date()
                 return dt.isoformat()
             except Exception:
@@ -143,53 +170,48 @@ def _parse_stops_from_text(text: str) -> Tuple[Optional[str], List[Dict[str, Any
     Extract tour_date + stop items of {address, start, end, raw_time}.
     Heuristics that work for ShowingTime print page and their PDF text.
     """
-    # Normalize whitespace
-    txt = re.sub(r"[ \t]+", " ", (text or ""))
-    txt = re.sub(r"\r", "", txt)
+    # Normalize (keep newlines for proximity matching)
+    txt = _normalize_glitched_text(text)
 
     tour_date = _parse_date(txt)
 
-    # Candidate address lines and time ranges
-    # Address: "123 Main St, City, ST 12345" (capture apt/unit as well)
+    # Address like "114 Atlantic Avenue, Benson, NC 27504"
     ADDR_RE = re.compile(r"(\d{1,6}\s+[^\n,]+,\s*[A-Za-z .\-']+,\s*[A-Z]{2}\s+\d{5}(?:-\d{4})?)")
     # Time windows like "10:00 AM - 10:15 AM" or "1:15PM-1:30PM"
     TIME_RE = re.compile(r"(\d{1,2}:\d{2}\s*[AP]M)\s*[-–]\s*(\d{1,2}:\d{2}\s*[AP]M)", re.I)
-
-    # Sometimes ShowingTime prints "Appt Time:" or "Time:" near the address
-    BLOCK_RE = re.compile(r"(Address|Property|Location)[:\s]+(.+?)\s+(?:Appt\s*Time|Time)[:\s]+(.{1,40}?[AP]M\s*[-–]\s*.{1,40}?[AP]M)", re.I | re.DOTALL)
+    # Structured "Address: ... Time: ..." blocks
+    BLOCK_RE = re.compile(r"(Address|Property|Location)[:\s]+(.+?)\s+(?:Appt\s*Time|Time)[:\s]+(.{1,60}?[AP]M\s*[-–]\s*.{1,60}?[AP]M)", re.I | re.DOTALL)
 
     stops: List[Dict[str, Any]] = []
 
-    # First try structured "Address: ... Time: ..." blocks
+    # Try structured blocks first
     for m in BLOCK_RE.finditer(txt):
-        addr = m.group(2).strip()
-        when = m.group(3).strip()
+        addr = re.sub(r"\s+", " ", m.group(2).strip())
+        when = " ".join(m.group(3).split())
         tm = TIME_RE.search(when)
         start, end = (tm.group(1).strip(), tm.group(2).strip()) if tm else ("", "")
         stops.append({"address": addr, "start": start, "end": end, "raw_time": when})
 
-    # If nothing found, fall back to scanning lines: match time, then nearest address line
+    # Fallback: match time lines + nearest address line within a few lines
     if not stops:
-        # Split on newlines to keep proximity
-        lines = [re.sub(r"\s+", " ", ln).strip() for ln in (text or "").splitlines()]
-        # Pair by proximity: time line followed by an address line within next ~3 lines
+        lines = [(ln or "").strip() for ln in txt.splitlines()]
         for i, ln in enumerate(lines):
             t = TIME_RE.search(ln)
             if t:
-                # search forward for an address
                 addr = ""
-                for j in range(i+1, min(i+5, len(lines))):
+                for j in range(i+1, min(i+6, len(lines))):
                     a = ADDR_RE.search(lines[j])
                     if a:
-                        addr = a.group(1).strip()
+                        addr = re.sub(r"\s+", " ", a.group(1).strip())
                         break
                 if addr:
                     stops.append({"address": addr, "start": t.group(1).strip(), "end": t.group(2).strip(), "raw_time": ln})
 
-    # As a last resort, collect all addresses without times (still useful to save)
+    # Last resort: collect addresses only
     if not stops:
         for a in ADDR_RE.finditer(txt):
-            stops.append({"address": a.group(1).strip(), "start": "", "end": "", "raw_time": ""})
+            addr = re.sub(r"\s+", " ", a.group(1).strip())
+            stops.append({"address": addr, "start": "", "end": "", "raw_time": ""})
 
     # De-dup by address + time
     uniq = {}
@@ -208,11 +230,18 @@ def parse_tour_from_print_url(url: str) -> Tuple[Optional[str], List[Dict[str, A
     except Exception as e:
         return None, [], f"Fetch failed: {e}"
 
-    # Remove HTML tags to get text quickly
-    text = re.sub(r"<br\s*/?>", "\n", html, flags=re.I)
+    # Preserve <br> as newlines, strip tags, but DO NOT collapse newlines away
+    text = re.sub(r"(?i)<br\s*/?>", "\n", html)
+    text = re.sub(r"(?s)<script[^>]*>.*?</script>", " ", text)
+    text = re.sub(r"(?s)<style[^>]*>.*?</style>", " ", text)
     text = re.sub(r"<[^>]+>", " ", text)
-    text = re.sub(r"&nbsp;", " ", text)
-    text = re.sub(r"\s+", " ", text)
+    text = text.replace("&nbsp;", " ")
+    # Collapse horizontal spaces, keep newlines
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+
+    # Fix broken words before parsing
+    text = _normalize_glitched_text(text)
 
     td, stops = _parse_stops_from_text(text)
     if not stops:
@@ -256,7 +285,6 @@ def _address_matches_sent(addr: str, sent_rows: List[Dict[str, Any]]) -> bool:
         u = (r.get("url") or "").lower()
         if not u:
             continue
-        # If slug appears in the homedetails or homes path, count it
         if "/homedetails/" in u or "/homes/" in u:
             if slug in u:
                 return True
@@ -267,7 +295,6 @@ def _store_tour(client_norm: str, client_display: str, tour_date_iso: Optional[s
     if not (_sb_ok() and client_norm and stops):
         return False, "Not configured or empty."
     try:
-        # Insert parent tour
         payload = {
             "client": client_norm,
             "client_display": client_display,
@@ -294,7 +321,6 @@ def _store_tour(client_norm: str, client_display: str, tour_date_iso: Optional[s
         SUPABASE.table("tour_stops").insert(rows).execute()
         return True, "Saved to tours/tour_stops."
     except Exception as e:
-        # Table might not exist — don't fail the UI
         return False, f"Save skipped/failed: {e}"
 
 # ---------- UI ----------
@@ -309,7 +335,6 @@ def render_tours_tab(state: dict):
     with colR:
         pdf_file = st.file_uploader("…or drop a Tour PDF", type=["pdf"])
 
-    # Parse action
     go = st.button("Parse tour", use_container_width=True)
     tour_date_iso: Optional[str] = None
     stops: List[Dict[str, Any]] = []
@@ -363,7 +388,7 @@ def render_tours_tab(state: dict):
                 "Add all stops to client (optional)",
                 options,
                 format_func=lambda i: ("— Select —" if i == sentinel else names[i]),
-                index=0  # FIXED: valid index; first option is sentinel
+                index=0  # valid index (sentinel)
             )
             chosen_client = active_clients[idx] if (idx is not None and idx >= 0 and idx < len(active_clients)) else None
             client_norm = _norm_tag(chosen_client["name"]) if chosen_client else ""
@@ -404,5 +429,4 @@ def render_tours_tab(state: dict):
                     else:
                         st.warning(msg)
 
-    # Helpful note about dependencies
-    st.caption("Tip: If PDF parsing fails, make sure `PyPDF2` is in your requirements.txt.")
+
