@@ -1,23 +1,19 @@
 # ui/tours_tab.py
-# Tours tab: parse ShowingTime Print URL or PDF -> stops with date/time + address (as link).
-# Cross-check against Supabase 'sent' and previously 'toured' (tours/tour_stops) by address slug.
-# Shows chips: SENT and TOURED (with most recent tour date/time). Stores address_slug for future lookups.
+# Tours tab: list clients (Active/Inactive), open a client's Tours report,
+# view/edit tour stops (showings), add tours & stops, with clickable links + times.
 
-import os, re, io, datetime
-from typing import List, Dict, Any, Optional, Tuple
+import os
+import re
+import io
+from datetime import date, datetime
+from typing import List, Dict, Any, Optional
 from html import escape
+from urllib.parse import quote_plus
 
-import requests
 import streamlit as st
-
-# ---- Optional PDF dep (install via requirements.txt: PyPDF2==3.0.1)
-try:
-    import PyPDF2  # type: ignore
-except Exception:
-    PyPDF2 = None
-
-# ---------- Supabase ----------
 from supabase import create_client, Client
+
+# ───────────────────────────── Supabase ─────────────────────────────
 
 @st.cache_resource
 def _get_supabase() -> Optional[Client]:
@@ -33,16 +29,70 @@ def _get_supabase() -> Optional[Client]:
 SUPABASE = _get_supabase()
 
 def _sb_ok() -> bool:
-    try: return bool(SUPABASE)
-    except NameError: return False
+    try:
+        return bool(SUPABASE)
+    except NameError:
+        return False
+
+# ───────────────────────────── Utils ─────────────────────────────
 
 def _norm_tag(s: str) -> str:
     return re.sub(r"\s+", " ", (s or "").strip()).lower()
 
-# ---------- Clients (cached) ----------
+def _slug_addr_for_match(s: str) -> str:
+    s = (s or "").lower()
+    s = re.sub(r"[#,.]+", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    s = re.sub(r"[^a-z0-9]+", "-", s).strip("-")
+    return s
+
+def _qp_get(name, default=None):
+    try:
+        qp = st.query_params
+        val = qp.get(name, default)
+        if isinstance(val, list) and val:
+            return val[0]
+        return val
+    except Exception:
+        qp = st.experimental_get_query_params()
+        return (qp.get(name, [default]) or [default])[0]
+
+def _qp_set(**kwargs):
+    try:
+        if kwargs:
+            st.query_params.update(kwargs)
+        else:
+            st.query_params.clear()
+    except Exception:
+        if kwargs:
+            st.experimental_set_query_params(**kwargs)
+        else:
+            st.experimental_set_query_params()
+
+def _safe_rerun():
+    try:
+        st.rerun()
+    except Exception:
+        try:
+            st.experimental_rerun()
+        except Exception:
+            pass
+
+def _zillow_deeplink_from_addr(addr: str) -> str:
+    # Clean, stable search deeplink (works well for SMS unfurls)
+    s = re.sub(r"\s+", " ", (addr or "").strip())
+    if not s:
+        return ""
+    slug = re.sub(r"[^\w\s,-]", "", s).replace(",", "")
+    slug = re.sub(r"\s+", "-", slug.strip())
+    return f"https://www.zillow.com/homes/{slug}_rb/"
+
+# ────────────────────────── Client registry ──────────────────────────
+
 @st.cache_data(ttl=60, show_spinner=False)
 def fetch_clients(include_inactive: bool = False):
-    if not _sb_ok(): return []
+    if not _sb_ok():
+        return []
     try:
         rows = SUPABASE.table("clients").select("id,name,name_norm,active").order("name", desc=False).execute().data or []
         rows = [r for r in rows if r.get("name_norm") != _norm_tag("test test")]
@@ -50,462 +100,370 @@ def fetch_clients(include_inactive: bool = False):
     except Exception:
         return []
 
-# ---------- Styles: high-contrast chips ----------
-def _apply_local_styles():
-    st.markdown("""
-    <style>
-      .tour-box { border:1px solid rgba(0,0,0,.08); border-radius:12px; padding:14px; }
-      .chip-date {
-        display:inline-block; padding:4px 10px; border-radius:999px;
-        font-weight:800; font-size:12.5px; letter-spacing:.2px;
-        color:#0f172a; background:linear-gradient(180deg,#fde68a 0%, #f59e0b 100%);
-        border:1px solid rgba(245,158,11,.45); box-shadow:0 6px 16px rgba(245,158,11,.22),0 1px 3px rgba(0,0,0,.08);
-      }
-      html[data-theme="dark"] .chip-date, .stApp [data-theme="dark"] .chip-date {
-        color:#111827; background:linear-gradient(180deg,#fde047 0%, #f59e0b 100%);
-        border:1px solid rgba(245,158,11,.55); box-shadow:0 6px 16px rgba(217,119,6,.45),0 1px 3px rgba(0,0,0,.35);
-      }
-
-      .chip-sent {
-        display:inline-block; padding:2px 8px; border-radius:999px; font-weight:800; font-size:11px;
-        color:#065f46; background:#dcfce7; border:1px solid rgba(5,150,105,.35);
-      }
-      html[data-theme="dark"] .chip-sent { color:#a7f3d0; background:#064e3b; border-color:rgba(167,243,208,.35);}
-
-      .chip-tour {
-        display:inline-block; padding:2px 8px; border-radius:999px; font-weight:800; font-size:11px;
-        color:#1e3a8a; background:#dbeafe; border:1px solid rgba(59,130,246,.35);
-      }
-      html[data-theme="dark"] .chip-tour { color:#bfdbfe; background:#1e3a8a; border-color:rgba(147,197,253,.35);}
-
-      .small { font-size:12.5px; color:#64748b; }
-      .stop-card { border-bottom:1px solid rgba(0,0,0,.06); padding:10px 0; }
-      .stop-card:last-child { border-bottom:0; }
-      .addr { font-weight:700; }
-      .time { color:#475569; }
-      .actions { margin-top:6px; }
-      .list-link { text-decoration:none; font-weight:600; }
-      a.addr-link { text-decoration:none; }
-    </style>
-    """, unsafe_allow_html=True)
-
-# ---------- Helpers ----------
-UA_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36",
-}
-
-def _address_slug(addr: str) -> str:
-    a = (addr or "").lower()
-    a = re.sub(r"[^\w\s,-]", "", a).replace(",", "")
-    a = re.sub(r"\s+", "-", a.strip())
-    return a
-
-def _zillow_deeplink_for_address(addr: str) -> str:
-    slug = _address_slug(addr)
-    return f"https://www.zillow.com/homes/{slug}_rb/"
-
-# ---- Normalize glitched text like "W ashington", "V arina", "W est", "W inchester"
-def _normalize_glitched_text(text: str) -> str:
-    if not text:
-        return text
-    # Keep newlines; collapse horizontal whitespace only
-    text = re.sub(r"[ \t]+", " ", text)
-    text = text.replace("\r", "")
-
-    # Merge capital single-letter + lowercase cluster twice (handles "W est" and "N W est" chains)
-    text = re.sub(r"\b([A-Z])\s+([a-z]{2,})\b", r"\1\2", text)
-    text = re.sub(r"\b([A-Z])\s+([a-z]{2,})\b", r"\1\2", text)
-
-    # Specific common street/place names seen split in PDFs
-    common_words = ["Washington", "Winchester", "Watauga", "Varina", "West", "Jackson", "Atlantic", "Longfellow", "Saturn", "Pine"]
-    for w in common_words:
-        first, rest = w[0], w[1:]
-        text = re.sub(rf"\b{first}\s+{rest}\b", w, text, flags=re.I)
-
-    # Tighten excessive newlines
-    text = re.sub(r"\n{3,}", "\n\n", text)
-    return text
-
-def _extract_text_from_pdf(file_bytes: bytes) -> str:
-    if not PyPDF2:
-        raise RuntimeError("PyPDF2 not installed")
-    with io.BytesIO(file_bytes) as bio:
-        reader = PyPDF2.PdfReader(bio)
-        parts = []
-        for p in reader.pages:
-            try:
-                parts.append(p.extract_text() or "")
-            except Exception:
-                continue
-        raw = "\n".join(parts)
-        return _normalize_glitched_text(raw)
-
-def _fetch_print_html(url: str) -> str:
-    r = requests.get(url, headers=UA_HEADERS, timeout=15)
-    r.raise_for_status()
-    return r.text
-
-def _parse_date(text: str) -> Optional[str]:
-    # "Tour Date: 9/19/2025", "Date: Friday, September 19, 2025", or naked "9/19/2025"
-    pats = [
-        r"Tour Date\s*:\s*([0-9]{1,2}/[0-9]{1,2}/[0-9]{2,4})",
-        r"Date\s*:\s*([A-Za-z]+,\s+[A-Za-z]+\s+[0-9]{1,2},\s+[0-9]{4})",
-        r"\b([0-9]{1,2}/[0-9]{1,2}/[0-9]{2,4})\b",
-    ]
-    for p in pats:
-        m = re.search(p, text, re.I)
-        if m:
-            raw = m.group(1).strip()
-            try:
-                if re.match(r"^\d{1,2}/\d{1,2}/\d{2,4}$", raw):
-                    mm, dd, yy = [int(x) for x in raw.split("/")]
-                    yy = yy if yy > 99 else (2000 + yy)
-                    dt = datetime.date(yy, mm, dd)
-                else:
-                    dt = datetime.datetime.strptime(raw, "%A, %B %d, %Y").date()
-                return dt.isoformat()
-            except Exception:
-                return raw
-    return None
-
-def _parse_stops_from_text(text: str) -> Tuple[Optional[str], List[Dict[str, Any]]]:
-    """
-    Extract tour_date + stop items of {address, start, end, raw_time}.
-    Works for ShowingTime print page & their PDF text.
-    """
-    # Normalize (keep newlines for proximity matching)
-    txt = _normalize_glitched_text(text)
-
-    tour_date = _parse_date(txt)
-
-    # Address like "114 Atlantic Avenue, Benson, NC 27504"
-    ADDR_RE = re.compile(r"(\d{1,6}\s+[^\n,]+,\s*[A-Za-z .\-']+,\s*[A-Z]{2}\s+\d{5}(?:-\d{4})?)")
-    # Time windows like "10:00 AM - 10:15 AM" or "1:15PM-1:30PM"
-    TIME_RE = re.compile(r"(\d{1,2}:\d{2}\s*[AP]M)\s*[-–]\s*(\d{1,2}:\d{2}\s*[AP]M)", re.I)
-    # Structured "Address: ... Time: ..." blocks
-    BLOCK_RE = re.compile(r"(Address|Property|Location)[:\s]+(.+?)\s+(?:Appt\s*Time|Time)[:\s]+(.{1,80}?[AP]M\s*[-–]\s*.{1,80}?[AP]M)", re.I | re.DOTALL)
-
-    stops: List[Dict[str, Any]] = []
-
-    # Try structured blocks first
-    for m in BLOCK_RE.finditer(txt):
-        addr = re.sub(r"\s+", " ", m.group(2).strip())
-        when = " ".join(m.group(3).split())
-        tm = TIME_RE.search(when)
-        start, end = (tm.group(1).strip(), tm.group(2).strip()) if tm else ("", "")
-        stops.append({"address": addr, "start": start, "end": end, "raw_time": when})
-
-    # Fallback: match time lines + nearest address line within a few lines
-    if not stops:
-        lines = [(ln or "").strip() for ln in txt.splitlines()]
-        for i, ln in enumerate(lines):
-            t = TIME_RE.search(ln)
-            if t:
-                addr = ""
-                for j in range(i+1, min(i+6, len(lines))):
-                    a = ADDR_RE.search(lines[j])
-                    if a:
-                        addr = re.sub(r"\s+", " ", a.group(1).strip())
-                        break
-                if addr:
-                    stops.append({"address": addr, "start": t.group(1).strip(), "end": t.group(2).strip(), "raw_time": ln})
-
-    # Last resort: collect addresses only
-    if not stops:
-        for a in ADDR_RE.finditer(txt):
-            addr = re.sub(r"\s+", " ", a.group(1).strip())
-            stops.append({"address": addr, "start": "", "end": "", "raw_time": ""})
-
-    # De-dup by address + time
-    uniq = {}
-    for s in stops:
-        key = (s.get("address",""), s.get("start",""), s.get("end",""))
-        if key not in uniq:
-            uniq[key] = s
-    stops = list(uniq.values())
-
-    return tour_date, stops
-
-def parse_tour_from_print_url(url: str) -> Tuple[Optional[str], List[Dict[str, Any]], Optional[str]]:
-    """Return (tour_date_iso, stops, err)."""
+def _invalidate_clients_cache():
     try:
-        html = _fetch_print_html(url)
-    except Exception as e:
-        return None, [], f"Fetch failed: {e}"
+        fetch_clients.clear()  # type: ignore[attr-defined]
+    except Exception:
+        pass
 
-    # Preserve <br> as newlines, strip tags, but DO NOT collapse newlines away
-    text = re.sub(r"(?i)<br\s*/?>", "\n", html)
-    text = re.sub(r"(?s)<script[^>]*>.*?</script>", " ", text)
-    text = re.sub(r"(?s)<style[^>]*>.*?</style>", " ", text)
-    text = re.sub(r"<[^>]+>", " ", text)
-    text = text.replace("&nbsp;", " ")
-    # Collapse horizontal spaces, keep newlines
-    text = re.sub(r"[ \t]+", " ", text)
-    text = re.sub(r"\n{3,}", "\n\n", text)
+# ───────────────────────────── Tours data ─────────────────────────────
 
-    # Fix broken words before parsing
-    text = _normalize_glitched_text(text)
-
-    td, stops = _parse_stops_from_text(text)
-    if not stops:
-        return td, [], "No stops found on the print page."
-    return td, stops, None
-
-def parse_tour_from_pdf(file_bytes: bytes) -> Tuple[Optional[str], List[Dict[str, Any]], Optional[str]]:
-    if not PyPDF2:
-        return None, [], "PyPDF2 not installed"
-    try:
-        txt = _extract_text_from_pdf(file_bytes)
-        td, stops = _parse_stops_from_text(txt)
-        if not stops:
-            return td, [], "No stops found in the PDF text."
-        return td, stops, None
-    except Exception as e:
-        return None, [], f"PDF parse error: {e}"
-
-# ---------- Sent cross-check ----------
 @st.cache_data(ttl=120, show_spinner=False)
-def _fetch_sent_for_client(client_norm: str, limit: int = 5000):
+def fetch_tours_for_client(client_norm: str) -> List[Dict[str, Any]]:
     if not (_sb_ok() and client_norm.strip()):
         return []
     try:
-        cols = "url,address,sent_at,campaign,mls_id,canonical,zpid"
-        resp = SUPABASE.table("sent")\
-            .select(cols)\
+        rows = SUPABASE.table("tours")\
+            .select("id, client, client_display, tour_date, created_at")\
             .eq("client", client_norm.strip())\
-            .order("sent_at", desc=True)\
-            .limit(limit)\
-            .execute()
-        return resp.data or []
+            .order("tour_date", desc=True)\
+            .limit(2000).execute().data or []
+        return rows
     except Exception:
         return []
 
-def _address_matches_sent(addr: str, sent_rows: List[Dict[str, Any]]) -> bool:
-    slug = _address_slug(addr)
-    if not slug:
-        return False
-    for r in sent_rows:
-        u = (r.get("url") or "").lower()
-        if not u:
-            continue
-        if "/homedetails/" in u or "/homes/" in u:
-            if slug in u:
-                return True
-    return False
-
-# ---------- Previously toured cross-check ----------
-@st.cache_data(ttl=90, show_spinner=False)
-def _prev_tour_index_for_client(client_norm: str) -> Dict[str, List[Dict[str, str]]]:
-    """
-    Returns slug -> list of {date,start,end,address} for that client.
-    Most recent first.
-    """
-    out: Dict[str, List[Dict[str, str]]] = {}
-    if not (_sb_ok() and (client_norm or "").strip()):
-        return out
+def _invalidate_tours_cache():
     try:
-        tours = SUPABASE.table("tours").select("id,tour_date").eq("client", client_norm.strip())\
-                .order("tour_date", desc=True).limit(2000).execute().data or []
-        if not tours:
-            return out
-        id_to_date = {t["id"]: (t.get("tour_date") or None) for t in tours if t.get("id")}
-        tour_ids = list(id_to_date.keys())
-        if not tour_ids:
-            return out
-
-        # fetch all stops for these tours
-        # Note: supabase-py supports .in_(col, list)
-        stops = SUPABASE.table("tour_stops")\
-            .select("tour_id,address,address_slug,start,end")\
-            .in_("tour_id", tour_ids)\
-            .limit(20000)\
-            .execute().data or []
-
-        for s in stops:
-            slug = s.get("address_slug") or _address_slug(s.get("address",""))
-            if not slug:
-                continue
-            out.setdefault(slug, [])
-            out[slug].append({
-                "date": id_to_date.get(s.get("tour_id")),
-                "start": s.get("start") or "",
-                "end": s.get("end") or "",
-                "address": s.get("address") or "",
-            })
-
-        # sort most recent first
-        for slug, items in out.items():
-            items.sort(key=lambda x: (x.get("date") or ""), reverse=True)
-        return out
+        fetch_tours_for_client.clear()  # type: ignore[attr-defined]
     except Exception:
-        return out
+        pass
 
-# ---------- Store to tours tables (optional) ----------
-def _store_tour(client_norm: str, client_display: str, tour_date_iso: Optional[str], stops: List[Dict[str, Any]]) -> Tuple[bool,str]:
-    if not (_sb_ok() and client_norm and stops):
-        return False, "Not configured or empty."
+@st.cache_data(ttl=120, show_spinner=False)
+def fetch_stops_for_tour(tour_id: int) -> List[Dict[str, Any]]:
+    if not (_sb_ok() and tour_id):
+        return []
+    try:
+        rows = SUPABASE.table("tour_stops")\
+            .select("id, tour_id, address, start, end, deeplink, address_slug")\
+            .eq("tour_id", tour_id)\
+            .order("start", desc=False)\
+            .limit(500).execute().data or []
+        return rows
+    except Exception:
+        return []
+
+def _invalidate_stops_cache():
+    try:
+        fetch_stops_for_tour.clear()  # type: ignore[attr-defined]
+    except Exception:
+        pass
+
+# ───────────────────────────── Tours CRUD ─────────────────────────────
+
+def create_tour(client_norm: str, client_display: str, tour_date: date):
+    if not _sb_ok():
+        return False, "Supabase not configured"
     try:
         payload = {
-            "client": client_norm,
-            "client_display": client_display,
-            "tour_date": tour_date_iso or None,
-            "created_at": datetime.datetime.utcnow().isoformat(timespec="seconds") + "Z"
+            "client": client_norm.strip(),
+            "client_display": (client_display or "").strip(),
+            "tour_date": str(tour_date),
         }
-        res = SUPABASE.table("tours").insert(payload).execute()
-        tour_id = (res.data or [{}])[0].get("id")
-        if not tour_id:
-            return False, "Insert tours row failed."
-
-        rows = []
-        for s in stops:
-            addr = s.get("address","")
-            start = s.get("start","")
-            end   = s.get("end","")
-            rows.append({
-                "tour_id": tour_id,
-                "address": addr,
-                "address_slug": _address_slug(addr) if addr else None,
-                "start": start,
-                "end": end,
-                "deeplink": _zillow_deeplink_for_address(addr) if addr else None
-            })
-        SUPABASE.table("tour_stops").insert(rows).execute()
-        return True, "Saved to tours/tour_stops."
+        resp = SUPABASE.table("tours").insert(payload).execute()
+        _invalidate_tours_cache()
+        return True, resp.data[0]["id"] if resp.data else True
     except Exception as e:
-        return False, f"Save skipped/failed: {e}"
+        return False, str(e)
 
-# ---------- UI ----------
-def render_tours_tab(state: dict):
-    _apply_local_styles()
+def delete_tour(tour_id: int):
+    if not _sb_ok():
+        return False, "Supabase not configured"
+    try:
+        SUPABASE.table("tour_stops").delete().eq("tour_id", tour_id).execute()
+        SUPABASE.table("tours").delete().eq("id", tour_id).execute()
+        _invalidate_tours_cache()
+        return True, "ok"
+    except Exception as e:
+        return False, str(e)
 
-    st.subheader("Tours")
+def add_stop(tour_id: int, address: str, start: str, end: str, deeplink: str = ""):
+    if not _sb_ok():
+        return False, "Supabase not configured"
+    try:
+        if not deeplink:
+            deeplink = _zillow_deeplink_from_addr(address)
+        payload = {
+            "tour_id": tour_id,
+            "address": address.strip(),
+            "address_slug": _slug_addr_for_match(address),
+            "start": (start or "").strip(),
+            "end": (end or "").strip(),
+            "deeplink": deeplink.strip(),
+        }
+        SUPABASE.table("tour_stops").insert(payload).execute()
+        _invalidate_stops_cache()
+        return True, "ok"
+    except Exception as e:
+        return False, str(e)
 
-    colL, colR = st.columns([1.2, 1])
-    with colL:
-        tour_url = st.text_input("Paste ShowingTime Print URL", placeholder="https://scheduling.showingtime.com/.../Tour/Print/30235965")
-    with colR:
-        pdf_file = st.file_uploader("…or drop a Tour PDF", type=["pdf"])
+def update_stop(stop_id: int, *, address: Optional[str] = None, start: Optional[str] = None,
+                end: Optional[str] = None, deeplink: Optional[str] = None):
+    if not _sb_ok():
+        return False, "Supabase not configured"
+    try:
+        patch: Dict[str, Any] = {}
+        if address is not None:
+            patch["address"] = address.strip()
+            patch["address_slug"] = _slug_addr_for_match(address)
+        if start is not None:
+            patch["start"] = start.strip()
+        if end is not None:
+            patch["end"] = end.strip()
+        if deeplink is not None:
+            patch["deeplink"] = deeplink.strip() or _zillow_deeplink_from_addr(address or "")
+        if not patch:
+            return True, "noop"
+        SUPABASE.table("tour_stops").update(patch).eq("id", stop_id).execute()
+        _invalidate_stops_cache()
+        return True, "ok"
+    except Exception as e:
+        return False, str(e)
 
-    go = st.button("Parse tour", use_container_width=True)
-    tour_date_iso: Optional[str] = None
-    stops: List[Dict[str, Any]] = []
-    err: Optional[str] = None
+def delete_stop(stop_id: int):
+    if not _sb_ok():
+        return False, "Supabase not configured"
+    try:
+        SUPABASE.table("tour_stops").delete().eq("id", stop_id).execute()
+        _invalidate_stops_cache()
+        return True, "ok"
+    except Exception as e:
+        return False, str(e)
 
-    if go:
-        if tour_url.strip():
-            tour_date_iso, stops, err = parse_tour_from_print_url(tour_url.strip())
-        elif pdf_file is not None:
-            try:
-                buf = pdf_file.getvalue()
-            except Exception:
-                buf = None
-            if buf:
-                tour_date_iso, stops, err = parse_tour_from_pdf(buf)
-            else:
-                err = "Could not read PDF bytes."
-        else:
-            err = "Provide a ShowingTime Print URL or upload a PDF."
+# ───────────────────────────── UI helpers ─────────────────────────────
 
-        if err:
-            st.error("Could not parse this tour. Please ensure it is the ShowingTime Print page or the exported Tour PDF.")
-            with st.expander("Parser details"):
-                st.write(err)
-            return
-        if not stops:
-            st.warning("No stops found. Double-check that this is a ShowingTime tour PDF/print page.")
-            return
-
-        # Date chip
-        human_date = tour_date_iso
-        try:
-            if tour_date_iso and re.match(r"^\d{4}-\d{2}-\d{2}$", tour_date_iso):
-                dt = datetime.date.fromisoformat(tour_date_iso)
-                human_date = dt.strftime("%a, %b %d, %Y")
-        except Exception:
-            pass
-
+def _client_row(name: str, norm: str, cid: int, active: bool):
+    # Layout matches Clients tab: name + ▦ ✎ ⟳ ⌫ (we only need ▦ here)
+    col_name, col_tours, col_sp = st.columns([9, 1, 2])
+    with col_name:
         st.markdown(
-            f"<div class='tour-box'><span class='chip-date' title='{escape(tour_date_iso or '')}'>"
-            f"{escape(human_date or 'Tour')}</span> &nbsp; "
-            f"<span class='small'>{len(stops)} stop{'s' if len(stops)!=1 else ''}</span></div>",
+            f"<span class='client-name'>{escape(name)}</span> "
+            f"<span class='pill {'active' if active else ''}'>{'active' if active else 'inactive'}</span>",
             unsafe_allow_html=True
         )
-        st.write("")
+    with col_tours:
+        if st.button("▦", key=f"open_tours_{cid}", help="Open Tours report"):
+            _qp_set(tclient=norm, scroll="1")
+            _safe_rerun()
+    st.markdown("<div style='border-bottom:1px solid var(--row-border); margin:4px 0 2px 0;'></div>", unsafe_allow_html=True)
 
-        # Optional client for cross-check + storing
-        active_clients = fetch_clients(include_inactive=False)
-        names = [c["name"] for c in active_clients]
+def _tour_badge(text: str) -> str:
+    # Higher-contrast badge for dates (easy to see in both themes)
+    return (
+        "<span style='display:inline-block;padding:2px 8px;border-radius:999px;"
+        "font-size:12px;font-weight:800;background:#fef3c7;color:#92400e;"
+        "border:1px solid rgba(146,64,14,.25);'>"
+        f"{escape(text)}</span>"
+    )
 
-        sentinel = -1
-        options = [sentinel] + list(range(len(names)))
-        idx = st.selectbox(
-            "Add all stops to client (optional)",
-            options,
-            format_func=lambda i: ("— Select —" if i == sentinel else names[i]),
-            index=0  # valid index (sentinel)
-        )
-        chosen_client = active_clients[idx] if (idx is not None and idx >= 0 and idx < len(active_clients)) else None
-        client_norm = _norm_tag(chosen_client["name"]) if chosen_client else ""
+def _time_chip(t1: str, t2: str) -> str:
+    txt = "–".join([x for x in [t1.strip(), t2.strip()] if x]) if (t1 or t2) else ""
+    if not txt:
+        return ""
+    return (
+        "<span style='display:inline-block;margin-left:8px;padding:2px 6px;border-radius:999px;"
+        "font-size:12px;font-weight:700;background:#dbeafe;color:#1e40af;"
+        "border:1px solid rgba(30,64,175,.25);'>"
+        f"{escape(txt)}</span>"
+    )
 
-        # Cross-check with `sent` and previously toured
-        sent_rows = _fetch_sent_for_client(client_norm) if chosen_client else []
-        prev_index = _prev_tour_index_for_client(client_norm) if chosen_client else {}
+# ───────────────────────────── Tours report UI ─────────────────────────────
 
-        # Show stops
-        for s in stops:
-            addr = s.get("address","").strip()
-            start = s.get("start","")
-            end   = s.get("end","")
-            deeplink = _zillow_deeplink_for_address(addr) if addr else ""
-            slug = _address_slug(addr)
+def _render_client_tours_panel(client_norm: str, client_display: str):
+    st.markdown(f"### Tours for {escape(client_display)}", unsafe_allow_html=True)
 
-            was_sent = _address_matches_sent(addr, sent_rows) if sent_rows else False
+    # Add tour
+    with st.expander("➕ Add a tour", expanded=False):
+        tdate = st.date_input("Tour date", value=date.today(), key="__new_tour_date__")
+        if st.button("Add tour", key="__add_tour_btn__", use_container_width=True):
+            ok, info = create_tour(client_norm, client_display, tdate)
+            if ok:
+                st.success("Tour created.")
+                _safe_rerun()
+            else:
+                st.error(f"Create failed: {info}")
 
-            # Previously toured?
-            prev_items = prev_index.get(slug) if prev_index else None
-            most_recent = prev_items[0] if (prev_items and len(prev_items)>0) else None
-            toured_chip = ""
-            if most_recent and most_recent.get("date"):
-                # include time if available on that previous stop
-                t_start = most_recent.get("start") or ""
-                t_end   = most_recent.get("end") or ""
-                time_span = f" {t_start}-{t_end}" if (t_start and t_end) else (f" {t_start}" if t_start else "")
-                toured_chip = f"<span class='chip-tour' title='Previously toured'>{escape(most_recent['date'] + time_span)}</span>"
+    tours = fetch_tours_for_client(client_norm)
+    if not tours:
+        st.info("No tours for this client yet.")
+        return
 
-            st.markdown("<div class='stop-card'>", unsafe_allow_html=True)
+    # Quick list of tours
+    st.markdown("#### All tours")
+    items = []
+    for t in tours:
+        tid = t["id"]
+        tdate = t.get("tour_date") or ""
+        # Count stops (cheap extra fetch for counts)
+        stops = fetch_stops_for_tour(tid)
+        count = len(stops)
+        items.append((tid, tdate, count))
 
-            # Address as a LINK
-            addr_html = (
-                f"<a class='addr-link' href='{escape(deeplink)}' target='_blank' rel='noopener'>"
-                f"{escape(addr) if addr else '(address missing)'}"
-                f"</a>"
-            )
-            st.markdown(
-                f"<div class='addr'>{addr_html}</div>"
-                f"<div class='time'>{escape(start)}"
-                f"{(' – ' + escape(end)) if (start and end) else ''}</div>",
-                unsafe_allow_html=True
-            )
-
-            # Chips / actions
-            chips = []
-            if toured_chip:
-                chips.append(toured_chip)
-            if was_sent:
-                chips.append("<span class='chip-sent' title='Matched by address slug in sent links'>SENT</span>")
-            if chips:
-                st.markdown("<div class='actions'>" + " &nbsp; ".join(chips) + "</div>", unsafe_allow_html=True)
-
-            st.markdown("</div>", unsafe_allow_html=True)
-
-        # Store all (optional)
-        if chosen_client:
-            if st.button(f"Add all stops to {chosen_client['name']}", use_container_width=True):
-                ok, msg = _store_tour(client_norm, chosen_client["name"], tour_date_iso, stops)
+    for tid, tdate, count in items:
+        colA, colB, colC, colD = st.columns([6, 2, 1, 1])
+        with colA:
+            st.markdown(f"{_tour_badge(str(tdate))} &nbsp; <strong>{count} stop{'s' if count!=1 else ''}</strong>", unsafe_allow_html=True)
+        with colB:
+            if st.button("Open", key=f"__open_tour_{tid}"):
+                _qp_set(tclient=client_norm, tour=str(tid))
+                _safe_rerun()
+        with colC:
+            if st.button("⟳", key=f"__refresh_tour_{tid}", help="Refresh this tour"):
+                _invalidate_stops_cache()
+                _safe_rerun()
+        with colD:
+            if st.button("⌫", key=f"__del_tour_{tid}", help="Delete this tour"):
+                ok, info = delete_tour(tid)
                 if ok:
-                    st.success("Tour saved.")
+                    st.success("Tour deleted.")
                 else:
-                    st.warning(msg)
+                    st.error(f"Delete failed: {info}")
+                _safe_rerun()
+        st.markdown("<div style='border-bottom:1px solid var(--row-border); margin:6px 0 10px 0;'></div>", unsafe_allow_html=True)
 
-    # Helpful note about dependencies
-    st.caption("Tip: If PDF parsing fails, make sure `PyPDF2` is in your requirements.txt.")
+    # Selected tour details
+    tid_qp = _qp_get("tour", "")
+    try:
+        tid_sel = int(tid_qp) if tid_qp else None
+    except Exception:
+        tid_sel = None
+
+    if tid_sel:
+        st.markdown("---")
+        st.markdown("#### Tour details")
+        stops = fetch_stops_for_tour(tid_sel)
+
+        if not stops:
+            st.info("No stops yet. Add the first stop below.")
+        else:
+            for s in stops:
+                sid = s["id"]
+                addr = s.get("address") or ""
+                start = s.get("start") or ""
+                end = s.get("end") or ""
+                deeplink = s.get("deeplink") or _zillow_deeplink_from_addr(addr)
+
+                # Inline card: hyperlink + time chip + quick Edit/Delete
+                col1, col2, col3 = st.columns([8, 1, 1])
+                with col1:
+                    a_html = (
+                        f'<a href="{escape(deeplink)}" target="_blank" rel="noopener">{escape(addr)}</a>'
+                        f' { _time_chip(start, end) }'
+                    )
+                    st.markdown(a_html, unsafe_allow_html=True)
+                with col2:
+                    if st.button("✎", key=f"__edit_stop_{sid}", help="Edit stop"):
+                        st.session_state[f"__edit_{sid}"] = True
+                with col3:
+                    if st.button("⌫", key=f"__del_stop_{sid}", help="Delete stop"):
+                        ok, info = delete_stop(sid)
+                        if ok:
+                            st.success("Stop deleted.")
+                        else:
+                            st.error(f"Delete failed: {info}")
+                        _safe_rerun()
+
+                # Inline editor
+                if st.session_state.get(f"__edit_{sid}"):
+                    with st.container():
+                        st.markdown("<div class='inline-panel'>", unsafe_allow_html=True)
+                        e_addr = st.text_input("Address", value=addr, key=f"__e_addr_{sid}")
+                        cc1, cc2 = st.columns(2)
+                        with cc1:
+                            e_start = st.text_input("Start (e.g. 10:00 AM)", value=start, key=f"__e_start_{sid}")
+                        with cc2:
+                            e_end = st.text_input("End (e.g. 10:30 AM)", value=end, key=f"__e_end_{sid}")
+                        e_link = st.text_input("Link (optional; auto if empty)", value=deeplink, key=f"__e_link_{sid}")
+                        ccs, ccc = st.columns([0.2, 0.2])
+                        if ccs.button("Save", key=f"__e_save_{sid}"):
+                            ok, info = update_stop(sid, address=e_addr, start=e_start, end=e_end, deeplink=e_link)
+                            if ok:
+                                st.success("Stop updated.")
+                            else:
+                                st.error(f"Update failed: {info}")
+                            st.session_state[f"__edit_{sid}"] = False
+                            _safe_rerun()
+                        if ccc.button("Cancel", key=f"__e_cancel_{sid}"):
+                            st.session_state[f"__edit_{sid}"] = False
+                        st.markdown("</div>", unsafe_allow_html=True)
+
+                    st.markdown("<div style='height:6px;'></div>", unsafe_allow_html=True)
+
+        # Add stop to this tour
+        st.markdown("##### Add stop")
+        with st.container():
+            a = st.text_input("Address", key="__new_stop_addr__")
+            c1, c2 = st.columns(2)
+            with c1:
+                s = st.text_input("Start (e.g. 1:00 PM)", key="__new_stop_start__")
+            with c2:
+                e = st.text_input("End (e.g. 1:30 PM)", key="__new_stop_end__")
+            link_default = _zillow_deeplink_from_addr(a) if a else ""
+            link = st.text_input("Link (optional; auto if empty)", value=link_default, key="__new_stop_link__")
+            if st.button("Add stop", key="__add_stop_btn__", use_container_width=True):
+                if not (a or "").strip():
+                    st.warning("Please enter an address.")
+                else:
+                    ok, info = add_stop(tid_sel, a, s, e, link)
+                    if ok:
+                        st.success("Stop added.")
+                        _safe_rerun()
+                    else:
+                        st.error(f"Add failed: {info}")
+
+# ───────────────────────────── Public entry ─────────────────────────────
+
+def render_tours_tab(state: dict):
+    st.subheader("Tours")
+    st.caption("View and edit showings (tour stops). Click a client to see their tours and all properties toured.")
+
+    if not _sb_ok():
+        st.warning("Supabase is not configured. Set SUPABASE_URL and SUPABASE_SERVICE_ROLE.")
+        return
+
+    tclient = _qp_get("tclient", "")
+    want_scroll = _qp_get("scroll", "") in ("1", "true", "yes")
+
+    all_clients = fetch_clients(include_inactive=True)
+    active = [c for c in all_clients if c.get("active")]
+    inactive = [c for c in all_clients if not c.get("active")]
+
+    colA, colB = st.columns([2, 3])
+
+    # Left: clients list (like Clients tab)
+    with colA:
+        st.markdown("### Clients", unsafe_allow_html=True)
+        st.markdown("#### Active", unsafe_allow_html=True)
+        if not active:
+            st.write("_No active clients_")
+        else:
+            for c in active:
+                _client_row(c["name"], c.get("name_norm", ""), c["id"], active=True)
+
+        st.markdown("#### Inactive", unsafe_allow_html=True)
+        if not inactive:
+            st.write("_No inactive clients_")
+        else:
+            for c in inactive:
+                _client_row(c["name"], c.get("name_norm", ""), c["id"], active=False)
+
+    # Right: selected client's Tours report
+    with colB:
+        st.markdown('<div id="tours_report_anchor"></div>', unsafe_allow_html=True)
+        if tclient:
+            display_name = next((c["name"] for c in all_clients if c.get("name_norm") == tclient), tclient)
+            _render_client_tours_panel(tclient, display_name)
+
+            # Smooth scroll when opening from the left list
+            if want_scroll:
+                st.components.v1.html(
+                    """
+                    <script>
+                      const el = parent.document.getElementById("tours_report_anchor");
+                      if (el) { el.scrollIntoView({behavior: "smooth", block: "start"}); }
+                    </script>
+                    """,
+                    height=0,
+                )
+                _qp_set(tclient=tclient)
+        else:
+            st.info("Select a client on the left to view and edit their tours.")
