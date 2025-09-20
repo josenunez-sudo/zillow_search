@@ -14,8 +14,7 @@ try:
 except Exception:
     PyPDF2 = None
 
-
-# ---------- Styles (macOS/App Store blue buttons) ----------
+# ---------- Mac-style blue buttons + light separators ----------
 st.markdown("""
 <style>
 .blue-btn-zone .stButton > button {
@@ -36,12 +35,10 @@ st.markdown("""
 }
 .blue-btn-zone .stButton > button:active { transform: translateY(0) scale(.99) !important; }
 
-/* light separators */
 :root { --row-border:#e2e8f0; }
 html[data-theme="dark"], .stApp [data-theme="dark"] { --row-border:#0b1220; }
 </style>
 """, unsafe_allow_html=True)
-
 
 # ---------- Supabase ----------
 @st.cache_resource
@@ -83,7 +80,6 @@ def _canonicalize_zillow(url: str) -> Tuple[str, Optional[str]]:
     m_z = re.search(r'(\d{6,})_zpid', base, re.I)
     return canon, (m_z.group(1) if m_z else None)
 
-
 # ---------- Clients ----------
 @st.cache_data(ttl=60, show_spinner=False)
 def fetch_clients():
@@ -94,7 +90,6 @@ def fetch_clients():
         return [r for r in rows if r.get("name_norm") != _norm_tag("test test")]
     except Exception:
         return []
-
 
 # ---------- ShowingTime parsing ----------
 _BAD_AFTER_NUM = r"(?:Beds?|Baths?|Sqft|Canceled|Cancelled|Confirmed|Reason|Presented|Access|Alarm|Instructions|Agent|Buyer)\b"
@@ -158,7 +153,7 @@ def _status_in_window(txt: str) -> str:
     u = txt.upper()
     if "CANCELLED" in u or "CANCELED" in u: return "CANCELED"
     if "CONFIRMED" in u: return "CONFIRMED"
-    return ""
+    return ""  # we'll coalesce later
 
 def _parse_tour_text(txt: str) -> Dict[str, Any]:
     # Tour date
@@ -175,7 +170,7 @@ def _parse_tour_text(txt: str) -> Dict[str, Any]:
 
     stops: List[Dict[str, Any]] = []
     for am in ADDR_RE.finditer(txt):
-        # Assemble clean address-only text
+        # Clean address-only text
         num   = am.group("num").strip()
         name  = re.sub(r'\s+', ' ', am.group("name").strip())
         stype = am.group("stype").strip()
@@ -205,7 +200,7 @@ def _parse_tour_text(txt: str) -> Dict[str, Any]:
             "start": t1.replace("AM"," AM").replace("PM"," PM").strip(),
             "end":   t2.replace("AM"," AM").replace("PM"," PM").strip(),
             "deeplink": _address_to_deeplink(addr_clean),
-            "status": stat
+            "status": stat  # may be empty here; we coalesce at insert
         })
 
     return {"tour_date": (tdate.isoformat() if tdate else None), "stops": stops}
@@ -227,7 +222,6 @@ def parse_showingtime_input(url: str, uploaded_pdf) -> Dict[str, Any]:
         return _parse_tour_text(text)
 
     return {"error": "Provide a Print URL or a PDF."}
-
 
 # ---------- DB helpers ----------
 def _create_or_get_tour(client_norm: str, client_display: str, tour_url: Optional[str], tour_date: date) -> int:
@@ -252,11 +246,12 @@ def _create_or_get_tour(client_norm: str, client_display: str, tour_url: Optiona
 
 def _insert_stops(tour_id: int, stops: List[Dict[str, Any]]) -> int:
     """
-    Insert stops for a tour. NOTE: Do NOT insert 'address_slug' if your table defines it as
-    a GENERATED column. We compute a slug in-memory for dedupe only, but we DO NOT send it.
+    Insert stops for a tour.
+    NOTE: Do NOT insert 'address_slug' if your table defines it as a GENERATED column.
+    We compute a slug in-memory for dedupe only.
     """
     if not SUPABASE: return 0
-    # Fetch existing slugs for dedupe (DB will provide generated slugs)
+    # Fetch existing slugs to dedupe
     existing = SUPABASE.table("tour_stops").select("address_slug").eq("tour_id", tour_id).limit(50000).execute().data or []
     seen = {e["address_slug"] for e in existing if e.get("address_slug")}
     rows = []
@@ -264,16 +259,22 @@ def _insert_stops(tour_id: int, stops: List[Dict[str, Any]]) -> int:
         addr = (s.get("address") or "").strip()
         if not addr: continue
         slug = _slug_addr(addr)
-        if slug in seen:  # dedupe against existing
+        if slug in seen:
             continue
+        # Coalesce status → default "SCHEDULED" to satisfy NOT NULL constraint
+        raw_status = (s.get("status") or "").strip().upper()
+        if raw_status not in ("CONFIRMED", "CANCELED", "CANCELLED", "SCHEDULED"):
+            raw_status = "SCHEDULED"
+        if raw_status == "CANCELLED":
+            raw_status = "CANCELED"
         rows.append({
             "tour_id": tour_id,
             "address": addr,
-            # DO NOT include address_slug here (generated column)
+            # no address_slug (generated)
             "start": (s.get("start") or None),
             "end":   (s.get("end") or None),
             "deeplink": (s.get("deeplink") or _address_to_deeplink(addr)),
-            "status": (s.get("status") or None),
+            "status": raw_status,  # <-- always set
         })
         seen.add(slug)
     if not rows: return 0
@@ -328,14 +329,12 @@ def _build_repeat_map(client_norm: str) -> Dict[tuple, int]:
             rep[(slug, td)] = seen_count[slug]
     return rep
 
-
 # ---------- Session: parsed payload ----------
 def _get_parsed() -> Dict[str, Any]:
     return st.session_state.get("__parsed_tour__") or {}
 
 def _set_parsed(payload: Dict[str, Any]):
     st.session_state["__parsed_tour__"] = payload or {}
-
 
 # ---------- HTML helpers ----------
 def _date_badge_html(d: str) -> str:
@@ -347,6 +346,8 @@ def _status_tag_html(stat_upper: str) -> str:
         return "<span style='padding:2px 8px;border-radius:9999px;font-size:11px;font-weight:800;background:#166534;color:#ecfdf5;border:1px solid #16a34a;white-space:nowrap;'>Confirmed</span>"
     if stat_upper in ("CANCELED","CANCELLED"):
         return "<span style='padding:2px 8px;border-radius:9999px;font-size:11px;font-weight:800;background:#7f1d1d;color:#fee2e2;border:1px solid #ef4444;white-space:nowrap;'>Canceled</span>"
+    if stat_upper == "SCHEDULED":
+        return "<span style='padding:2px 8px;border-radius:9999px;font-size:11px;font-weight:800;background:#334155;color:#e2e8f0;border:1px solid #475569;white-space:nowrap;'>Scheduled</span>"
     return ""
 
 def _time_badge_html(when: str) -> str:
@@ -357,7 +358,6 @@ def _repeat_tag_html(n: int) -> str:
     if n >= 2:
         return "<span style='padding:2px 8px;border-radius:9999px;font-size:11px;font-weight:800;background:#92400e;color:#fff7ed;border:1px solid #f59e0b;white-space:nowrap;margin-left:8px;'>2nd+ showing</span>"
     return ""
-
 
 # ---------- Main renderer ----------
 def render_tours_tab(state: dict):
@@ -415,7 +415,7 @@ def render_tours_tab(state: dict):
         if stops:
             lis = []
             for s in stops:
-                addr = (s.get("address","").strip())                 # address-only
+                addr = (s.get("address","").strip())                 # address-only hyperlink text
                 href = (s.get("deeplink") or _address_to_deeplink(addr)).strip()
                 start = (s.get("start") or "").strip()
                 end   = (s.get("end") or "").strip()
@@ -442,7 +442,7 @@ def render_tours_tab(state: dict):
         else:
             st.info("No stops to preview.")
 
-        # Secondary View report button (visible near preview)
+        # Extra View report button near preview
         st.markdown("<div class='blue-btn-zone'>", unsafe_allow_html=True)
         view_report_mid = st.button("View report", use_container_width=False, key="__view_report_mid__")
         st.markdown("</div>", unsafe_allow_html=True)
@@ -477,7 +477,7 @@ def render_tours_tab(state: dict):
             "Add all stops to client (optional)",
             list(range(len(add_names))),
             format_func=lambda i: add_names[i],
-            index=0,  # No logging by default
+            index=0,  # default "No logging"
             key="__tour_add_to_client__"
         )
         chosen_norm = add_norms[idx_add]
@@ -506,7 +506,7 @@ def render_tours_tab(state: dict):
                     st.error(f"Could not add stops. {e}")
 
         with colBB:
-            # Top-level report button again for convenience
+            # Report button in action row too
             st.markdown("<div class='blue-btn-zone'>", unsafe_allow_html=True)
             view_report_bottom = st.button("View report", use_container_width=True, key="__view_report_bottom__")
             st.markdown("</div>", unsafe_allow_html=True)
@@ -514,7 +514,7 @@ def render_tours_tab(state: dict):
         with colCC:
             st.caption("Tip: choose **No client** if you only want to parse/preview without logging.")
 
-        # Any of the three "View report" buttons scroll down:
+        # Any of the "View report" buttons scroll down:
         if view_report_top or view_report_mid or view_report_bottom:
             st.components.v1.html(
                 """
@@ -536,12 +536,19 @@ def render_tours_tab(state: dict):
     norms2 = [c["name_norm"] for c in clients2]
 
     if names2:
-        irep = st.selectbox("Pick a client", list(range(len(names2))),
-                            format_func=lambda i: names2[i], index=0, key="__tour_client_pick__")
+        colPick, colBtn = st.columns([0.68, 0.32])
+        with colPick:
+            irep = st.selectbox("Pick a client", list(range(len(names2))),
+                                format_func=lambda i: names2[i], index=0, key="__tour_client_pick__")
+        with colBtn:
+            st.markdown("<div class='blue-btn-zone'>", unsafe_allow_html=True)
+            view_report_here = st.button("View report", use_container_width=True, key="__view_report_here__")
+            st.markdown("</div>", unsafe_allow_html=True)
+            # (Button is primarily visual here; the section already shows the report for the selected client.)
+
         _render_client_tours_report(names2[irep], norms2[irep])
     else:
         st.info("No clients found.")
-
 
 def _render_client_tours_report(client_display: str, client_norm: str):
     if not SUPABASE:
