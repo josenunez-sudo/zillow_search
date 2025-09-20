@@ -2,7 +2,7 @@
 import os, re, io
 from datetime import datetime
 from html import escape
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 from urllib.parse import unquote
 
 import streamlit as st
@@ -34,7 +34,7 @@ def _norm_tag(s: str) -> str:
     return re.sub(r"\s+", " ", (s or "").strip()).lower()
 
 # =========================
-# STRICT address slug (shared)
+# STRICT address canon + core key
 # =========================
 _DIR_MAP = {
     "n": "north", "s": "south", "e": "east", "w": "west",
@@ -57,32 +57,18 @@ _TYPE_MAP = {
     "sq": "square", "square": "square",
     "trl": "trail", "trail": "trail",
 }
-
 _WORD_RE = re.compile(r"[A-Za-z0-9']+")
 
 def _canonical_words(addr: str) -> List[str]:
-    """
-    Lowercase, strip punctuation, normalize directionals and street types.
-    Keep only alnum words (drop commas/periods). Merge multiple whitespace.
-    """
     s = (addr or "").strip().lower()
-    # Replace separators with spaces
     s = re.sub(r"[,/]+", " ", s)
-    s = re.sub(r"[\-]+", " ", s)  # treat hyphen as separator for words
+    s = re.sub(r"[\-]+", " ", s)
     s = re.sub(r"\s+", " ", s).strip()
-
     words: List[str] = []
     for m in _WORD_RE.finditer(s):
         w = m.group(0)
-
-        # expand directionals
-        if w in _DIR_MAP:
-            w = _DIR_MAP[w]
-
-        # normalize street type (only if it matches exactly a type token)
-        if w in _TYPE_MAP:
-            w = _TYPE_MAP[w]
-
+        if w in _DIR_MAP: w = _DIR_MAP[w]
+        if w in _TYPE_MAP: w = _TYPE_MAP[w]
         words.append(w)
     return words
 
@@ -90,20 +76,75 @@ def _slug_addr_strict(addr: str) -> str:
     words = _canonical_words(addr)
     return "-".join(words)
 
-# Minimal previous slugger (kept only for fallback use if needed)
+# Extra-strict “property core key”: <num>|<name tokens until type>|<type>|<city>|<state>|<zip>
+# Works even if punctuation/case differ. Uses direction/type normalization.
+def _core_addr_key(addr: str) -> str:
+    words = _canonical_words(addr)
+    if not words: return ""
+    # Try to isolate house number (first token if numeric)
+    i = 0
+    num = words[0] if words and words[0].isdigit() else ""
+    if num: i = 1
+    # Collect street name tokens until we hit a street TYPE (street/road/etc)
+    name_tokens: List[str] = []
+    stype = ""
+    while i < len(words):
+        w = words[i]
+        if w in _TYPE_MAP.values():
+            stype = w
+            i += 1
+            break
+        name_tokens.append(w)
+        i += 1
+    # Remainder tokens include city/state/zip (best-effort)
+    rest = words[i:]
+    city = state = zipc = ""
+    # Try to find state (2-letter or normalized direction words avoided)
+    # We’ll just take the last 1–2 tokens as state/zip if they match patterns
+    if rest:
+        # zip if 5 digits (or 5-4)
+        if re.fullmatch(r"\d{5}(-\d{4})?", rest[-1] or ""):
+            zipc = rest[-1]; rest = rest[:-1]
+        if rest:
+            # state = two letters (nc, va, etc.)
+            if re.fullmatch(r"[a-z]{2}", rest[-1] or ""):
+                state = rest[-1]
+                rest = rest[:-1]
+        if rest:
+            city = "-".join(rest)
+    return "|".join([num, "-".join(name_tokens), stype, city, state, zipc])
+
+# For very old rows, keep a loose slug too
 def _slug_addr_loose(addr: str) -> str:
     a = (addr or "").strip().lower()
     a = re.sub(r"[^\w\s,-]", "", a).replace(",", "")
     return re.sub(r"\s+", "-", a).strip("-")
 
 # =========================
-# URL/ZPID helpers
+# Zillow URL helpers
 # =========================
 _ZPID_RE = re.compile(r'(\d{6,})_zpid', re.I)
 
 def _zpid_from_url(url: str) -> str:
     m = _ZPID_RE.search(url or "")
     return (m.group(1) if m else "").strip()
+
+def _url_base(url: str) -> str:
+    return re.sub(r"[?#].*$", "", (url or "").strip()).lower()
+
+# Extract the address part from the URL path:
+# - /homedetails/<ADDR-SLUG>/<ZPID>/
+# - /homes/<ADDR-SLUG>_rb/
+def _url_addr_slug(url: str) -> str:
+    u = (url or "").strip()
+    u = re.sub(r"[?#].*$", "", u)
+    m1 = re.search(r"/homedetails/([^/]+)/\d{6,}_zpid/", u, re.I)
+    if m1:
+        return (m1.group(1) or "").lower()
+    m2 = re.search(r"/homes/([^/_]+)_rb/?", u, re.I)
+    if m2:
+        return (m2.group(1) or "").lower()
+    return ""
 
 def address_text_from_url(url: str) -> str:
     if not url: return ""
@@ -129,7 +170,7 @@ def _pretty_sent_at(iso_str: str) -> str:
         except Exception:
             pass
         out = dt.strftime("%b %d, %Y • %I:%M %p")
-        out = re.sub(r"\b0(\d:)", r"\1", out)  # strip leading zero in hour
+        out = re.sub(r"\b0(\d:)", r"\1", out)
         return out
     except Exception:
         m = re.match(r"^(\d{4}-\d{2}-\d{2})", iso_str)
@@ -227,10 +268,6 @@ def _safe_rerun():
 # =========================
 @st.cache_data(ttl=120, show_spinner=False)
 def fetch_sent_for_client(client_norm: str, limit: int = 5000):
-    """
-    Returns rows ordered by most recent first.
-    Columns: url,address,sent_at,campaign,mls_id,canonical,zpid
-    """
     if not (_sb_ok() and client_norm.strip()):
         return []
     try:
@@ -247,10 +284,6 @@ def fetch_sent_for_client(client_norm: str, limit: int = 5000):
 
 @st.cache_data(ttl=120, show_spinner=False)
 def fetch_tour_address_slugs(client_norm: str) -> Dict[str, int]:
-    """
-    Returns {strict_slug: count_across_all_tours} using STRICT slugger,
-    ignoring DB's stored slug to avoid historical inconsistencies.
-    """
     out: Dict[str, int] = {}
     if not (_sb_ok() and client_norm.strip()):
         return out
@@ -260,7 +293,6 @@ def fetch_tour_address_slugs(client_norm: str) -> Dict[str, int]:
         if not tours: return out
         ids = [t["id"] for t in tours]
         if not ids: return out
-        # Pull address text; recompute strict slug here
         sq = SUPABASE.table("tour_stops").select("address").in_("tour_id", ids).limit(50000).execute()
         rows = sq.data or []
         for r in rows:
@@ -292,7 +324,7 @@ def _client_row(name: str, norm: str, cid: int, active: bool):
 
     with col_rep:
         if st.button("▦", key=f"rep_{cid}", help="Open report"):
-            st.session_state["__active_tab__"] = "Clients"   # keep focus on Clients tab
+            st.session_state["__active_tab__"] = "Clients"
             _qp_set(report=norm, scroll="1")
             _safe_rerun()
 
@@ -312,7 +344,6 @@ def _client_row(name: str, norm: str, cid: int, active: bool):
         if st.button("⌫", key=f"del_{cid}", help="Delete"):
             st.session_state[f"__del_{cid}"] = True
 
-    # Inline rename
     if st.session_state.get(f"__edit_{cid}"):
         st.markdown("<div style='margin-top:6px;padding:6px;border:1px dashed #e2e8f0;border-radius:8px;'>", unsafe_allow_html=True)
         new_name = st.text_input("New name", value=name, key=f"rn_val_{cid}")
@@ -327,7 +358,6 @@ def _client_row(name: str, norm: str, cid: int, active: bool):
             st.session_state[f"__edit_{cid}"] = False
         st.markdown("</div>", unsafe_allow_html=True)
 
-    # Inline delete confirm
     if st.session_state.get(f"__del_{cid}"):
         st.markdown("<div style='margin-top:6px;padding:6px;border:1px dashed #e2e8f0;border-radius:8px;'>", unsafe_allow_html=True)
         d1, d2 = st.columns([0.25, 0.25])
@@ -350,14 +380,12 @@ def _render_client_report_view(client_display_name: str, client_norm: str):
     with colX:
         if st.button("Close report", key=f"__close_report_{client_norm}"):
             st.session_state["__active_tab__"] = "Clients"
-            _qp_set()  # clear query params
+            _qp_set()
             _safe_rerun()
 
-    # Base rows (most recent first)
     rows = fetch_sent_for_client(client_norm)
     total = len(rows)
 
-    # Campaign picklist
     seen_camps = []
     for r in rows:
         c = (r.get("campaign") or "").strip()
@@ -377,17 +405,14 @@ def _render_client_report_view(client_display_name: str, client_norm: str):
     with colF3:
         st.caption(f"{total} total logged")
 
-    # Cross-check: toured slugs using STRICT slugger
-    toured_slugs = fetch_tour_address_slugs(client_norm)  # dict strict_slug -> count
+    # Tours cross-check (STRICT)
+    toured_slugs = fetch_tour_address_slugs(client_norm)  # strict slug -> count
     toured_set = set(toured_slugs.keys())
 
-    # Filter by campaign/search
     def _match(row) -> bool:
-        if sel_campaign is not None:
-            if (row.get("campaign") or "").strip() != sel_campaign:
-                return False
-        if not q_norm:
-            return True
+        if sel_campaign is not None and (row.get("campaign") or "").strip() != sel_campaign:
+            return False
+        if not q_norm: return True
         addr = (row.get("address") or "").lower()
         mls  = (row.get("mls_id") or "").lower()
         url  = (row.get("url") or "").lower()
@@ -395,39 +420,45 @@ def _render_client_report_view(client_display_name: str, client_norm: str):
 
     rows_f = [r for r in rows if _match(r)]
 
-    # ======= HARD DEDUPE (no repeats ever) =======
+    # ======= BULLETPROOF DEDUPE =======
     seen_canon: set = set()
     seen_zpid:  set = set()
-    seen_slug:  set = set()
+    seen_url:   set = set()
+    seen_urladdr: set = set()
+    seen_strict: set = set()
+    seen_core:   set = set()
     unique_rows: List[Dict[str, Any]] = []
 
-    for r in rows_f:  # newest-first from DB
+    for r in rows_f:  # newest-first
         canon = (r.get("canonical") or "").strip().lower()
-        zpid  = (r.get("zpid") or "").strip()
         url   = (r.get("url") or "").strip()
+        zpid  = (r.get("zpid") or "").strip() or _zpid_from_url(url)
         addr  = (r.get("address") or "").strip()
-
-        if not zpid:
-            zpid = _zpid_from_url(url)
         if not addr:
             addr = address_text_from_url(url)
 
-        strict_slug = _slug_addr_strict(addr)
-        loose_slug  = _slug_addr_loose(addr)  # extra safety for old rows
+        # build identities
+        url_base   = _url_base(url)
+        url_addr   = _url_addr_slug(url)                  # address slug from URL
+        strict_key = _slug_addr_strict(addr)              # whole-address strict slug
+        core_key   = _core_addr_key(addr)                 # # + street(core) + type + city + state + zip
 
-        # Drop if any identity already seen
+        # if any identity already seen => skip
         if canon and canon in seen_canon:   continue
-        if zpid and zpid in seen_zpid:      continue
-        if strict_slug and strict_slug in seen_slug: continue
-        if loose_slug and loose_slug in seen_slug:   continue
+        if zpid  and zpid  in seen_zpid:    continue
+        if url_base and url_base in seen_url: continue
+        if url_addr and url_addr in seen_urladdr: continue
+        if strict_key and strict_key in seen_strict: continue
+        if core_key   and core_key   in seen_core:   continue
 
         unique_rows.append(r)
 
-        # Mark identities
-        if canon: seen_canon.add(canon)
-        if zpid:  seen_zpid.add(zpid)
-        if strict_slug: seen_slug.add(strict_slug)
-        if loose_slug:  seen_slug.add(loose_slug)
+        if canon:     seen_canon.add(canon)
+        if zpid:      seen_zpid.add(zpid)
+        if url_base:  seen_url.add(url_base)
+        if url_addr:  seen_urladdr.add(url_addr)
+        if strict_key:seen_strict.add(strict_key)
+        if core_key:  seen_core.add(core_key)
 
     count = len(unique_rows)
     st.caption(f"{count} unique listing{'s' if count!=1 else ''}")
@@ -440,13 +471,10 @@ def _render_client_report_view(client_display_name: str, client_norm: str):
     items_html = []
     for r in unique_rows:
         url = (r.get("url") or "").strip()
-        addr = (r.get("address") or "").strip()
-        if not addr:
-            addr = address_text_from_url(url) or "Listing"
-
-        slug = _slug_addr_strict(addr)
-        toured = slug in toured_set
-        toured_count = toured_slugs.get(slug, 0)
+        addr = (r.get("address") or "").strip() or address_text_from_url(url) or "Listing"
+        strict_key = _slug_addr_strict(addr)
+        toured = strict_key in toured_set
+        toured_count = toured_slugs.get(strict_key, 0)
 
         sent_at = _pretty_sent_at(r.get("sent_at") or "")
         camp = (r.get("campaign") or "").strip()
@@ -457,7 +485,6 @@ def _render_client_report_view(client_display_name: str, client_norm: str):
                 f"<span style='font-size:11px;font-weight:700;padding:2px 6px;border-radius:999px;"
                 f"background:#e2e8f0;margin-left:6px;'>{escape(camp)}</span>"
             )
-
         toured_chip = ""
         if toured:
             toured_chip = (
@@ -468,7 +495,6 @@ def _render_client_report_view(client_display_name: str, client_norm: str):
                 + (f" ×{toured_count}" if toured_count > 1 else "") +
                 "</span>"
             )
-
         time_chip = f"<span style='color:#64748b;font-size:12px;margin-left:6px;'>{escape(sent_at)}</span>" if sent_at else ""
 
         items_html.append(
@@ -485,7 +511,6 @@ def _render_client_report_view(client_display_name: str, client_norm: str):
         unsafe_allow_html=True
     )
 
-    # Export filtered+deduped
     with st.expander("Export filtered report"):
         import pandas as pd
         df = pd.DataFrame(unique_rows)
@@ -527,7 +552,6 @@ def render_clients_tab():
             for c in inactive:
                 _client_row(c["name"], c.get("name_norm",""), c["id"], active=False)
 
-    # Report section
     st.markdown('<div id="report_anchor"></div>', unsafe_allow_html=True)
     if report_norm_qp:
         display_name = next((c["name"] for c in all_clients if c.get("name_norm")==report_norm_qp), report_norm_qp)
