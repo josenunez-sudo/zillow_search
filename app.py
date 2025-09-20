@@ -1,16 +1,3 @@
-Perfect — we’ll keep **Run, Clients, Tours** in that exact order, and still auto-reselect the last active tab (e.g., Tours after Parse/Clear/Add). You don’t need to touch your Tours tab code again.
-
-Here’s a **full paste** `app.py` that:
-
-* Keeps the tab order fixed: **Run → Clients → Tours**
-* Remembers `__active_tab__` in `st.session_state`
-* Uses a tiny JS snippet to re-click the saved tab after any rerun (so Streamlit’s “always pick first tab on rerun” behavior is overridden)
-
-### `app.py` (drop-in)
-
-```python
-# app.py
-
 import os, sys, json
 import streamlit as st
 
