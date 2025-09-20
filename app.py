@@ -32,7 +32,7 @@ apply_page_base()
 st.markdown('<h2 class="app-title">Address Alchemist</h2>', unsafe_allow_html=True)
 st.markdown('<p class="app-sub">Paste addresses or <em>any listing links</em> -> verified Zillow links</p>', unsafe_allow_html=True)
 
-# Fixed tab order (do NOT set __active_tab__ here; tabs will set it themselves before reruns)
+# Fixed tab order (Run, Clients, Tours)
 tab_run, tab_clients, tab_tours = st.tabs(["Run", "Clients", "Tours"])
 
 # Ensure we have a default remembered tab
@@ -40,15 +40,18 @@ if "__active_tab__" not in st.session_state:
     st.session_state["__active_tab__"] = "Run"
 
 with tab_run:
-    # Don't set __active_tab__ here; let Run tab set it right before it triggers any rerun
+    # Mark active while rendering this tab (so actions from here remember it)
+    st.session_state["__active_tab__"] = "Run"
     render_run_tab(state=st.session_state)
 
 with tab_clients:
-    # Don't set __active_tab__ here; Clients tab will set just-in-time before reruns
+    # Mark active while rendering this tab (restores Clients' report button behavior)
+    st.session_state["__active_tab__"] = "Clients"
     render_clients_tab()
 
 with tab_tours:
-    # Tours tab already sets __active_tab__ = "Tours" before calling st.rerun() in its actions
+    # Tours tab also sets this just before any rerun inside its own actions
+    st.session_state["__active_tab__"] = "Tours"
     render_tours_tab(state=st.session_state)
 
 # Re-select the remembered tab after reruns while keeping visible order fixed
