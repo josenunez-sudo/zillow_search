@@ -1,27 +1,24 @@
 # ui/tours_tab.py
-# Tours tab: parse ShowingTime Print URL or PDF, preview clean links+times,
-# then (optionally) add all stops to a client (tours + tour_stops, and log as "sent").
-# No debug logs shown in UI. Status badge (CONFIRMED / CANCELED) visible only here.
-
-import os, io, re, json
-from datetime import datetime, date
+# Tours tab: ShowingTime Print URL / PDF → parsed stops → optional insert to Supabase (tours, tour_stops) and sent.
+import re, io, os, json
+from datetime import datetime
 from typing import List, Dict, Any, Optional, Tuple
-from html import escape
 
 import requests
 import streamlit as st
 
-# Optional PDF parser
+# ---------- Optional PDF dep ----------
 try:
-    from PyPDF2 import PdfReader  # ensure PyPDF2 is in requirements.txt
+    import PyPDF2  # type: ignore
+    _HAVE_PYPDF2 = True
 except Exception:
-    PdfReader = None  # handled gracefully
+    _HAVE_PYPDF2 = False
 
 # ---------- Supabase ----------
 from supabase import create_client, Client
 
 @st.cache_resource
-def get_supabase() -> Optional[Client]:
+def _get_supabase() -> Optional[Client]:
     try:
         url = os.getenv("SUPABASE_URL", st.secrets.get("SUPABASE_URL", ""))
         key = os.getenv("SUPABASE_SERVICE_ROLE", st.secrets.get("SUPABASE_SERVICE_ROLE", ""))
@@ -31,423 +28,387 @@ def get_supabase() -> Optional[Client]:
     except Exception:
         return None
 
-SUPABASE = get_supabase()
+SB: Optional[Client] = _get_supabase()
 
-# ---------- HTTP ----------
-UA_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-    "Accept-Language": "en-US,en;q=0.9",
-    "Cache-Control": "no-cache",
-    "Pragma": "no-cache",
-}
+# ---------- Shared helpers ----------
+def _norm_tag(s: str) -> str:
+    return re.sub(r"\s+", " ", (s or "").strip()).lower()
 
-REQUEST_TIMEOUT = 15
+def _address_slug(addr: str) -> str:
+    return re.sub(r"[^0-9a-z]+", "-", (addr or "").lower()).strip("-")
 
-# ---------- Styling ----------
-st.markdown("""
-<style>
-.tour-wrap { border:1px solid rgba(0,0,0,.08); border-radius:12px; padding:12px; }
-ul.tour-list { margin: 6px 0 0 1.1rem; padding:0; list-style:disc; }
-ul.tour-list li { margin: 0.18rem 0; line-height:1.35; }
-.badge { display:inline-block; font-size:11px; font-weight:800; padding:2px 8px; border-radius:999px; margin-left:8px; vertical-align:1px; }
-.badge.confirmed { background: #dcfce7; color:#166534; border:1px solid rgba(16,185,129,.35); }
-.badge.canceled { background: #fee2e2; color:#991b1b; border:1px solid rgba(239,68,68,.35); }
-.inline-controls { display:flex; gap:8px; align-items:center; }
-.smallmuted { font-size:12px; color:#64748b; margin-top:2px; }
-</style>
-""", unsafe_allow_html=True)
-
-# ---------- Utilities ----------
-MONTHS = ("January","February","March","April","May","June","July","August","September","October","November","December")
-
-def _norm(s: str) -> str:
-    return re.sub(r"\s+", " ", (s or "").strip())
-
-def _slug(text: str) -> str:
-    return re.sub(r'[^a-z0-9]+', '-', (text or '').lower()).strip('-')
-
-def _addr_slug(addr: str) -> str:
-    return _slug(re.sub(r'[,]+', ' ', addr))
-
-def _address_to_zillow_rb(addr: str) -> str:
-    a = addr.lower()
-    a = re.sub(r"[^\w\s,-]", "", a).replace(",", "")
-    a = re.sub(r"\s+", "-", a.strip())
+def _deeplink_from_address(addr: str) -> str:
+    # clean & slug → simple Zillow homes deeplink (good enough for SMS/unfurl + later resolution)
+    a = re.sub(r"[^\w\s,-]", "", (addr or "").strip())
+    a = a.replace(",", "")
+    a = re.sub(r"\s+", "-", a.lower())
     return f"https://www.zillow.com/homes/{a}_rb/"
 
-def _parse_mmddyyyy_from_str(text: str) -> Optional[date]:
-    m = re.search(rf"({'|'.join(MONTHS)})\s+(\d{{1,2}}),\s*(\d{{4}})", text, re.I)
-    if not m:
-        return None
+# ---------- Fetch clients (filter out "test test") ----------
+@st.cache_data(ttl=60, show_spinner=False)
+def _fetch_clients(include_inactive: bool = True) -> List[Dict[str, Any]]:
+    if not SB:
+        return []
     try:
-        return datetime.strptime(f"{m.group(1)} {m.group(2)}, {m.group(3)}", "%B %d, %Y").date()
+        rows = SB.table("clients").select("id,name,name_norm,active").order("name", desc=False).execute().data or []
+        rows = [r for r in rows if r.get("name_norm") != _norm_tag("test test")]
+        if include_inactive:
+            return rows
+        return [r for r in rows if r.get("active")]
     except Exception:
-        return None
+        return []
 
-def _find_buyer_name(text: str) -> Optional[str]:
-    m = re.search(r"Buyer['’]s name\s*:\s*([A-Za-z .,'\-]+)", text, re.I)
+# ---------- Minimal styles for badges ----------
+_badge_css = """
+<style>
+.tour-list { margin: 0 0 0.5rem 1.1rem; padding: 0; list-style: disc; }
+.tour-list li { margin: 0.25rem 0; }
+.badge-mini { display:inline-block; font-size: 11px; font-weight:800; padding:1px 8px; border-radius:999px; margin-left:8px; vertical-align: baseline;}
+.badge-ok { background:#dcfce7; color:#065f46; border:1px solid rgba(5,150,105,.35); }
+.badge-cancel { background:#fee2e2; color:#991b1b; border:1px solid rgba(185,28,28,.35); }
+.badge-unk { background:#e2e8f0; color:#334155; border:1px solid rgba(100,116,139,.25); }
+</style>
+"""
+
+# ---------- ShowingTime parsing ----------
+_TIME_RE = r"(\d{1,2}:\d{2}\s*[AP]M)"
+_ADDR_RE = r"\d{1,6}\s+[^\n,]+,\s+[A-Za-z][^,]+,\s+[A-Z]{2}\s+\d{5}(?:-\d{4})?"
+_CONF_TOKENS = ("CONFIRMED", "Confirmed")
+_CANCEL_TOKENS = ("CANCELED", "CANCELLED", "Canceled", "Cancelled")
+
+def _strip_html(html: str) -> str:
+    # Remove tags, normalize spaces/newlines
+    txt = re.sub(r"(?is)<script[^>]*>.*?</script>", " ", html or "")
+    txt = re.sub(r"(?is)<style[^>]*>.*?</style>", " ", txt)
+    txt = re.sub(r"(?s)<[^>]+>", " ", txt)
+    txt = txt.replace("\xa0", " ")
+    txt = re.sub(r"[ \t]+", " ", txt)
+    txt = re.sub(r"\s+\n", "\n", txt)
+    txt = re.sub(r"\n\s+", "\n", txt)
+    return txt.strip()
+
+def _parse_date_from_text(t: str) -> Optional[str]:
+    # Examples: "Buyer's Tour - Monday, September 22, 2025"
+    m = re.search(r"Buy(?:er|ers)'?s\s+Tour\s*-\s*([A-Za-z]+,\s*[A-Za-z]+\s+\d{1,2},\s*\d{4})", t)
+    if not m:
+        # Fallback: find Month Day, Year anywhere
+        m = re.search(r"([A-Za-z]+,\s*[A-Za-z]+\s+\d{1,2},\s*\d{4})", t)
     if m:
-        return _norm(m.group(1))
-    m2 = re.search(r"Buyer['’]s?\s*(?:Tour|-)\s*[^\n]*?\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)\b", text)
-    if m2:
-        return _norm(m2.group(1))
-    m3 = re.search(r"\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)\b[^\n]*Stops", text)
-    if m3:
-        return _norm(m3.group(1))
+        raw = m.group(1)
+        for fmt in ("%A, %B %d, %Y", "%A,%B %d, %Y", "%B %d, %Y"):
+            try:
+                dt = datetime.strptime(raw.replace("  ", " "), fmt)
+                return dt.strftime("%Y-%m-%d")
+            except Exception:
+                pass
     return None
 
-def _clean_text_for_parse(text: str) -> str:
-    text = re.sub(r"(?<=\b[A-Za-z])\s(?=[a-z])", "", text)  # fix split letters in PDFs
-    text = re.sub(r"[ \t]+", " ", text)
-    return text
-
-ADDR_RE = re.compile(
-    r"(\d{1,6}\s+[A-Za-z0-9 .'\-]+,\s*[A-Za-z .'\-]+,\s*[A-Z]{2}\s+\d{5}(?:-\d{4})?)", re.I
-)
-TIME_RE = re.compile(
-    r"(\d{1,2}:\d{2}\s?(?:AM|PM))\s*[-–]\s*(\d{1,2}:\d{2}\s?(?:AM|PM))", re.I
-)
-
-def _nearby_status(chunk: str) -> Optional[str]:
-    if re.search(r"\bCONFIRMED\b", chunk, re.I):
-        return "confirmed"
-    if re.search(r"\bCANCE?LLED?\b", chunk, re.I):
+def _status_from_chunk(chunk: str) -> str:
+    if any(tok in chunk for tok in _CANCEL_TOKENS):
         return "canceled"
-    return None
+    if any(tok in chunk for tok in _CONF_TOKENS):
+        return "confirmed"
+    return "scheduled"
 
 def _extract_stops_from_text(text: str) -> List[Dict[str, str]]:
+    # Find each address, then capture the nearest time range right after it
     stops: List[Dict[str, str]] = []
-    idx = 0
-    while True:
-        m = ADDR_RE.search(text, idx)
-        if not m:
-            break
-        addr = _norm(m.group(1))
-        start_window = m.end()
-        window = text[start_window:start_window + 600]
-        mt = TIME_RE.search(window)
-        start_time, end_time = "", ""
-        if mt:
-            start_time = _norm(mt.group(1))
-            end_time   = _norm(mt.group(2))
-        status = _nearby_status(window) or ""
+    # Make a list of matches with their spans
+    addrs = [(m.group(0), m.start(), m.end()) for m in re.finditer(_ADDR_RE, text)]
+    if not addrs:
+        return []
+
+    for i, (addr, s, e) in enumerate(addrs):
+        nxt = addrs[i+1][1] if i+1 < len(addrs) else len(text)
+        window = text[e:nxt]
+        m_time = re.search(rf"{_TIME_RE}\s*-\s*{_TIME_RE}", window)
+        start_t, end_t = "", ""
+        if m_time:
+            start_t = re.sub(r"\s+", " ", m_time.group(1)).strip().upper()
+            end_t = re.sub(r"\s+", " ", m_time.group(2)).strip().upper()
+        status = _status_from_chunk(window)
         stops.append({
-            "address": addr,
-            "start": start_time,
-            "end": end_time,
+            "address": re.sub(r"\s+", " ", addr).strip(),
+            "start": start_t,
+            "end": end_t,
             "status": status,
-            "deeplink": _address_to_zillow_rb(addr),
-            "address_slug": _addr_slug(addr),
         })
-        idx = start_window
-    # de-dup consecutive identical (addr, times)
-    dedup: List[Dict[str, str]] = []
-    seen = set()
-    for s in stops:
-        key = (s["address"], s["start"], s["end"])
-        if key in seen:
-            continue
-        seen.add(key)
-        dedup.append(s)
-    return dedup
+    return stops
 
-def _parse_print_html(url: str) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+def parse_showingtime_print_url(url: str) -> Dict[str, Any]:
     try:
-        r = requests.get(url, headers=UA_HEADERS, timeout=REQUEST_TIMEOUT)
+        r = requests.get(url, timeout=15, allow_redirects=True)
         if not r.ok:
-            return None, "Could not fetch Print page."
-        html = r.text
-        safe = re.sub(r"(?is)<script.*?>.*?</script>", " ", html)
-        safe = re.sub(r"(?is)<style.*?>.*?</style>", " ", safe)
-        text = re.sub(r"(?s)<[^>]+>", " ", safe)
-        text = _clean_text_for_parse(text)
-        tdate = _parse_mmddyyyy_from_str(text)
-        buyer = _find_buyer_name(text)
-        stops = _extract_stops_from_text(text)
-        if not stops:
-            return None, "No stops found. Double-check that this is a ShowingTime tour Print page."
-        return {
-            "print_url": url,
-            "buyer": buyer or "",
-            "tour_date": tdate.isoformat() if tdate else "",
-            "stops": stops
-        }, None
-    except Exception:
-        return None, "No stops found. Double-check that this is a ShowingTime tour Print page."
-
-def _parse_pdf(file: io.BytesIO) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
-    if not PdfReader:
-        return None, "PyPDF2 not installed. Add PyPDF2 to requirements.txt for PDF parsing."
-    try:
-        reader = PdfReader(file)
-        raw = ""
-        for p in reader.pages:
-            raw += "\n" + (p.extract_text() or "")
-        text = _clean_text_for_parse(raw)
-        tdate = _parse_mmddyyyy_from_str(text)
-        buyer = _find_buyer_name(text)
-        stops = _extract_stops_from_text(text)
-        if not stops:
-            return None, "No stops found. Double-check that this is a ShowingTime tour PDF."
-        return {
-            "print_url": "",
-            "buyer": buyer or "",
-            "tour_date": tdate.isoformat() if tdate else "",
-            "stops": stops
-        }, None
-    except Exception:
-        return None, "No stops found. Double-check that this is a ShowingTime tour PDF."
-
-# ---------- Clients ----------
-@st.cache_data(ttl=90, show_spinner=False)
-def _fetch_clients(include_inactive: bool = True) -> List[Dict[str, Any]]:
-    if not SUPABASE:
-        return []
-    try:
-        resp = SUPABASE.table("clients").select("id,name,name_norm,active").order("name", desc=False).execute()
-        rows = resp.data or []
-        # hide "test test"
-        rows = [r for r in rows if (r.get("name_norm") or "") != "test test"]
-        return rows if include_inactive else [r for r in rows if r.get("active")]
-    except Exception:
-        return []
-
-def _client_options_for_norm_dropdown() -> Tuple[List[str], List[Optional[str]]]:
-    NO_CLIENT = "➤ No client (show ALL, no logging)"
-    all_clients = _fetch_clients(include_inactive=True)
-    names = [c["name"] for c in all_clients]
-    norms = [c.get("name_norm") for c in all_clients]
-    labels = [NO_CLIENT] + names
-    keys   = [None] + norms
-    return labels, keys
-
-def _client_display_dropdown_options() -> List[str]:
-    all_clients = _fetch_clients(include_inactive=True)
-    return [c["name"] for c in all_clients]
-
-# ---------- DB insertions ----------
-def _insert_tour_and_stops(
-    client_norm: Optional[str],
-    client_display: Optional[str],
-    tour_date: Optional[date],
-    print_url: Optional[str],
-    stops: List[Dict[str, str]],
-) -> Tuple[Optional[int], Optional[str]]:
-    if not SUPABASE:
-        return None, "Supabase not configured."
-
-    # If No client selected (No logging), skip DB writes
-    if not client_norm:
-        return None, None
-
-    try:
-        payload = {
-            "client": client_norm or None,
-            "client_display": client_display or None,
-            "tour_date": (tour_date.isoformat() if isinstance(tour_date, date) else None),
-            "url": (print_url or None),
-            # IMPORTANT: set a status that passes your check constraint (fix for 'parsed')
-            "status": "requested",
-        }
-        t_res = SUPABASE.table("tours").insert(payload).execute()
-        data = (t_res.data or [])
-        if not data:
-            return None, "Create tour failed (no return)."
-        tour_id = data[0].get("id")
-        if not tour_id:
-            return None, "Create tour failed (no id)."
-
-        stop_rows = []
-        for s in stops:
-            stop_rows.append({
-                "tour_id": tour_id,
-                "address": s.get("address") or "",
-                "address_slug": s.get("address_slug") or "",
-                "start": s.get("start") or "",
-                "end": s.get("end") or "",
-                "deeplink": s.get("deeplink") or "",
-                "status": (s.get("status") or None),
-            })
-        if stop_rows:
-            SUPABASE.table("tour_stops").insert(stop_rows).execute()
-        return int(tour_id), None
+            return {"ok": False, "error": f"Fetch failed ({r.status_code})"}
+        txt = _strip_html(r.text)
+        iso = _parse_date_from_text(txt) or datetime.utcnow().strftime("%Y-%m-%d")
+        # Attempt buyer name (optional)
+        buyer = ""
+        m = re.search(r"Buyer['’]s name:\s*([^\n]+)", txt, re.I)
+        if m: buyer = m.group(1).strip()
+        stops = _extract_stops_from_text(txt)
+        return {"ok": True, "tour_date": iso, "buyer": buyer, "stops": stops}
     except Exception as e:
-        try:
-            err = getattr(e, "args", [])
-            if err and isinstance(err[0], dict):
-                return None, f"Create tour failed: {json.dumps(err[0])}"
-        except Exception:
-            pass
-        return None, f"Create tour failed: {e!r}"
+        return {"ok": False, "error": str(e)}
 
-def _log_stops_to_sent(client_norm: str, client_display: str, stops: List[Dict[str, str]], tour_date: Optional[date]) -> None:
-    if not SUPABASE or not client_norm or not stops:
-        return
-    now_iso = datetime.utcnow().isoformat(timespec="seconds") + "Z"
-    campaign = f"toured-{(tour_date.isoformat() if tour_date else datetime.utcnow().date().isoformat())}"
+def parse_showingtime_pdf(file_bytes: bytes) -> Dict[str, Any]:
+    if not _HAVE_PYPDF2:
+        return {"ok": False, "error": "PyPDF2 not installed. Add PyPDF2 to requirements.txt"}
+    try:
+        reader = PyPDF2.PdfReader(io.BytesIO(file_bytes))
+        buf = []
+        for p in reader.pages:
+            try:
+                buf.append(p.extract_text() or "")
+            except Exception:
+                pass
+        txt = "\n".join(buf)
+        # Normalize
+        txt = txt.replace("\u200b", " ")
+        txt = re.sub(r"[ \t]+", " ", txt)
+        txt = re.sub(r"\s+\n", "\n", txt)
+        iso = _parse_date_from_text(txt) or datetime.utcnow().strftime("%Y-%m-%d")
+        # Buyer (optional)
+        buyer = ""
+        m = re.search(r"Buyer['’]s name:\s*([^\n]+)", txt, re.I)
+        if m: buyer = m.group(1).strip()
+        stops = _extract_stops_from_text(txt)
+        return {"ok": True, "tour_date": iso, "buyer": buyer, "stops": stops}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+# ---------- Supabase inserts ----------
+def _create_tour_row(client_norm: Optional[str], client_display: Optional[str],
+                     tour_date_iso: str, url: Optional[str]) -> Tuple[bool, Optional[int], str]:
+    if not SB:
+        return False, None, "Supabase not configured"
+    payload = {
+        "client": (client_norm or None),
+        "client_display": (client_display or None),
+        "tour_date": tour_date_iso,
+        "status": "requested",           # IMPORTANT: valid per your CHECK constraint
+        "url": (url or None),
+    }
+    try:
+        resp = SB.table("tours").insert(payload).execute()
+        rows = (resp.data or []) if hasattr(resp, "data") else []
+        tid = rows[0].get("id") if rows else None
+        return (True if tid else False), tid, ("ok" if tid else "No ID returned")
+    except Exception as e:
+        return False, None, f"{e}"
+
+def _insert_tour_stops(tour_id: int, stops: List[Dict[str, str]]) -> Tuple[bool, str]:
+    if not SB or not stops:
+        return False, "No stops or Supabase not configured"
     rows = []
     for s in stops:
-        url = s.get("deeplink") or ""
-        addr = s.get("address") or ""
+        addr = s.get("address", "")
+        rows.append({
+            "tour_id": tour_id,
+            "address": addr,
+            "address_slug": _address_slug(addr),
+            "start": s.get("start") or None,
+            "end": s.get("end") or None,
+            "deeplink": _deeplink_from_address(addr),
+            "status": s.get("status") or "scheduled",
+        })
+    try:
+        SB.table("tour_stops").insert(rows).execute()
+        return True, "ok"
+    except Exception as e:
+        return False, f"{e}"
+
+# Optional: log each stop into `sent` when a client is selected
+def _log_stops_to_sent(client_norm: str, client_display: str,
+                       stops: List[Dict[str, str]], tour_date_iso: str) -> Tuple[bool, str]:
+    if not SB or not client_norm or not stops:
+        return False, "No client or no stops"
+    now_iso = datetime.utcnow().isoformat(timespec="seconds") + "Z"
+    campaign = f"tour-{tour_date_iso}"
+    rows = []
+    for s in stops:
+        addr = s.get("address", "")
+        url = _deeplink_from_address(addr)
         rows.append({
             "client": client_norm,
             "campaign": campaign,
-            "url": url or None,
+            "url": url,
             "canonical": None,
             "zpid": None,
             "mls_id": None,
-            "address": addr or None,
+            "address": addr,
             "sent_at": now_iso,
         })
-    if rows:
-        try:
-            SUPABASE.table("sent").insert(rows).execute()
-        except Exception:
-            pass
+    try:
+        SB.table("sent").insert(rows).execute()
+        return True, "ok"
+    except Exception as e:
+        return False, f"{e}"
 
-# ---------- Session state ----------
-def _get_parsed() -> Dict[str, Any]:
-    return st.session_state.get("__tours_parsed__", {})
+# ---------- Session helpers ----------
+def _get_parsed() -> Optional[Dict[str, Any]]:
+    return st.session_state.get("__tour_parsed__")
 
 def _set_parsed(payload: Dict[str, Any]):
-    st.session_state["__tours_parsed__"] = payload
+    st.session_state["__tour_parsed__"] = payload
 
 def _clear_parsed():
-    st.session_state.pop("__tours_parsed__", None)
+    st.session_state.pop("__tour_parsed__", None)
 
-def _remove_stop(i: int):
-    payload = _get_parsed()
-    stops = payload.get("stops") or []
-    if 0 <= i < len(stops):
-        del stops[i]
-        payload["stops"] = stops
-        _set_parsed(payload)
-
-# ---------- Renderer ----------
+# ---------- Main renderer ----------
 def render_tours_tab(state: dict):
-    st.subheader("Tours")
+    st.markdown(_badge_css, unsafe_allow_html=True)
 
-    # Import controls
-    col_in1, col_in2 = st.columns([1.4, 1])
-    with col_in1:
-        print_url = st.text_input("Paste ShowingTime Print URL", value="", placeholder="https://scheduling.showingtime.com/.../Tour/Print/30235965")
-    with col_in2:
-        file = st.file_uploader("Or drop a Tour PDF", type=["pdf"])
+    # --- Import block (top) ---
+    st.subheader("Import Tour (ShowingTime)")
+    colL, colR = st.columns([1.4, 1])
+    with colL:
+        url_in = st.text_input("ShowingTime Print URL (or sharing link)", value="", placeholder="https://scheduling.showingtime.com/(S(...))/Tour/Print/30235965")
+    with colR:
+        pdf_file = st.file_uploader("…or drop a Tour PDF", type=["pdf"])
 
-    col_btn1, col_btn2 = st.columns([0.15, 0.15])
-    with col_btn1:
-        do_parse = st.button("Parse", use_container_width=True)
-    with col_btn2:
-        do_clear = st.button("Clear", use_container_width=True)
+    # Controls row: Parse + Clear on the right
+    c1, c2, c3 = st.columns([1, 1, 1])
+    with c1:
+        parse_clicked = st.button("Parse Tour", type="primary", use_container_width=True)
+    with c2:
+        clear_clicked = st.button("Clear", use_container_width=True)
+    with c3:
+        st.write("")  # spacer
 
-    if do_clear:
+    if clear_clicked:
         _clear_parsed()
+        st.success("Cleared.")
+        st.stop()
 
-    if do_parse:
-        payload, err = (None, None)
-        if (print_url or "").strip():
-            payload, err = _parse_print_html(print_url.strip())
-        elif file is not None:
-            try:
-                payload, err = _parse_pdf(io.BytesIO(file.read()))
-            except Exception:
-                payload, err = None, "No stops found. Double-check that this is a ShowingTime tour PDF."
+    # --- Parse action ---
+    if parse_clicked:
+        parsed = None
+        if pdf_file is not None:
+            if not _HAVE_PYPDF2:
+                st.error("PDF parsing requires `PyPDF2`. Add it to your requirements.txt.")
+                st.stop()
+            content = pdf_file.getvalue()
+            parsed = parse_showingtime_pdf(content)
+        elif url_in.strip():
+            parsed = parse_showingtime_print_url(url_in.strip())
         else:
-            err = "Provide a Print URL or a Tour PDF."
+            st.error("Provide a Print URL or upload a Tour PDF.")
+            st.stop()
 
-        if err:
-            st.error(err)
-        elif payload:
-            _set_parsed(payload)
+        if not parsed or not parsed.get("ok"):
+            st.error("Could not parse this tour. Please ensure it is the ShowingTime Print page or the exported Tour PDF.")
+            st.stop()
 
-    parsed = _get_parsed()
-    stops: List[Dict[str, str]] = parsed.get("stops") or []
-    tour_date_iso = parsed.get("tour_date") or ""
-    buyer = parsed.get("buyer") or ""
-    purl = parsed.get("print_url") or ""
+        stops = parsed.get("stops") or []
+        if not stops:
+            st.error("No stops found. Double-check that this is a ShowingTime tour Print page or PDF.")
+            st.stop()
 
-    if stops:
-        # Summary (no verbose logs)
-        bits = [f"Parsed **{len(stops)}** stop{'s' if len(stops)!=1 else ''}"]
-        if buyer: bits.append(escape(buyer))
-        if tour_date_iso: bits.append(escape(tour_date_iso))
-        st.markdown(" • ".join(bits), unsafe_allow_html=True)
+        # Attach deeplinks + slugs
+        for s in stops:
+            s["deeplink"] = _deeplink_from_address(s.get("address", ""))
+            s["address_slug"] = _address_slug(s.get("address", ""))
 
-        # Preview list with remove buttons
-        st.markdown("<div class='tour-wrap'>", unsafe_allow_html=True)
-        for i, s in enumerate(stops):
-            addr = s.get("address","")
-            href = s.get("deeplink","") or _address_to_zillow_rb(addr)
-            begin = s.get("start","")
-            end   = s.get("end","")
-            status = (s.get("status") or "").lower()
-            badge = ""
+        parsed["source_url"] = (url_in.strip() or None)
+        _set_parsed(parsed)
+
+    # --- Show parsed list (if any) ---
+    data = _get_parsed()
+    if data:
+        tour_date = data.get("tour_date") or ""
+        stops: List[Dict[str, str]] = data.get("stops") or []
+
+        # Clean display list: time + link + badge
+        items = []
+        for s in stops:
+            start = s.get("start") or ""
+            end = s.get("end") or ""
+            addr = s.get("address") or ""
+            link = s.get("deeplink") or _deeplink_from_address(addr)
+            status = (s.get("status") or "scheduled").lower()
             if status == "confirmed":
-                badge = "<span class='badge confirmed'>CONFIRMED</span>"
+                badge = "<span class='badge-mini badge-ok'>CONFIRMED</span>"
             elif status == "canceled":
-                badge = "<span class='badge canceled'>CANCELED</span>"
+                badge = "<span class='badge-mini badge-cancel'>CANCELED</span>"
+            else:
+                badge = "<span class='badge-mini badge-unk'>SCHEDULED</span>"
+            timetxt = f"{start}–{end}" if (start and end) else (start or end or "")
+            head = (timetxt + " • ") if timetxt else ""
+            items.append(
+                f"<li>{head}<a href='{link}' target='_blank' rel='noopener'>{addr}</a> {badge}</li>"
+            )
+        st.markdown("<ul class='tour-list'>" + "\n".join(items) + "</ul>", unsafe_allow_html=True)
 
-            colL, colR = st.columns([0.9, 0.1])
-            with colL:
-                st.markdown(
-                    f"<li style='list-style: none;'><a href='{escape(href)}' target='_blank' rel='noopener'>{escape(addr)}</a>"
-                    f"{(' — ' + escape(begin) + '–' + escape(end)) if (begin and end) else ''}"
-                    f"{badge}</li>",
-                    unsafe_allow_html=True
-                )
-            with colR:
-                if st.button("✕", key=f"rm_{i}", help="Remove this stop", use_container_width=True):
-                    _remove_stop(i)
-                    st.experimental_rerun()
-        st.markdown("</div>", unsafe_allow_html=True)
-        st.caption("Review (and remove) any stops before adding.")
+        st.divider()
 
-        # ---- Add all stops to client section ----
-        st.markdown("---")
-        st.markdown("**Add all stops** (optional)")
-        labels, keys = _client_options_for_norm_dropdown()
-        idx_norm = st.selectbox(
-            "Choose client for logging",
-            list(range(len(labels))),
-            format_func=lambda i: labels[i],
-            index=0,  # first is always "No client"
+        # --- Add All Stops to client + Client display ---
+        # clients list (active + inactive), but no "test test"
+        clients = _fetch_clients(include_inactive=True)
+        client_names = [c["name"] for c in clients]
+        # Build options with 'No client' as the LAST option (and default)
+        NO_CLIENT = "➤ No client (show ALL, no logging)"
+        client_options = client_names + [NO_CLIENT]
+        default_idx = len(client_options) - 1  # default: No client
+        sel_idx = st.selectbox(
+            "Add all stops to client (optional)",
+            list(range(len(client_options))),
+            format_func=lambda i: client_options[i],
+            index=default_idx,
+            key="__tour_add_client_idx__",
         )
-        chosen_norm = keys[idx_norm]  # None == No logging
+        selected_name = client_options[sel_idx]
+        client_norm = _norm_tag(selected_name) if selected_name != NO_CLIENT else ""
 
-        # Client display name dropdown (exclude "No client") — only needed if logging
-        display_names = _client_display_dropdown_options()
-        display_choice = st.selectbox(
+        # Client display dropdown: only real clients (exclude 'test test' and NO_CLIENT)
+        display_names = client_names[:]  # already filtered
+        # Try to pre-select if a real client was chosen above
+        pre_idx = display_names.index(selected_name) if (selected_name in display_names) else 0 if display_names else 0
+        client_display = st.selectbox(
             "Client display name (for the tour record)",
-            display_names if display_names else ["—"],
-            index=0 if display_names else 0,
-        ) if chosen_norm else None
+            display_names if display_names else ["(none)"],
+            index=(pre_idx if display_names else 0),
+            key="__tour_display_name__",
+        )
+        if not display_names:
+            client_display = None  # nothing to choose
 
-        add_col1, add_col2 = st.columns([0.3, 0.7])
-        with add_col1:
-            if st.button("Add all stops", use_container_width=True, key="add_all"):
-                if not chosen_norm:
-                    st.success("Checked and ready. Not logged (No client).")
-                else:
-                    # Parse date once
-                    tdate = None
-                    try:
-                        tdate = datetime.strptime(tour_date_iso, "%Y-%m-%d").date() if tour_date_iso else None
-                    except Exception:
-                        tdate = None
-                    tour_id, err = _insert_tour_and_stops(
-                        client_norm=chosen_norm,
-                        client_display=display_choice or buyer or "",
-                        tour_date=tdate,
-                        print_url=(purl or ""),
-                        stops=stops,
-                    )
-                    if err:
-                        st.error(err)
-                    else:
-                        _log_stops_to_sent(chosen_norm, display_choice or buyer or "", stops, tdate)
-                        st.success("Tour and stops added.")
-        st.caption("Adding will store a tour record and log each stop as 'sent' (campaign = toured-YYYY-MM-DD).")
+        # --- Add All + Clear (always clickable) ---
+        a1, a2 = st.columns([1, 1])
+        with a1:
+            add_clicked = st.button("➕ Add All Stops", type="primary", use_container_width=True)
+        with a2:
+            clear2 = st.button("Clear", use_container_width=True, key="__clear2__")
 
-    else:
-        st.info("Paste a ShowingTime Print URL or drop a Tour PDF, then click **Parse**.")
+        if clear2:
+            _clear_parsed()
+            st.success("Cleared.")
+            st.stop()
+
+        if add_clicked:
+            # Insert tour (status 'requested' always)
+            ok, tour_id, info = _create_tour_row(
+                client_norm=(client_norm or None),
+                client_display=(client_display if client_display and client_display != "(none)" else None),
+                tour_date_iso=tour_date or datetime.utcnow().strftime("%Y-%m-%d"),
+                url=data.get("source_url"),
+            )
+            if not ok or not tour_id:
+                st.error(f"Create tour failed: {info}")
+                st.stop()
+
+            # Insert stops
+            ok2, info2 = _insert_tour_stops(tour_id, stops)
+            if not ok2:
+                st.error(f"Insert stops failed: {info2}")
+                st.stop()
+
+            # If a client is selected (not No client), also log to sent
+            if client_norm:
+                ok3, info3 = _log_stops_to_sent(client_norm, (client_display or ""), stops, tour_date)
+                if not ok3:
+                    # Don’t spam logs; just surface minimal error
+                    st.warning(f"Added tour, but logging to 'sent' had an issue: {info3}")
+
+            st.success("Tour and stops added.")
+            # keep the parsed list visible so you can verify or add again if needed
