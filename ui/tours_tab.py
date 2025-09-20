@@ -11,9 +11,40 @@ from supabase import create_client, Client
 
 # ========= Optional PDF support =========
 try:
-    import PyPDF2  # add "PyPDF2" to requirements.txt
+    import PyPDF2  # ensure "PyPDF2" is in requirements.txt
 except Exception:
     PyPDF2 = None
+
+
+# ========= Page-local styles (blue buttons like Run tab) =========
+st.markdown("""
+<style>
+/* Blue theme buttons like Run tab */
+.blue-btn-zone .stButton > button {
+  background: linear-gradient(180deg, #2563eb 0%, #1d4ed8 100%) !important;
+  color: #fff !important;
+  font-weight: 800 !important;
+  letter-spacing: .2px !important;
+  border: 0 !important;
+  border-radius: 12px !important;
+  box-shadow: 0 8px 20px rgba(29,78,216,.35), 0 2px 6px rgba(0,0,0,.15) !important;
+  transform: translateY(0) !important;
+  transition: transform .08s ease, box-shadow .12s ease, filter .08s ease !important;
+}
+.blue-btn-zone .stButton > button:hover {
+  transform: translateY(-1px) !important;
+  box-shadow: 0 12px 28px rgba(29,78,216,.40), 0 3px 10px rgba(0,0,0,.18) !important;
+  filter: brightness(1.06) !important;
+}
+.blue-btn-zone .stButton > button:active {
+  transform: translateY(0) scale(.99) !important;
+}
+
+/* simple row divider color */
+:root { --row-border: #e2e8f0; }
+html[data-theme="dark"], .stApp [data-theme="dark"] { --row-border:#0b1220; }
+</style>
+""", unsafe_allow_html=True)
 
 
 # ========= Supabase =========
@@ -31,8 +62,7 @@ def get_supabase() -> Optional[Client]:
 SUPABASE = get_supabase()
 
 def _safe_rerun():
-    try:
-        st.rerun()
+    try: st.rerun()
     except Exception:
         try: st.experimental_rerun()
         except Exception: pass
@@ -77,6 +107,7 @@ def _qp_set(**kwargs):
         if kwargs: st.experimental_set_query_params(**kwargs)
         else: st.experimental_set_query_params()
 
+
 # ========= Clients =========
 @st.cache_data(ttl=60, show_spinner=False)
 def fetch_clients():
@@ -86,26 +117,23 @@ def fetch_clients():
             .select("id,name,name_norm,active")\
             .order("name", desc=False)\
             .execute().data or []
-        # filter out test test
+        # Hide "test test"
         return [r for r in rows if r.get("name_norm") != _norm_tag("test test")]
     except Exception:
         return []
 
-# ========= Parsing (robust, no raw logs displayed) =========
-# Stricter street-type list to avoid matching junk like "00 Beds ..."
+
+# ========= Parsing (address-only hyperlinks + right-side time/status badges) =========
+# Very explicit "full address" regex (no capture groups; we use the whole match as the address)
 _STREET_TYPES = r"(?:St|Street|Ave|Avenue|Dr|Drive|Ln|Lane|Rd|Road|Blvd|Boulevard|Ct|Court|Pl|Place|Ter|Terrace|Way|Cir|Circle|Pkwy|Parkway|Hwy|Highway)"
-# Capture groups: 1=street part, 2=city, 3=state, 4=zip
-_ADDR_RE = re.compile(
-    rf"\b("                                   # 1: full street part
-    r"\d{{1,6}}\s+[A-Za-z0-9.\-']+(?:\s+[A-Za-z0-9.\-']+)*\s+{_STREET_TYPES}"  # 123 N Main St
-    r"(?:\s+[A-Za-z0-9.\-']+)?"               # optional extra like 'NW' or 'Unit'
-    r")\s*,\s*([A-Za-z .'\-]+)\s*,\s*([A-Z]{{2}})\s*(\d{{5}}(?:-\d{{4}})?)\b",
+FULL_ADDR_RE = re.compile(
+    rf"\b\d{{1,6}}\s+[A-Za-z0-9.\-']+(?:\s+[A-Za-z0-9.\-']+)*\s+{_STREET_TYPES}"
+    rf"(?:\s+[A-Za-z0-9.\-']+)?\s*,\s*[A-Za-z .'\-]+\s*,\s*[A-Z]{{2}}\s*\d{{5}}(?:-\d{{4}})?\b",
     re.I
 )
-
-_TIME_RE = re.compile(r'(\d{1,2}:\d{2}\s*(?:AM|PM))\s*[-–]\s*(\d{1,2}:\d{2}\s*(?:AM|PM))', re.I)
-_DATE_HEADER_RE = re.compile(r'(?:Buyer|Agent)[^\n]{0,80}Tour\s*-\s*[A-Za-z]+,\s*([A-Za-z]+)\s*(\d{1,2}),\s*(\d{4})', re.I)
-_GENERIC_DATE_RE = re.compile(r'([A-Za-z]+)\s+(\d{1,2}),\s*(\d{4})')
+TIME_RE = re.compile(r'(\d{1,2}:\d{2}\s*(?:AM|PM))\s*[-–]\s*(\d{1,2}:\d{2}\s*(?:AM|PM))', re.I)
+DATE_HEADER_RE = re.compile(r'(?:Buyer|Agent)[^\n]{0,80}Tour\s*-\s*[A-Za-z]+,\s*([A-Za-z]+)\s*(\d{1,2}),\s*(\d{4})', re.I)
+GENERIC_DATE_RE = re.compile(r'([A-Za-z]+)\s+(\d{1,2}),\s*(\d{4})')
 
 def _month_to_num(m: str) -> int:
     try:
@@ -140,60 +168,52 @@ def _fetch_html(url: str) -> str:
     except Exception:
         return ""
 
+def _status_in_window(txt: str) -> str:
+    u = txt.upper()
+    if "CANCELLED" in u or "CANCELED" in u:
+        return "CANCELED"
+    if "CONFIRMED" in u:
+        return "CONFIRMED"
+    return ""
+
 def _parse_tour_text(txt: str) -> Dict[str, Any]:
-    # Date
+    # Tour date
     tdate = None
-    m = _DATE_HEADER_RE.search(txt)
+    m = DATE_HEADER_RE.search(txt)
     if m:
         mon, day, year = m.group(1), int(m.group(2)), int(m.group(3))
         tdate = date(int(year), _month_to_num(mon), int(day))
     else:
-        m2 = _GENERIC_DATE_RE.search(txt)
+        m2 = GENERIC_DATE_RE.search(txt)
         if m2:
             mon, day, year = m2.group(1), int(m2.group(2)), int(m2.group(3))
             tdate = date(int(year), _month_to_num(mon), int(day))
 
-    # Times (we’ll assign nearest time window after the address)
-    time_iter = list(_TIME_RE.finditer(txt))
-    times_by_pos: List[Tuple[int, Tuple[str,str]]] = []
-    for tm in time_iter:
-        s = tm.group(1).upper().replace(" ", "")
-        e = tm.group(2).upper().replace(" ", "")
-        times_by_pos.append((tm.start(), (s, e)))
-    times_by_pos.sort(key=lambda x: x[0])
-
-    def nearest_time(addr_pos: int) -> Tuple[str, str]:
-        if not times_by_pos: return "", ""
-        after = [t for t in times_by_pos if t[0] >= addr_pos]
-        return after[0][1] if after else times_by_pos[-1][1]
-
-    def status_around(span_start: int, span_end: int) -> str:
-        w = txt[max(0, span_start-300): min(len(txt), span_end+300)].upper()
-        if "CANCELLED" in w or "CANCELED" in w:
-            return "CANCELED"
-        if "CONFIRMED" in w:
-            return "CONFIRMED"
-        return ""
-
     stops: List[Dict[str, Any]] = []
-    for am in _ADDR_RE.finditer(txt):
-        # Rebuild the clean address strictly from capture groups
-        street = am.group(1).strip()
-        city   = am.group(2).strip()
-        state  = am.group(3).strip()
-        zipc   = am.group(4).strip()
-        addr_clean = f"{street}, {city}, {state} {zipc}"
+    for am in FULL_ADDR_RE.finditer(txt):
+        addr_clean = am.group(0).strip()  # ONLY the address text
+        pos = am.start()
 
-        t1, t2 = nearest_time(am.start())
-        stat = status_around(am.start(), am.end())
-        starts = t1.replace("AM", " AM").replace("PM", " PM").strip()
-        ends   = t2.replace("AM", " AM").replace("PM", " PM").strip()
+        # Local window around the address to find the closest time/status
+        win_start = max(0, pos - 220)
+        win_end   = min(len(txt), pos + 220)
+        window = txt[win_start:win_end]
+
+        tm = TIME_RE.search(window)
+        if tm:
+            t1 = tm.group(1).upper().replace(" ", "")
+            t2 = tm.group(2).upper().replace(" ", "")
+        else:
+            t1 = t2 = ""
+
+        stat = _status_in_window(window)
+
         stops.append({
             "address": addr_clean,
-            "start": starts,
-            "end": ends,
+            "start": t1.replace("AM"," AM").replace("PM"," PM").strip(),
+            "end":   t2.replace("AM"," AM").replace("PM"," PM").strip(),
             "deeplink": _address_to_deeplink(addr_clean),
-            "status": stat  # tag only (no verbose lines)
+            "status": stat
         })
 
     return {
@@ -218,6 +238,7 @@ def parse_showingtime_input(url: str, uploaded_pdf) -> Dict[str, Any]:
         return _parse_tour_text(text)
 
     return {"error": "Provide a Print URL or a PDF."}
+
 
 # ========= DB helpers =========
 def _create_or_get_tour(client_norm: str, client_display: str, tour_url: Optional[str], tour_date: date) -> int:
@@ -269,7 +290,7 @@ def _insert_stops(tour_id: int, stops: List[Dict[str, Any]]) -> int:
     return len(ins.data or [])
 
 def _insert_sent_for_stops(client_norm: str, stops: List[Dict[str, Any]], tour_date: date) -> int:
-    """Also mark as 'toured' in sent (for Client/Run views). Campaign = toured-YYYYMMDD."""
+    """Mark as 'toured' in sent (for Client/Run views). Campaign = toured-YYYYMMDD."""
     if not SUPABASE or not client_norm or not stops:
         return 0
     now_iso = datetime.utcnow().isoformat(timespec="seconds") + "Z"
@@ -320,12 +341,14 @@ def _build_repeat_map(client_norm: str) -> Dict[tuple, int]:
             rep[(slug, td)] = seen_count[slug]
     return rep
 
+
 # ========= Session: parsed payload =========
 def _get_parsed() -> Dict[str, Any]:
     return st.session_state.get("__parsed_tour__") or {}
 
 def _set_parsed(payload: Dict[str, Any]):
     st.session_state["__parsed_tour__"] = payload or {}
+
 
 # ========= Small HTML helpers =========
 def _date_badge_html(d: str) -> str:
@@ -351,9 +374,10 @@ def _repeat_tag_html(n: int) -> str:
         return "<span style='padding:2px 8px;border-radius:9999px;font-size:11px;font-weight:800;background:#92400e;color:#fff7ed;border:1px solid #f59e0b;white-space:nowrap;'>2nd+ showing</span>"
     return ""
 
-# ========= Renderer =========
+
+# ========= Main renderer =========
 def render_tours_tab(state: dict):
-    # ========== IMPORT (Parse) ==========
+    # ========== Import (Parse) ==========
     st.markdown("### Import a tour")
     col1, col2 = st.columns([1.3, 1])
     with col1:
@@ -363,9 +387,13 @@ def render_tours_tab(state: dict):
 
     cA, cB, _ = st.columns([0.25, 0.25, 0.5])
     with cA:
+        st.markdown("<div class='blue-btn-zone'>", unsafe_allow_html=True)
         do_parse = st.button("Parse", use_container_width=True, key="__parse_btn__")
+        st.markdown("</div>", unsafe_allow_html=True)
     with cB:
+        st.markdown("<div class='blue-btn-zone'>", unsafe_allow_html=True)
         do_clear = st.button("Clear", use_container_width=True, key="__clear_btn__")
+        st.markdown("</div>", unsafe_allow_html=True)
 
     if do_clear:
         _set_parsed({})
@@ -399,7 +427,7 @@ def render_tours_tab(state: dict):
         if stops:
             lis = []
             for s in stops:
-                addr = s.get("address","").strip()
+                addr = (s.get("address","").strip())
                 href = (s.get("deeplink") or _address_to_deeplink(addr)).strip()
                 start = (s.get("start") or "").strip()
                 end   = (s.get("end") or "").strip()
@@ -435,7 +463,7 @@ def render_tours_tab(state: dict):
 
         NO_CLIENT = "➤ No client (show ALL, no logging)"
 
-        # 1) Client display name (dropdown of real clients only)
+        # 1) Client display name (for the tour record itself) — dropdown of real clients
         if client_names:
             idx_disp = st.selectbox(
                 "Client display name (for the tour record)",
@@ -450,7 +478,7 @@ def render_tours_tab(state: dict):
             client_display = ""
             client_display_norm = ""
 
-        # 2) Add all stops to client (optional) — first option = No client
+        # 2) Add all stops to client (optional) — first option = No client (no logging)
         add_names = [NO_CLIENT] + client_names
         add_norms = [""         ] + client_norms
         idx_add = st.selectbox(
@@ -462,17 +490,18 @@ def render_tours_tab(state: dict):
         )
         chosen_norm = add_norms[idx_add]
 
-        # 3) Also mark as "toured" in Sent
         also_mark_sent = st.checkbox("Also mark these stops as “toured” in Sent", value=True)
 
         colAA, colBB = st.columns([0.35, 0.65])
         with colAA:
             can_add = bool(stops) and bool(tdate) and bool(client_display and client_display_norm)
+            st.markdown("<div class='blue-btn-zone'>", unsafe_allow_html=True)
             add_clicked = st.button("Add all stops", use_container_width=True, disabled=not can_add)
+            st.markdown("</div>", unsafe_allow_html=True)
             if add_clicked:
                 try:
                     tdate_obj = datetime.fromisoformat(tdate).date() if tdate else date.today()
-                    # Create/attach tour under display client
+                    # Create/attach tour under the display client
                     tour_id = _create_or_get_tour(
                         client_norm=client_display_norm,
                         client_display=client_display,
@@ -480,7 +509,6 @@ def render_tours_tab(state: dict):
                         tour_date=tdate_obj
                     )
                     n = _insert_stops(tour_id, stops)
-                    # Optional: also log to sent for chosen client
                     if also_mark_sent and chosen_norm:
                         _insert_sent_for_stops(chosen_norm, stops, tdate_obj)
                     st.success(f"Added {n} stop(s) to {client_display} for {tdate_obj}.")
@@ -509,7 +537,9 @@ def render_tours_tab(state: dict):
             irep = 0
     with colR2:
         st.write("")  # spacer
+        st.markdown("<div class='blue-btn-zone'>", unsafe_allow_html=True)
         st.button("Show report", use_container_width=True)
+        st.markdown("</div>", unsafe_allow_html=True)
 
     if names2:
         _render_client_tours_report(names2[irep], norms2[irep])
