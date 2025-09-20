@@ -1,396 +1,234 @@
 # ui/tours_tab.py
-# "Tours" tab: paste ShowingTime URL OR upload PDF → parse stops (address + time).
-# Optional: log parsed stops to Supabase "tours" table, and cross-check with "sent".
+# Tours tab: paste a ShowingTime tour link OR drop a PDF → extract stop addresses + times.
 
-import os, io, re, csv, json, datetime
-from typing import List, Dict, Any, Optional, Tuple
-from html import escape
+import os, io, re, html
+from typing import List, Dict, Any, Tuple, Optional
 
-import streamlit as st
 import requests
+import streamlit as st
+import streamlit.components.v1 as components
 
-# ---------- Optional PDF extractors ----------
-try:
-    from pdfminer.high_level import extract_text as pdfminer_extract_text
-except Exception:
-    pdfminer_extract_text = None
+# ---------- Config ----------
+REQUEST_TIMEOUT = 15
+UA_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                  "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+}
 
-def _pdf_text_via_pypdf2(data: bytes) -> str:
-    try:
-        import PyPDF2
-        rdr = PyPDF2.PdfReader(io.BytesIO(data))
-        return "\n".join([(p.extract_text() or "") for p in rdr.pages])
-    except Exception:
-        return ""
-
-def extract_text_from_pdf_bytes(data: bytes) -> str:
-    if not data:
-        return ""
-    if pdfminer_extract_text:
-        try:
-            return pdfminer_extract_text(io.BytesIO(data)) or ""
-        except Exception:
-            pass
-    # fallback
-    return _pdf_text_via_pypdf2(data)
-
-# ---------- Supabase ----------
-from supabase import create_client, Client
-
-@st.cache_resource
-def get_supabase() -> Optional[Client]:
-    try:
-        url = os.getenv("SUPABASE_URL", st.secrets.get("SUPABASE_URL", ""))
-        key = os.getenv("SUPABASE_SERVICE_ROLE", st.secrets.get("SUPABASE_SERVICE_ROLE", ""))
-        if not url or not key:
-            return None
-        return create_client(url, key)
-    except Exception:
-        return None
-
-SUPABASE: Optional[Client] = get_supabase()
-
-def _sb_ok() -> bool:
-    try:
-        return bool(SUPABASE)
-    except Exception:
-        return False
-
-def _norm(s: str) -> str:
-    return re.sub(r"\s+", " ", (s or "").strip()).lower()
-
-def _norm_addr(s: str) -> str:
-    s = (s or "").lower()
-    s = re.sub(r"unit\s+[#\w-]+", "", s)
-    s = re.sub(r"apt\s+[#\w-]+", "", s)
-    s = re.sub(r"[^\w\s]", " ", s)
-    s = re.sub(r"\s+", " ", s)
-    return s.strip()
-
-@st.cache_data(ttl=60, show_spinner=False)
-def fetch_clients(include_inactive: bool = False):
-    if not _sb_ok(): return []
-    try:
-        rows = SUPABASE.table("clients").select("id,name,name_norm,active").order("name", desc=False).execute().data or []
-        return rows if include_inactive else [r for r in rows if r.get("active")]
-    except Exception:
-        return []
-
-@st.cache_data(ttl=120, show_spinner=False)
-def get_sent_addresses_for_client(client_norm: str) -> List[str]:
-    """Return a list of normalized address strings from your 'sent' table for cross-check."""
-    if not (_sb_ok() and client_norm.strip()):
-        return []
-    try:
-        rows = SUPABASE.table("sent")\
-            .select("address")\
-            .eq("client", client_norm.strip())\
-            .limit(20000)\
-            .execute().data or []
-        addrs = [r.get("address") or "" for r in rows]
-        return [_norm_addr(a) for a in addrs if (a or "").strip()]
-    except Exception:
-        return []
-
-def log_tours_rows(client_norm: str, tour_date_iso: str, source_url: str, stops: List[Dict[str, Any]]) -> Tuple[bool, str]:
-    """Insert stops to 'tours' table. Requires table:
-       tours(client text, tour_date text, address text, city text, state text, zip text,
-             start_time text, end_time text, source_url text, created_at timestamptz)
+# ---------- Helpers ----------
+def _clean_spaces_inside_words(s: str) -> str:
     """
-    if not (_sb_ok() and client_norm.strip() and stops):
-        return False, "Not configured or no stops."
-    now_iso = datetime.datetime.utcnow().isoformat(timespec="seconds") + "Z"
-    rows = []
-    for s in stops:
-        rows.append({
-            "client": client_norm.strip(),
-            "tour_date": (tour_date_iso or ""),
-            "address": s.get("address",""),
-            "city": s.get("city",""),
-            "state": s.get("state",""),
-            "zip": s.get("zip",""),
-            "start_time": s.get("start",""),
-            "end_time": s.get("end",""),
-            "source_url": source_url or "",
-            "created_at": now_iso,
-        })
+    Fix ShowingTime PDF text quirk:
+      - "W ashington" -> "Washington"
+      - "V arina"     -> "Varina"
+      - "W est"       -> "West"
+    Strategy: remove a space when a single space is followed by a LOWERCASE letter.
+    This keeps normal word boundaries (uppercase next) intact, e.g. "Longfellow Street".
+    """
+    return re.sub(r'([A-Za-z])\s(?=[a-z])', r'\1', s)
+
+def _normalize_text_block(raw: str) -> str:
+    # Collapse multiple spaces/newlines; fix inserted spaces in words.
+    txt = raw.replace("\r", "\n")
+    txt = re.sub(r"[ \t]+", " ", txt)
+    txt = re.sub(r"\n+", "\n", txt)
+    txt = _clean_spaces_inside_words(txt)
+    return txt.strip()
+
+def _strip_html_to_text(html_src: str) -> str:
+    # Keep line breaks from <br> and block tags, then strip tags → text.
+    s = html_src
+    s = re.sub(r"(?i)<br\s*/?>", "\n", s)
+    s = re.sub(r"(?i)</(p|div|li|tr|h[1-6])>", "\n", s)
+    s = re.sub(r"(?i)<(p|div|li|tr|h[1-6])[^>]*>", "", s)
+    s = re.sub(r"(?is)<script[^>]*>.*?</script>", "", s)
+    s = re.sub(r"(?is)<style[^>]*>.*?</style>", "", s)
+    s = re.sub(r"<[^>]+>", " ", s)
+    s = html.unescape(s)
+    return _normalize_text_block(s)
+
+def _fetch_url(url: str) -> Tuple[str, int]:
     try:
-        SUPABASE.table("tours").insert(rows).execute()
-        return True, "ok"
-    except Exception as e:
-        return False, str(e)
+        r = requests.get(url, headers=UA_HEADERS, timeout=REQUEST_TIMEOUT, allow_redirects=True)
+        return (r.text if r.ok else ""), r.status_code
+    except Exception:
+        return "", 0
 
-# ---------- Parsing helpers (works for both HTML Print & PDF text) ----------
-WEEKDAYS = r"(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)"
-MONTHS   = r"(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)"
-TIME_RE  = re.compile(r"\b(\d{1,2}:\d{2})\s*(AM|PM)\s*[-–]\s*(\d{1,2}:\d{2})\s*(AM|PM)\b", re.I)
-DATE_LONG_RE = re.compile(rf"\b{WEEKDAYS}\w*\s*,\s*{MONTHS}\w*\s+\d{{1,2}},\s*\d{{4}}\b", re.I)
-DATE_NUM_RE  = re.compile(r"\b(\d{1,2})/(\d{1,2})/(\d{4})\b")
+def _pdf_to_text(file_bytes: bytes) -> str:
+    """
+    Use PyPDF2 (pypdf) to extract text from the ShowingTime PDF.
+    """
+    try:
+        import PyPDF2  # pypdf / PyPDF2 works the same here
+    except Exception:
+        # Graceful fallback message up top instead of crashing.
+        st.warning("PyPDF2 not installed. Add `PyPDF2` to requirements.txt for PDF parsing.")
+        return ""
 
-# Address line heuristic: "... City, ST 12345"
-ADDR_LINE_RE = re.compile(
-    r"(?P<addr>.+?),\s*(?P<city>[A-Za-z .'-]+),\s*(?P<state>[A-Z]{2})\s+(?P<zip>\d{5}(?:-\d{4})?)",
-    re.I
+    try:
+        reader = PyPDF2.PdfReader(io.BytesIO(file_bytes))
+        txt = "\n\n".join((p.extract_text() or "") for p in reader.pages)
+        return _normalize_text_block(txt)
+    except Exception:
+        return ""
+
+# ---------- Core parser ----------
+STOP_RE = re.compile(
+    r"""(?mx)
+    ^\s*
+    (?P<street>[0-9A-Za-z #/.\-']+),\s+
+    (?P<city>[A-Za-z .'\-]+),\s+
+    (?P<state>[A-Z]{2})\s+
+    (?P<zip>\d{5})
+    \s+
+    (?P<start>\d{1,2}:\d{2}\s?[AP]M)
+    \s*-\s*
+    (?P<end>\d{1,2}:\d{2}\s?[AP]M)
+    """,
+    re.IGNORECASE,
 )
 
-def clamp_html_to_text(html: str) -> str:
-    # Very light "text" from HTML so regex works; avoid bs4 dependency.
-    txt = re.sub(r"<br\s*/?>", "\n", html, flags=re.I)
-    txt = re.sub(r"</(p|div|tr|li|h\d)>", "\n", txt, flags=re.I)
-    txt = re.sub(r"<[^>]+>", " ", txt)
-    txt = re.sub(r"[ \t]+", " ", txt)
-    txt = re.sub(r"\n\s*\n+", "\n", txt)
-    return txt
+def parse_tour_text(normalized_text: str) -> List[Dict[str, str]]:
+    """
+    Parse the normalized text into stops.
+    Returns: list of dicts with street, city, state, zip, start, end, address_line.
+    """
+    stops: List[Dict[str, str]] = []
+    for m in STOP_RE.finditer(normalized_text):
+        street = m.group("street").strip()
+        city   = m.group("city").strip()
+        state  = m.group("state").strip().upper()
+        zipc   = m.group("zip").strip()
+        start  = m.group("start").strip().upper().replace("  ", " ")
+        end    = m.group("end").strip().upper().replace("  ", " ")
 
-def parse_stops_from_text(txt: str) -> Dict[str, Any]:
-    """Return dict: { date: ISO or '', stops: [ {address, city, state, zip, start, end}, ... ], debug: {...} }"""
-    raw = txt or ""
-    text = re.sub(r"[ \t]+", " ", raw)
-    lines = [l.strip() for l in raw.splitlines() if l.strip()]
+        # Final pass to fix any remaining split words in street/city
+        street = _clean_spaces_inside_words(street)
+        city   = _clean_spaces_inside_words(city)
 
-    # Find a tour date anywhere in text
-    tour_date_str = ""
-    mlong = DATE_LONG_RE.search(text)
-    if mlong:
-        tour_date_str = mlong.group(0)
-    else:
-        mnum = DATE_NUM_RE.search(text)
-        if mnum:
-            tour_date_str = mnum.group(0)
+        addr_line = f"{street}, {city}, {state} {zipc}"
+        stops.append({
+            "street": street,
+            "city": city,
+            "state": state,
+            "zip": zipc,
+            "start": start,
+            "end": end,
+            "address_line": addr_line,
+        })
+    return stops
 
-    # Best-effort ISO date
-    tour_date_iso = ""
-    if tour_date_str:
-        try:
-            # try multiple formats
-            for fmt in ("%A, %B %d, %Y", "%a, %b %d, %Y", "%m/%d/%Y"):
-                try:
-                    dt = datetime.datetime.strptime(tour_date_str, fmt)
-                    tour_date_iso = dt.date().isoformat()
-                    break
-                except Exception:
-                    continue
-        except Exception:
-            tour_date_iso = ""
+def parse_tour_from_pdf(file_bytes: bytes) -> List[Dict[str, str]]:
+    txt = _pdf_to_text(file_bytes)
+    if not txt:
+        return []
+    return parse_tour_text(txt)
 
-    # Scan lines; pair TIMES with ADDRESSES found near them (in-order)
-    times: List[Tuple[str,str,int]] = []  # (start, end, line_index)
-    addrs: List[Tuple[Dict[str,str],int]] = []  # ({address,city,state,zip}, line_index)
+def parse_tour_from_url(url: str) -> List[Dict[str, str]]:
+    html_src, status = _fetch_url(url)
+    if not html_src:
+        return []
 
-    for i, ln in enumerate(lines):
-        # Collect times present on the line
-        for m in TIME_RE.finditer(ln):
-            start = f"{m.group(1)} {m.group(2).upper()}"
-            end   = f"{m.group(3)} {m.group(4).upper()}"
-            times.append((start, end, i))
-        # Collect addresses
-        ma = ADDR_LINE_RE.search(ln)
-        if ma:
-            d = {
-                "address": ma.group("addr").strip(),
-                "city": ma.group("city").strip(),
-                "state": ma.group("state").upper().strip(),
-                "zip": ma.group("zip").strip(),
-            }
-            addrs.append((d, i))
+    # Some showingti.me short-links redirect to a Print page. We parse whatever we get by
+    # converting HTML → text and then applying the same regex.
+    text_from_html = _strip_html_to_text(html_src)
+    if not text_from_html:
+        return []
+    return parse_tour_text(text_from_html)
 
-    # If nothing matched, try a denser pass over the entire text (some PDFs line-break oddly)
-    if not times or not addrs:
-        for m in TIME_RE.finditer(text):
-            start = f"{m.group(1)} {m.group(2).upper()}"
-            end   = f"{m.group(3)} {m.group(4).upper()}"
-            times.append((start, end, -1))
-        for m in ADDR_LINE_RE.finditer(text):
-            d = {
-                "address": m.group("addr").strip(),
-                "city": m.group("city").strip(),
-                "state": m.group("state").upper().strip(),
-                "zip": m.group("zip").strip(),
-            }
-            addrs.append((d, -1))
+# ---------- UI rendering ----------
+def _render_results(stops: List[Dict[str, str]]):
+    st.markdown("#### Tour Stops")
 
-    # Pairing: in order, nearest time to following/preceding address
-    stops: List[Dict[str, Any]] = []
-    used_addr = set()
-    for start, end, ti in times:
-        # choose the closest address line index to ti that's not used yet (prefer address after the time)
-        best_j = None
-        best_dist = 10**9
-        for j, (d, ai) in enumerate(addrs):
-            if j in used_addr:
-                continue
-            dist = abs((ai if ai >= 0 else ti) - (ti if ti >= 0 else ai))
-            # prefer address that appears within +/- 4 lines, or any if none close
-            rank = dist
-            if ai >= ti and ti >= 0:
-                rank -= 0.25  # nudge for "address after time"
-            if rank < best_dist:
-                best_dist = rank
-                best_j = j
-        if best_j is not None:
-            used_addr.add(best_j)
-            d, _ = addrs[best_j]
-            stops.append({
-                "address": d["address"],
-                "city": d["city"],
-                "state": d["state"],
-                "zip": d["zip"],
-                "start": start,
-                "end": end,
-            })
+    if not stops:
+        st.error("Could not parse this tour. Please ensure it is the ShowingTime Print page or the exported Tour PDF.")
+        with st.expander("Troubleshoot (show raw debug)"):
+            st.info("Enable the **Debug** switch above and re-parse to view a text preview of what I’m seeing.")
+        return
 
-    # If we still have unmatched addresses (no time found), add them as time-less stops
-    for j, (d, _) in enumerate(addrs):
-        if j not in used_addr:
-            stops.append({
-                "address": d["address"],
-                "city": d["city"],
-                "state": d["state"],
-                "zip": d["zip"],
-                "start": "",
-                "end": "",
-            })
+    # TIGHT list + Copy-all button (like Run tab)
+    items_html = []
+    copy_lines = []
+    for s in stops:
+        label = f"{s['address_line']} — {s['start']} to {s['end']}"
+        items_html.append(f"<li>{html.escape(label)}</li>")
+        copy_lines.append(label)
+    items_html = "\n".join(items_html)
+    copy_text = "\\n".join(copy_lines) + ("\\n" if copy_lines else "")
 
-    return {
-        "date": tour_date_iso,
-        "stops": stops,
-        "debug": {
-            "lines": lines[:400],
-            "found_times": times,
-            "found_addrs": [x[0] for x in addrs],
-            "date_raw": tour_date_str
-        }
-    }
+    html_blob = f"""
+    <html><head><meta charset="utf-8" />
+      <style>
+        html,body {{ margin:0; font-family:-apple-system, Segoe UI, Roboto, Arial, sans-serif; }}
+        .results-wrap {{ position:relative; box-sizing:border-box; padding:8px 120px 4px 0; }}
+        ul.link-list {{ margin:0 0 0.2rem 1.2rem; padding:0; list-style:disc; }}
+        ul.link-list li {{ margin:0.2rem 0; }}
+        .copyall-btn {{ position:absolute; top:0; right:8px; z-index:5; padding:6px 10px; height:26px; border:0; border-radius:10px; color:#fff; font-weight:700; background:#1d4ed8; cursor:pointer; opacity:.95; }}
+      </style>
+    </head><body>
+      <div class="results-wrap">
+        <button id="copyAll" class="copyall-btn" title="Copy all stops" aria-label="Copy all stops">Copy</button>
+        <ul class="link-list">{items_html}</ul>
+      </div>
+      <script>
+        (function(){{
+          const btn=document.getElementById('copyAll');
+          const text = "{copy_text}".replaceAll("\\n", "\\n");
+          btn.addEventListener('click', async () => {{
+            try {{
+              await navigator.clipboard.writeText(text);
+              const prev=btn.textContent; btn.textContent='✓'; setTimeout(()=>{{ btn.textContent=prev; }}, 900);
+            }} catch(e) {{
+              const prev=btn.textContent; btn.textContent='×'; setTimeout(()=>{{ btn.textContent=prev; }}, 900);
+            }}
+          }});
+        }})();
+      </script>
+    </body></html>
+    """
+    est_h = max(80, min(32 * max(1, len(stops)) + 24, 700))
+    components.html(html_blob, height=est_h, scrolling=False)
 
-def parse_showingtime_url(url: str) -> Dict[str, Any]:
-    UA = {
-        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126 Safari/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.9"
-    }
-    try:
-        r = requests.get(url, headers=UA, timeout=15)
-        if not r.ok:
-            return {"date":"", "stops":[], "debug":{"error": f"HTTP {r.status_code}"}}
-        html = r.text
-        text = clamp_html_to_text(html)
-        return parse_stops_from_text(text)
-    except Exception as e:
-        return {"date":"", "stops":[], "debug":{"error": repr(e)}}
-
-# ---------- UI ----------
 def render_tours_tab():
     st.subheader("Tours")
-    st.caption("Paste a ShowingTime link **or** upload a tour PDF, then click **Parse tour**.")
+    st.caption("Paste a ShowingTime tour link (Print page or short link) or upload the exported tour PDF.")
 
-    # Client picker (optional logging + cross-check)
-    clients = fetch_clients(include_inactive=False)
-    name_options = ["➤ No client (no logging)"] + [c["name"] for c in clients]
-    sel_idx = st.selectbox("Client", list(range(len(name_options))), format_func=lambda i: name_options[i], index=0)
-    selected_client = None if sel_idx == 0 else clients[sel_idx-1]
-    client_norm = (selected_client["name_norm"] if selected_client else "").strip()
+    # Controls similar to Run tab
+    st.markdown('<div class="center-box">', unsafe_allow_html=True)
+    url = st.text_input("Tour URL (ShowingTime)", value="", placeholder="https://scheduling.showingtime.com/.../Tour/Print/30235965")
+    colA, colB = st.columns([1,1])
+    with colA:
+        debug = st.toggle("Debug", value=False, help="Show a text preview of the parsed content if needed")
+    with colB:
+        st.write("")  # spacer
 
-    # Inputs like Run tab
-    col1, col2 = st.columns([1.6, 1])
-    with col1:
-        url_in = st.text_input("ShowingTime link (Print or short link)", placeholder="https://scheduling.showingtime.com/... /Tour/Print/... or https://showingti.me/...")
-    with col2:
-        st.caption("or drop a PDF below")
+    file = st.file_uploader("Or drop a Tour PDF", type=["pdf"], help="Export from ShowingTime → Tour Details PDF", label_visibility="visible")
+    st.markdown('</div>', unsafe_allow_html=True)
 
-    uploaded = st.file_uploader("Upload ShowingTime Tour PDF", type=["pdf"], label_visibility="collapsed")
-    col3, col4, col5 = st.columns([1,1,1.4])
-    with col3:
-        show_table = st.checkbox("Show table", value=True)
-    with col4:
-        show_debug = st.checkbox("Show debug", value=False)
-    with col5:
-        parse_clicked = st.button("🧭 Parse tour", use_container_width=True)
+    # Action
+    run = st.button("🗺️ Parse tour", use_container_width=True)
 
-    parsed: Dict[str, Any] = {}
-    stops: List[Dict[str, Any]] = []
-    text_preview = ""
+    if not run:
+        st.info("Paste a link or upload a PDF, then click **Parse tour**.")
+        return
 
-    if parse_clicked:
-        if uploaded is not None:
-            data = uploaded.read()
-            text_preview = extract_text_from_pdf_bytes(data)
-            parsed = parse_stops_from_text(text_preview)
-        elif (url_in or "").strip():
-            parsed = parse_showingtime_url(url_in.strip())
-            # For debug view
-            try:
-                text_preview = "\n".join(parsed.get("debug",{}).get("lines", []))
-            except Exception:
-                text_preview = ""
-        else:
-            st.warning("Provide a ShowingTime link or upload a PDF.")
-            st.stop()
+    stops: List[Dict[str, str]] = []
 
-        stops = parsed.get("stops", []) or []
-        if not stops:
-            st.error("Could not parse this tour. Please ensure it is the ShowingTime Print page or the exported Tour PDF.")
-        else:
-            st.success(f"Parsed {len(stops)} stop(s)" + (f" — Date: {parsed.get('date')}" if parsed.get("date") else ""))
+    # Prefer PDF if provided; else use URL
+    raw_preview = ""
+    if file is not None:
+        data = file.getvalue()
+        raw_preview = _pdf_to_text(data)
+        stops = parse_tour_text(raw_preview or "")
+    elif url.strip():
+        html_src, status = _fetch_url(url.strip())
+        raw_preview = _strip_html_to_text(html_src) if html_src else ""
+        stops = parse_tour_text(raw_preview or "")
 
-    # Cross-check (addresses sent already)
-    sent_addr_norms = set(get_sent_addresses_for_client(client_norm)) if client_norm else set()
-    for s in stops:
-        s["_addr_norm"] = _norm_addr(", ".join([s.get("address",""), s.get("city",""), s.get("state",""), s.get("zip","")]))
+    if debug:
+        with st.expander("Raw text preview (debug)"):
+            st.code(raw_preview[:4000] if raw_preview else "(no preview)")
 
-    if stops:
-        # Results list like Run tab
-        st.markdown("#### Tour Stops")
-        items = []
-        for s in stops:
-            addr_full = ", ".join([p for p in [s.get("address",""), s.get("city",""), s.get("state",""), s.get("zip","")] if p])
-            t = ""
-            if s.get("start") or s.get("end"):
-                t = f"<span class='hl'>{escape(s.get('start',''))} – {escape(s.get('end',''))}</span> "
-            badge = ""
-            if client_norm and s.get("_addr_norm") in sent_addr_norms:
-                badge = " <span class='badge dup' title='This address appears in Sent for this client.'>Sent</span>"
-            gmap = "https://www.google.com/maps/search/" + requests.utils.quote(addr_full)
-            items.append(f"<li style='margin:0.2rem 0;'>{t}<a href='{escape(gmap)}' target='_blank' rel='noopener'>{escape(addr_full)}</a>{badge}</li>")
-        html = "<ul class='link-list'>" + "\n".join(items) + "</ul>"
-        st.markdown(html, unsafe_allow_html=True)
-
-        # Optional table
-        if show_table:
-            import pandas as pd
-            df = pd.DataFrame([{
-                "start": s.get("start",""),
-                "end": s.get("end",""),
-                "address": s.get("address",""),
-                "city": s.get("city",""),
-                "state": s.get("state",""),
-                "zip": s.get("zip",""),
-                "sent_already": (client_norm and s.get("_addr_norm") in sent_addr_norms)
-            } for s in stops])
-            st.dataframe(df, use_container_width=True, hide_index=True)
-
-        # Export CSV
-        csv_buf = io.StringIO()
-        w = csv.DictWriter(csv_buf, fieldnames=["start","end","address","city","state","zip"])
-        w.writeheader()
-        for s in stops:
-            w.writerow({k: s.get(k,"") for k in ["start","end","address","city","state","zip"]})
-        st.download_button("Export CSV", data=csv_buf.getvalue(),
-                           file_name=f"tour_{parsed.get('date') or 'stops'}.csv",
-                           mime="text/csv", use_container_width=True)
-
-        # Log all to Supabase
-        if selected_client:
-            if st.button(f"➕ Add all stops to {selected_client['name']}", use_container_width=True):
-                ok, msg = log_tours_rows(
-                    client_norm=selected_client["name_norm"],
-                    tour_date_iso=parsed.get("date",""),
-                    source_url=(url_in or ""),
-                    stops=stops
-                )
-                st.success("Logged to Supabase.") if ok else st.warning(f"Supabase insert failed: {msg}")
-
-    # Debug view
-    if parse_clicked and show_debug:
-        with st.expander("Debug view (first ~400 lines)"):
-            st.code(text_preview or "(no preview)", language="text")
-            st.json(parsed.get("debug", {}), expanded=False)
+    _render_results(stops)
