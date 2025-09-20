@@ -11,7 +11,7 @@ from supabase import create_client, Client
 
 # ========= Optional PDF support =========
 try:
-    import PyPDF2  # pip install PyPDF2
+    import PyPDF2  # add "PyPDF2" to requirements.txt
 except Exception:
     PyPDF2 = None
 
@@ -48,6 +48,16 @@ def _slug_addr(addr: str) -> str:
 def _address_to_deeplink(addr: str) -> str:
     return f"https://www.zillow.com/homes/{_slug_addr(addr)}_rb/"
 
+def _canonicalize_zillow(url: str) -> Tuple[str, Optional[str]]:
+    """Returns (canonical_url, zpid_if_any). Works for /homes/ and /homedetails/."""
+    if not url:
+        return "", None
+    base = re.sub(r"[?#].*$", "", url.strip())
+    m_full = re.search(r'^(https?://[^?#]*/homedetails/[^/]+/\d{6,}_zpid/)', base, re.I)
+    canon = m_full.group(1) if m_full else base
+    m_z = re.search(r'(\d{6,})_zpid', base, re.I)
+    return canon, (m_z.group(1) if m_z else None)
+
 # ----- Query params -----
 def _qp_get(name, default=None):
     try:
@@ -73,13 +83,16 @@ def _qp_set(**kwargs):
 def fetch_clients():
     if not SUPABASE: return []
     try:
-        rows = SUPABASE.table("clients").select("id,name,name_norm,active").order("name", desc=False).execute().data or []
-        # filter out "test test"
+        rows = SUPABASE.table("clients")\
+            .select("id,name,name_norm,active")\
+            .order("name", desc=False)\
+            .execute().data or []
+        # filter out test test
         return [r for r in rows if r.get("name_norm") != _norm_tag("test test")]
     except Exception:
         return []
 
-# ========= Parsing (robust, no raw logs shown) =========
+# ========= Parsing (robust, no raw logs displayed) =========
 _TIME_RE = re.compile(r'(\d{1,2}:\d{2}\s*(?:AM|PM))\s*[-–]\s*(\d{1,2}:\d{2}\s*(?:AM|PM))', re.I)
 _ADDR_RE = re.compile(r'\b\d{1,6}\s+[^\n,]+,\s+[A-Za-z .\'-]+,\s*[A-Z]{2}\s*\d{5}\b')
 _DATE_HEADER_RE = re.compile(r'(?:Buyer|Agent)[^\n]{0,80}Tour\s*-\s*[A-Za-z]+,\s*([A-Za-z]+)\s*(\d{1,2}),\s*(\d{4})', re.I)
@@ -103,7 +116,6 @@ def _extract_text_from_pdf(file) -> str:
         return ""
 
 def _html_to_text(html: str) -> str:
-    # strip tags/scripts/styles; reduce whitespace
     txt = re.sub(r'<script[\s\S]*?</script>', ' ', html, flags=re.I)
     txt = re.sub(r'<style[\s\S]*?</style>', ' ', txt, flags=re.I)
     txt = re.sub(r'<[^>]+>', ' ', txt)
@@ -132,7 +144,7 @@ def _parse_tour_text(txt: str) -> Dict[str, Any]:
             mon, day, year = m2.group(1), int(m2.group(2)), int(m2.group(3))
             tdate = date(int(year), _month_to_num(mon), int(day))
 
-    # Collect in-document order
+    # Gather times near addresses
     addr_iter = list(_ADDR_RE.finditer(txt))
     time_iter = list(_TIME_RE.finditer(txt))
     times_by_pos: List[Tuple[int, Tuple[str,str]]] = []
@@ -148,7 +160,6 @@ def _parse_tour_text(txt: str) -> Dict[str, Any]:
         return after[0][1] if after else times_by_pos[-1][1]
 
     def status_around(span_start: int, span_end: int) -> str:
-        # Scan a modest window; only return CONFIRMED or CANCELED/CANCELLED
         w = txt[max(0, span_start-300): min(len(txt), span_end+300)].upper()
         if "CANCELLED" in w or "CANCELED" in w:
             return "CANCELED"
@@ -168,7 +179,7 @@ def _parse_tour_text(txt: str) -> Dict[str, Any]:
             "start": starts,
             "end": ends,
             "deeplink": _address_to_deeplink(addr),
-            "status": stat  # only a tag; we won't display any other text like Beds/Notes/Cancel reason
+            "status": stat  # tag only; we *never* render any raw detailed text
         })
 
     return {
@@ -177,7 +188,6 @@ def _parse_tour_text(txt: str) -> Dict[str, Any]:
     }
 
 def parse_showingtime_input(url: str, uploaded_pdf) -> Dict[str, Any]:
-    # Prefer PDF if present
     if uploaded_pdf is not None:
         if not PyPDF2:
             return {"error": "PyPDF2 not installed (add to requirements.txt)."}
@@ -195,11 +205,10 @@ def parse_showingtime_input(url: str, uploaded_pdf) -> Dict[str, Any]:
 
     return {"error": "Provide a Print URL or a PDF."}
 
-# ========= DB helpers (no status persisted; preview-only tag) =========
+# ========= DB helpers =========
 def _create_or_get_tour(client_norm: str, client_display: str, tour_url: Optional[str], tour_date: date) -> int:
     if not SUPABASE:
         raise RuntimeError("Supabase not configured.")
-    # Reuse same client + date
     q = SUPABASE.table("tours").select("id,url").eq("client", client_norm).eq("tour_date", tour_date.isoformat()).limit(1).execute()
     rows = q.data or []
     if rows:
@@ -213,7 +222,7 @@ def _create_or_get_tour(client_norm: str, client_display: str, tour_url: Optiona
         "client_display": client_display,
         "url": (tour_url or None),
         "tour_date": tour_date.isoformat(),
-        "status": "imported",  # allowed by your check constraint
+        "status": "imported",  # use an allowed status per your constraint
     }).execute()
     if not ins.data:
         raise RuntimeError("Create tour failed.")
@@ -237,7 +246,6 @@ def _insert_stops(tour_id: int, stops: List[Dict[str, Any]]) -> int:
             "start": (s.get("start") or None),
             "end":   (s.get("end") or None),
             "deeplink": (s.get("deeplink") or _address_to_deeplink(addr)),
-            # we intentionally do NOT store the confirm/cancel status in DB
         })
         seen.add(slug)
     if not rows:
@@ -245,12 +253,45 @@ def _insert_stops(tour_id: int, stops: List[Dict[str, Any]]) -> int:
     ins = SUPABASE.table("tour_stops").insert(rows).execute()
     return len(ins.data or [])
 
+def _insert_sent_for_stops(client_norm: str, stops: List[Dict[str, Any]], tour_date: date) -> int:
+    """Also mark as 'toured' in sent (for Client/Run views). Campaign = toured-YYYYMMDD."""
+    if not SUPABASE or not client_norm or not stops:
+        return 0
+    now_iso = datetime.utcnow().isoformat(timespec="seconds") + "Z"
+    campaign = f"toured-{tour_date.strftime('%Y%m%d')}"
+    rows = []
+    for s in stops:
+        addr = (s.get("address") or "").strip()
+        if not addr:
+            continue
+        url = (s.get("deeplink") or _address_to_deeplink(addr)).strip()
+        canon, zpid = _canonicalize_zillow(url)
+        rows.append({
+            "client":   client_norm,
+            "campaign": campaign,
+            "url":      url,
+            "canonical": canon or None,
+            "zpid":     zpid or None,
+            "mls_id":   None,
+            "address":  addr or None,
+            "sent_at":  now_iso,
+        })
+    if not rows:
+        return 0
+    try:
+        ins = SUPABASE.table("sent").insert(rows).execute()
+        return len(ins.data or [])
+    except Exception:
+        # swallow errors to avoid user-visible log spam
+        return 0
+
 def _build_repeat_map(client_norm: str) -> Dict[tuple, int]:
     if not SUPABASE: return {}
     tq = SUPABASE.table("tours").select("id,tour_date").eq("client", client_norm).order("tour_date", desc=False).limit(5000).execute()
     tours = tq.data or []
     if not tours: return {}
     ids = [t["id"] for t in tours]
+    if not ids: return {}
     sq = SUPABASE.table("tour_stops").select("tour_id,address_slug").in_("tour_id", ids).limit(50000).execute()
     stops = sq.data or []
     t2s: Dict[int, List[str]] = {}
@@ -272,25 +313,29 @@ def _get_parsed() -> Dict[str, Any]:
 def _set_parsed(payload: Dict[str, Any]):
     st.session_state["__parsed_tour__"] = payload or {}
 
+# ========= Small HTML helpers =========
+def _date_badge_html(d: str) -> str:
+    # High-contrast inline style so it always shows
+    return (
+        "<span style='display:inline-block;padding:2px 10px;border-radius:9999px;"
+        "background:#1d4ed8;color:#fff;font-weight:800;border:1px solid rgba(0,0,0,.15);'>"
+        f"{escape(d)}</span>"
+    )
+
+def _status_tag_html(stat_upper: str) -> str:
+    if stat_upper == "CONFIRMED":
+        return "<span style='margin-left:.4rem;padding:2px 8px;border-radius:9999px;font-size:11px;font-weight:800;background:#166534;color:#ecfdf5;border:1px solid #16a34a;'>Confirmed</span>"
+    if stat_upper in ("CANCELED","CANCELLED"):
+        return "<span style='margin-left:.4rem;padding:2px 8px;border-radius:9999px;font-size:11px;font-weight:800;background:#7f1d1d;color:#fee2e2;border:1px solid #ef4444;'>Canceled</span>"
+    return ""
+
+def _repeat_tag_html(n: int) -> str:
+    if n >= 2:
+        return "<span style='margin-left:.4rem;padding:2px 8px;border-radius:9999px;font-size:11px;font-weight:800;background:#92400e;color:#fff7ed;border:1px solid #f59e0b;'>2nd+ showing</span>"
+    return ""
+
 # ========= Renderer =========
 def render_tours_tab(state: dict):
-    # Styles: date and status badges + time emphasis
-    st.markdown("""
-    <style>
-      .badge { display:inline-block; font-size:11px; font-weight:800; padding:2px 8px; border-radius:999px; margin-left:6px; }
-      .badge.date { background:#0ea5e9; color:#eff6ff; border:1px solid rgba(30,58,138,.35); }
-      html[data-theme="dark"] .badge.date { background:#1e3a8a; color:#c7d2fe; }
-      .tag{display:inline-block;margin-left:.4rem;padding:2px 8px;border-radius:999px;font-size:11px;font-weight:800;}
-      .tag.ok{background:#166534; color:#ecfdf5; border:1px solid #16a34a;}
-      .tag.bad{background:#7f1d1d; color:#fee2e2; border:1px solid #ef4444;}
-      .tag.repeat{background:#92400e; color:#fff7ed; border:1px solid #f59e0b;}
-      .time{font-weight:800;margin-right:.35rem;}
-      ul.link-list { margin: .25rem 0 .5rem 1.2rem; padding:0; }
-      ul.link-list li { margin:.25rem 0; }
-      .thinsep{border-bottom:1px solid var(--row-border); margin:.5rem 0;}
-    </style>
-    """, unsafe_allow_html=True)
-
     # ========== IMPORT (Parse) ==========
     st.markdown("### Import a tour")
     col1, col2 = st.columns([1.3, 1])
@@ -332,7 +377,7 @@ def render_tours_tab(state: dict):
             st.caption(f"Parsed {len(stops)} stop(s)")
         with right:
             if tdate:
-                st.markdown(f"<div style='text-align:right;'><span class='badge date'>{escape(tdate)}</span></div>", unsafe_allow_html=True)
+                st.markdown(f"<div style='text-align:right;'>{_date_badge_html(tdate)}</div>", unsafe_allow_html=True)
 
         if stops:
             lis = []
@@ -343,20 +388,18 @@ def render_tours_tab(state: dict):
                 end   = (s.get("end") or "").strip()
                 when  = f"{start}–{end}" if (start and end) else (start or end or "")
                 stat  = (s.get("status") or "").upper()
-                tag = ""
-                if stat in ("CONFIRMED","CANCELED","CANCELLED"):
-                    tag = f' <span class="tag {"ok" if stat=="CONFIRMED" else "bad"}'>{escape(stat.title())}</span>'
                 lis.append(
-                    f"<li>"
-                    f"{(f'<span class=\"time\">{escape(when)}</span> ' if when else '')}"
-                    f"<a href='{escape(href)}' target='_blank' rel='noopener'>{escape(addr)}</a>{tag}"
-                    f"</li>"
+                    "<li>"
+                    + (f"<span style='font-weight:800;margin-right:.35rem;'>{escape(when)}</span> " if when else "")
+                    + f"<a href='{escape(href)}' target='_blank' rel='noopener'>{escape(addr)}</a>"
+                    + _status_tag_html(stat)
+                    + "</li>"
                 )
-            st.markdown("<ul class='link-list'>" + "\n".join(lis) + "</ul>", unsafe_allow_html=True)
+            st.markdown("<ul style='margin:.25rem 0 .5rem 1.2rem;padding:0;'>" + "\n".join(lis) + "</ul>", unsafe_allow_html=True)
         else:
             st.info("No stops to preview.")
 
-        st.markdown('<div class="thinsep"></div>', unsafe_allow_html=True)
+        st.markdown("<div style='border-bottom:1px solid var(--row-border); margin:.5rem 0;'></div>", unsafe_allow_html=True)
 
         # ========== Add all stops flow ==========
         clients = fetch_clients()
@@ -366,15 +409,19 @@ def render_tours_tab(state: dict):
         NO_CLIENT = "➤ No client (show ALL, no logging)"
 
         # 1) Client display name (dropdown of real clients only)
-        idx_disp = st.selectbox(
-            "Client display name (for the tour record)",
-            list(range(len(client_names))),
-            format_func=lambda i: client_names[i] if client_names else "",
-            index=(0 if client_names else 0),
-            key="__tour_client_display__"
-        )
-        client_display = (client_names[idx_disp] if client_names else "").strip()
-        client_display_norm = (client_norms[idx_disp] if client_names else "").strip()
+        if client_names:
+            idx_disp = st.selectbox(
+                "Client display name (for the tour record)",
+                list(range(len(client_names))),
+                format_func=lambda i: client_names[i],
+                index=0,
+                key="__tour_client_display__"
+            )
+            client_display = client_names[idx_disp]
+            client_display_norm = client_norms[idx_disp]
+        else:
+            client_display = ""
+            client_display_norm = ""
 
         # 2) Add all stops to client (optional) — first option = No client
         add_names = [NO_CLIENT] + client_names
@@ -382,29 +429,34 @@ def render_tours_tab(state: dict):
         idx_add = st.selectbox(
             "Add all stops to client (optional)",
             list(range(len(add_names))),
-            format_func=lambda i: add_names[i] if add_names else "",
+            format_func=lambda i: add_names[i],
             index=0,
             key="__tour_add_to_client__"
         )
-        cho_client_norm = add_norms[idx_add]
+        chosen_norm = add_norms[idx_add]
+
+        # 3) Also mark as "toured" in Sent (so client/run views can tag toured)
+        also_mark_sent = st.checkbox("Also mark these stops as “toured” in Sent", value=True)
 
         colAA, colBB = st.columns([0.35, 0.65])
         with colAA:
             can_add = bool(stops) and bool(tdate) and bool(client_display and client_display_norm)
-            if st.button("Add all stops", use_container_width=True, disabled=not can_add):
+            add_clicked = st.button("Add all stops", use_container_width=True, disabled=not can_add)
+            if add_clicked:
                 try:
-                    if cho_client_norm:
-                        tdate_obj = datetime.fromisoformat(tdate).date() if tdate else date.today()
-                        tour_id = _create_or_get_tour(
-                            client_norm=client_display_norm,   # owner = display dropdown
-                            client_display=client_display,
-                            tour_url=(url or None),
-                            tour_date=tdate_obj
-                        )
-                        n = _insert_stops(tour_id, stops)
-                        st.success(f"Added {n} stop(s) to {client_display} for {tdate_obj}.")
-                    else:
-                        st.info("Preview only — not logged (No client).")
+                    # Create/attach to the display client's tour (owner)
+                    tdate_obj = datetime.fromisoformat(tdate).date() if tdate else date.today()
+                    tour_id = _create_or_get_tour(
+                        client_norm=client_display_norm,
+                        client_display=client_display,
+                        tour_url=(url or None),
+                        tour_date=tdate_obj
+                    )
+                    n = _insert_stops(tour_id, stops)
+                    # Optional: also log to sent (for toured indicator)
+                    if also_mark_sent and chosen_norm:
+                        _insert_sent_for_stops(chosen_norm, stops, tdate_obj)
+                    st.success(f"Added {n} stop(s) to {client_display} for {tdate_obj}.")
                 except Exception as e:
                     st.error(f"Could not add stops. {e}")
 
@@ -424,7 +476,10 @@ def render_tours_tab(state: dict):
 
     colR1, colR2 = st.columns([1.2, 1])
     with colR1:
-        irep = st.selectbox("Pick a client", list(range(len(names2))), format_func=lambda i: names2[i] if names2 else "", index=(default_idx if names2 else 0), key="__tour_client_pick__")
+        if names2:
+            irep = st.selectbox("Pick a client", list(range(len(names2))), format_func=lambda i: names2[i], index=default_idx, key="__tour_client_pick__")
+        else:
+            irep = 0
     with colR2:
         st.write("")  # spacer
         st.button("Show report", use_container_width=True)
@@ -451,10 +506,9 @@ def _render_client_tours_report(client_display: str, client_norm: str):
 
     for t in tours:
         td = t["tour_date"]
-        st.markdown(f"#### {escape(client_display)} <span class='badge date'>{escape(td)}</span>", unsafe_allow_html=True)
+        st.markdown(f"#### {escape(client_display)} {_date_badge_html(td)}", unsafe_allow_html=True)
         sq = SUPABASE.table("tour_stops").select("address,address_slug,start,end,deeplink").eq("tour_id", t["id"]).order("start", desc=False).limit(500).execute()
         stops = sq.data or []
-
         if not stops:
             st.caption("_(No stops logged for this date.)_")
             continue
@@ -468,18 +522,11 @@ def _render_client_tours_report(client_display: str, client_norm: str):
             end   = (s.get("end") or "").strip()
             when  = f"{start}–{end}" if (start and end) else (start or end or "")
             visit = repeat_map.get((slug, td), 1)
-            repeat_html = f' <span class="tag repeat">{_ordinal(visit)} showing</span>' if visit >= 2 else ""
             items.append(
-                f"<li>"
-                f"{(f'<span class=\"time\">{escape(when)}</span> ' if when else '')}"
-                f"<a href='{escape(href)}' target='_blank' rel='noopener'>{escape(addr)}</a>"
-                f"{repeat_html}"
-                f"</li>"
+                "<li>"
+                + (f"<span style='font-weight:800;margin-right:.35rem;'>{escape(when)}</span> " if when else "")
+                + f"<a href='{escape(href)}' target='_blank' rel='noopener'>{escape(addr)}</a>"
+                + _repeat_tag_html(visit)
+                + "</li>"
             )
-        st.markdown("<ul class='link-list'>" + "\n".join(items) + "</ul>", unsafe_allow_html=True)
-
-
-def _ordinal(n: int) -> str:
-    if 10 <= (n % 100) <= 20: suf = "th"
-    else: suf = {1:"st",2:"nd",3:"rd"}.get(n % 10, "th")
-    return f"{n}{suf}"
+        st.markdown("<ul style='margin:.25rem 0 .5rem 1.2rem;padding:0;'>" + "\n".join(items) + "</ul>", unsafe_allow_html=True)
