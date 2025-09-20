@@ -1,7 +1,11 @@
-import os, sys, json
+# app.py
+
+import os
+import sys
+import json
 import streamlit as st
 
-# --- Path shim (robust for Streamlit Cloud / different CWDs) ---
+# Path shim (robust for different working dirs)
 HERE = os.path.dirname(os.path.abspath(__file__))
 if HERE not in sys.path:
     sys.path.insert(0, HERE)
@@ -23,20 +27,19 @@ except Exception:
     spec.loader.exec_module(mod)  # type: ignore
     render_tours_tab = getattr(mod, "render_tours_tab")
 
-# ---------- UI ----------
+# UI
 apply_page_base()
 st.markdown('<h2 class="app-title">Address Alchemist</h2>', unsafe_allow_html=True)
-st.markdown('<p class="app-sub">Paste addresses or <em>any listing links</em> → verified Zillow links</p>', unsafe_allow_html=True)
+st.markdown('<p class="app-sub">Paste addresses or <em>any listing links</em> -> verified Zillow links</p>', unsafe_allow_html=True)
 
 # Fixed tab order: Run, Clients, Tours
 tab_run, tab_clients, tab_tours = st.tabs(["Run", "Clients", "Tours"])
 
-# Default the remembered tab if not set
+# Remember last active tab across reruns
 if "__active_tab__" not in st.session_state:
     st.session_state["__active_tab__"] = "Run"
 
 with tab_run:
-    # Mark this as the active tab when user interacts here during this render
     st.session_state["__active_tab__"] = "Run"
     render_run_tab(state=st.session_state)
 
@@ -48,41 +51,33 @@ with tab_tours:
     st.session_state["__active_tab__"] = "Tours"
     render_tours_tab(state=st.session_state)
 
-# --- Re-select the remembered tab after reruns while keeping visible order fixed ---
-# This clicks the tab whose label matches st.session_state["__active_tab__"]
+# Re-select the remembered tab after reruns while keeping visible order fixed
 wanted = st.session_state.get("__active_tab__", "Run")
 st.components.v1.html(
-    f"""
+    """
     <script>
-    (function() {{
-      const wanted = {json.dumps(wanted)};
+    (function() {
+      const wanted = %s;
       let tries = 0;
-      function pick() {{
-        // Streamlit renders tab headers as buttons[role="tab"] in the parent doc
-        const btns = window.parent.document.querySelectorAll('button[role="tab"]');
-        if (!btns || !btns.length) {{
+      function pick() {
+        const doc = window.parent.document;
+        const btns = doc.querySelectorAll('button[role="tab"]');
+        if (!btns || !btns.length) {
           if (tries++ < 60) setTimeout(pick, 50);
           return;
-        }}
-        for (const b of btns) {{
+        }
+        for (const b of btns) {
           const label = (b.innerText || "").trim();
           const selected = b.getAttribute("aria-selected") === "true";
-          if (label === wanted && !selected) {{
+          if (label === wanted && !selected) {
             b.click();
             break;
-          }}
-        }}
-      }}
-      // Run ASAP and retry a bit while Streamlit mounts
+          }
+        }
+      }
       setTimeout(pick, 0);
-    }})();
+    })();
     </script>
-    """,
+    """ % json.dumps(wanted),
     height=0
 )
-```
-
-**What to keep in your Tours tab (`ui/tours_tab.py`):**
-
-* Leave your `_stay_on_tours()` calls and `st.session_state["__active_tab__"] = "Tours"` logic exactly as you already have it. That’s how we tell the app which tab to reselect.
-* No other changes needed.
