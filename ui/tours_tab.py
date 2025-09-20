@@ -245,7 +245,7 @@ def _insert_tour_and_stops(client_norm: str, client_display: str, tour_date: Opt
     except Exception as e:
         return False, f"Create tour failed: {e}", None
 
-def _log_stops_to_sent(client_norm: str, client_display: str, stops: List[Dict, str]):
+def _log_stops_to_sent(client_norm: str, client_display: str, stops: List[Dict[str, Any]]) -> Tuple[bool, str]:
     if not (_sb_ok() and client_norm and stops):
         return False, "skip"
     now_iso = datetime.utcnow().isoformat(timespec="seconds") + "Z"
@@ -421,7 +421,6 @@ def render_tours_tab(state: dict):
             if guessed_idx is not None:
                 display_default = guessed_idx
             else:
-                # if a real client is selected (sel_idx >= 1), mirror it
                 if sel_idx >= 1:
                     display_default = sel_idx - 1
         display_choice = st.selectbox(
@@ -431,7 +430,7 @@ def render_tours_tab(state: dict):
             key="__tour_display_sel__"
         )
 
-        # Button is ALWAYS clickable now; we validate selection on click.
+        # Button is ALWAYS clickable; we validate selection on click.
         add_clicked = st.button("Add all stops to selected client", use_container_width=True, key="__add_all_btn__")
 
         if add_clicked:
@@ -495,3 +494,4 @@ def render_tours_tab(state: dict):
                                     st.experimental_rerun()
                             else:
                                 st.warning("Failed to remove stop.")
+
