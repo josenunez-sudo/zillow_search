@@ -1,12 +1,14 @@
 # ui/tours_tab.py
 # Tours tab: Parse → Verify → Add all → (also insert into `sent`) and clients can see TOURED tags.
+# This version adds a robust fallback parser that scans the entire text blob, so it works
+# on ShowingTime Print pages where lines are irregular.
 
 import os
 import re
 import io
 from datetime import date, datetime
 from typing import List, Dict, Any, Optional, Tuple
-from html import escape
+from html import escape, unescape as html_unescape
 
 import streamlit as st
 import requests
@@ -195,13 +197,11 @@ def add_stop(tour_id: int, address: str, start: str, end: str, deeplink: str = "
 
 
 # ───────────────────────────── ALSO LOG STOPS INTO `sent` ─────────────────────────────
-# This is the key piece: when you add stops, we also upsert into the `sent` table and mark as "toured".
 
 def _log_sent_for_tour(client_norm: str, client_display: str, tour_id: int, tour_date: date, stops: List[Dict[str, str]]):
     """
     Insert each stop into `sent` so it appears in the 'properties sent' list.
-    We try to include 'toured_at' & 'tour_id' if those columns exist; if the insert fails
-    (e.g., columns missing), retry with a minimal payload.
+    If your 'sent' table lacks toured_at / tour_id, we fallback to a minimal insert.
     """
     if not (_sb_ok() and client_norm and stops):
         return
@@ -221,12 +221,11 @@ def _log_sent_for_tour(client_norm: str, client_display: str, tour_id: int, tour
             "mls_id": None,
             "address": addr or None,
             "sent_at": ts_now,
-            # Optional columns (if you added them)
+            # Optional columns (if present)
             "toured_at": ts_now,
             "tour_id": tour_id,
         })
 
-    # De-dup by url for this client (avoid spam inserts)
     try:
         urls = [r["url"] for r in rows_full if r.get("url")]
         if urls:
@@ -239,7 +238,6 @@ def _log_sent_for_tour(client_norm: str, client_display: str, tour_id: int, tour
     if not rows_full:
         return
 
-    # Try full insert (with toured_at, tour_id). If it fails, fallback to minimal.
     try:
         SUPABASE.table("sent").insert(rows_full).execute()
         return
@@ -262,7 +260,6 @@ def _log_sent_for_tour(client_norm: str, client_display: str, tour_id: int, tour
     try:
         SUPABASE.table("sent").insert(rows_min).execute()
     except Exception:
-        # Last resort: ignore if we can't insert, but don't break the flow
         pass
 
 
@@ -274,8 +271,26 @@ _DATE_PATTERNS = [
     re.compile(r'([A-Za-z]+\s+\d{1,2},\s+\d{4})'),
     re.compile(r'(\d{1,2}/\d{1,2}/\d{4})'),
 ]
+# Relaxed line parser pattern
 _ADDR_RELAX = re.compile(
     r'^\s*(?P<street>.+?)\s*,?\s*(?P<city>[A-Za-z .\-]+?)\s*,\s*(?P<state>[A-Z]{2})\s+(?P<zip>\d{5}(?:-\d{4})?)\s*$'
+)
+
+# Fallback: scan entire blob for address + time on one "flow"
+_ADDR_TIME_BLOB = re.compile(
+    r'(?P<addr>\d{1,6}\s+[A-Za-z0-9 .\'\-]+,\s*[A-Za-z .\'\-]+,\s*[A-Z]{2}\s+\d{5}(?:-\d{4})?)\s+'
+    r'(?P<start>\d{1,2}:\d{2}\s?(?:AM|PM|am|pm))\s*(?:–|-|to)\s*(?P<end>\d{1,2}:\d{2}\s?(?:AM|PM|am|pm))'
+)
+
+# Address-only; we’ll hunt a nearby time window after it
+_ADDR_ONLY_BLOB = re.compile(
+    r'(?P<addr>\d{1,6}\s+[A-Za-z0-9 .\'\-]+,\s*[A-Za-z .\'\-]+,\s*[A-Z]{2}\s+\d{5}(?:-\d{4})?)'
+)
+
+# Date headline like: "Buyer's Tour - Monday, September 22, 2025"
+_DATE_HEADLINE = re.compile(
+    r'Tour\s*[-–]\s*([A-Za-z]+day,\s+[A-Za-z]+\s+\d{1,2},\s+\d{4})',
+    re.IGNORECASE
 )
 
 def _parse_date_string(s: str) -> Optional[date]:
@@ -295,10 +310,13 @@ def _clean_unicode(s: str) -> str:
 def _fix_common_breaks(s: str) -> str:
     s = _clean_unicode(s)
     s = re.sub(r"\s{2,}", " ", s).strip()
-    s = re.sub(r"\b([A-Z])\s+([a-z]{2,})\b", r"\1\2", s)
+    # Unsplit accidental single-letter joins like "N W est" -> "N West", "W inchester" -> "Winchester"
+    s = re.sub(r"\b([A-Z])\s+([A-Za-z]{2,})\b", r"\1\2", s)
     return s
 
 def _lines_from_html(html: str) -> str:
+    # convert HTML to plaintext with line breaks
+    html = html_unescape(html or "")
     txt = re.sub(r"(?i)<br\s*/?>", "\n", html)
     txt = re.sub(r"(?i)</p>", "\n", txt)
     txt = re.sub(r"(?s)<[^>]+>", " ", txt)
@@ -321,6 +339,52 @@ def _extract_text_from_pdf(file_bytes: bytes) -> str:
     except Exception:
         return ""
 
+def _fallback_parse_blob(blob: str) -> Tuple[Optional[date], List[Dict[str, str]]]:
+    """Global scan for addresses + times; also tries to pull a tour date from the headline."""
+    blob = _fix_common_breaks(_clean_unicode(blob or ""))
+    # find date first
+    tdate = None
+    mhd = _DATE_HEADLINE.search(blob)
+    if mhd:
+        tdate = _parse_date_string(mhd.group(1))
+    if not tdate:
+        for pat in _DATE_PATTERNS:
+            md = pat.search(blob)
+            if md:
+                tdate = _parse_date_string(md.group(1))
+                if tdate: break
+
+    stops: List[Dict[str, str]] = []
+
+    # 1) address + time in one go
+    for m in _ADDR_TIME_BLOB.finditer(blob):
+        addr = _fix_common_breaks(m.group("addr"))
+        start = m.group("start").upper().replace("  ", " ").strip()
+        end   = m.group("end").upper().replace("  ", " ").strip()
+        stops.append({"address": addr, "start": start, "end": end, "deeplink": _zillow_deeplink_from_addr(addr)})
+
+    # 2) any leftover addresses; search a small window to the right for a time range
+    if not stops:
+        for m in _ADDR_ONLY_BLOB.finditer(blob):
+            addr = _fix_common_breaks(m.group("addr"))
+            # look ahead ~150 chars
+            start_idx = m.end()
+            window = blob[start_idx:start_idx+180]
+            mt = _TIME_RE.search(window)
+            s1 = mt.group(1).upper().strip() if mt else ""
+            s2 = mt.group(2).upper().strip() if mt else ""
+            stops.append({"address": addr, "start": s1, "end": s2, "deeplink": _zillow_deeplink_from_addr(addr)})
+
+    # de-dup
+    uniq, seen = [], set()
+    for s in stops:
+        key = (s["address"], s["start"], s["end"])
+        if key in seen: continue
+        seen.add(key)
+        uniq.append(s)
+
+    return tdate, uniq
+
 def parse_showingtime_text(text: str) -> Tuple[Optional[date], List[Dict[str, str]], str, str]:
     if not text:
         return None, [], "Empty input", ""
@@ -330,7 +394,13 @@ def parse_showingtime_text(text: str) -> Tuple[Optional[date], List[Dict[str, st
 
     # Detect tour date near the top
     tdate: Optional[date] = None
-    for line in lines[:40]:
+    for line in lines[:60]:
+        # headline “Tour - Monday, September 22, 2025”
+        mh = _DATE_HEADLINE.search(line)
+        if mh:
+            tdate = _parse_date_string(mh.group(1))
+            if tdate:
+                break
         for pat in _DATE_PATTERNS:
             m = pat.search(line)
             if m:
@@ -340,16 +410,17 @@ def parse_showingtime_text(text: str) -> Tuple[Optional[date], List[Dict[str, st
         if tdate:
             break
 
+    # Line-by-line stop extraction
     stops: List[Dict[str, str]] = []
-    i = 0
-    n = len(lines)
+    i, n = 0, len(lines)
+    _ADDR_RELAX_LOCAL = _ADDR_RELAX
     while i < n:
         L0 = lines[i].strip()
-        m = _ADDR_RELAX.match(L0)
+        m = _ADDR_RELAX_LOCAL.match(L0)
         used_next = False
         if not m and i + 1 < n:
             L01 = _fix_common_breaks(L0 + " " + lines[i + 1].strip())
-            m = _ADDR_RELAX.match(L01)
+            m = _ADDR_RELAX_LOCAL.match(L01)
             used_next = bool(m)
 
         if m:
@@ -359,8 +430,9 @@ def parse_showingtime_text(text: str) -> Tuple[Optional[date], List[Dict[str, st
             zcode  = m.group("zip").strip()
             addr_full = f"{street}, {city}, {state} {zcode}"
 
+            # search next few lines for the time window
             time_found = False
-            for j in range(i + 1, min(i + 4, n)):
+            for j in range(i + 1, min(i + 5, n)):
                 mt = _TIME_RE.search(lines[j])
                 if mt:
                     s1 = mt.group(1).upper()
@@ -377,7 +449,16 @@ def parse_showingtime_text(text: str) -> Tuple[Optional[date], List[Dict[str, st
 
         i += 1
 
-    # Deduplicate by (address,start,end)
+    # If nothing found, run blob fallback (handles your example)
+    if not stops:
+        blob = " ".join(lines)
+        t2, stops2 = _fallback_parse_blob(blob)
+        if t2 and not tdate:
+            tdate = t2
+        if stops2:
+            stops = stops2
+
+    # Deduplicate
     uniq = []
     seen = set()
     for s in stops:
@@ -486,7 +567,7 @@ def _render_client_tours_report(client_norm: str, client_name: str):
         st.markdown("<ul class='link-list'>" + "\n".join(lines) + "</ul>", unsafe_allow_html=True)
 
 
-# ───────────────────────────── Main UI (Parse → Add all → also log to sent) ─────────────────────────────
+# ───────────────────────────── Main UI ─────────────────────────────
 
 def render_tours_tab(state: dict):
     st.subheader("Tours")
@@ -546,7 +627,7 @@ def render_tours_tab(state: dict):
         st.warning(parse_err)
         if dbg_text:
             with st.expander("Debug: extracted text"):
-                st.text(dbg_text[:6000])
+                st.text(dbg_text[:8000])
 
     # Preview + Add all
     if stops_parsed:
