@@ -1,6 +1,6 @@
 # ui/tours_tab.py
-# Tours tab with "Parse -> Add all tours" flow, side-by-side clients with ▦ Report,
-# per-tour delete (undo), and high-contrast date/time badges.
+# Tours tab with robust "Parse → Add all tours" flow, side-by-side clients with ▦ Report,
+# per-tour delete, and high-contrast date/time badges. Parser improved for ShowingTime quirks.
 
 import os
 import re
@@ -201,18 +201,23 @@ def add_stop(tour_id: int, address: str, start: str, end: str, deeplink: str = "
         return False, str(e)
 
 
-# ───────────────────────────── ShowingTime parsing ─────────────────────────────
+# ───────────────────────────── ShowingTime parsing (improved) ─────────────────────────────
 
+# Accept "9:00 AM-10:15 AM", "9:00AM - 10:15AM", "9:00 AM – 10:15 AM"
 _TIME_RE = re.compile(
     r'(\d{1,2}:\d{2}\s?(?:AM|PM|am|pm))\s*(?:–|-|to)\s*(\d{1,2}:\d{2}\s?(?:AM|PM|am|pm))'
 )
+
+# Broader date capture variants
 _DATE_PATTERNS = [
     re.compile(r'([A-Za-z]+day,\s+[A-Za-z]+\s+\d{1,2},\s+\d{4})'),  # Saturday, September 21, 2024
     re.compile(r'([A-Za-z]+\s+\d{1,2},\s+\d{4})'),                  # September 21, 2024
     re.compile(r'(\d{1,2}/\d{1,2}/\d{4})'),                         # 09/21/2024
 ]
-_ADDR_RE = re.compile(
-    r'^\s*([0-9A-Za-z#.\- ]+?),\s*([A-Za-z .\-]+?),\s*([A-Z]{2})\s+(\d{5}(?:-\d{4})?)\s*$'
+
+# Relaxed address pattern; street may be anything up to city, optional comma before city
+_ADDR_RELAX = re.compile(
+    r'^\s*(?P<street>.+?)\s*,?\s*(?P<city>[A-Za-z .\-]+?)\s*,\s*(?P<state>[A-Z]{2})\s+(?P<zip>\d{5}(?:-\d{4})?)\s*$'
 )
 
 def _parse_date_string(s: str) -> Optional[date]:
@@ -224,21 +229,68 @@ def _parse_date_string(s: str) -> Optional[date]:
             continue
     return None
 
-def _normalize_line(l: str) -> str:
-    l = l.replace("\xa0", " ")
-    l = re.sub(r"([A-Za-z])\s+([A-Za-z])", r"\1\2", l)  # collapse split letters (W est → West)
-    l = re.sub(r"\s{2,}", " ", l)
-    return l.strip()
+def _clean_unicode(s: str) -> str:
+    # Normalize unicode dashes and spaces
+    s = s.replace("\u2013", "-").replace("\u2014", "-").replace("\u2212", "-")
+    s = s.replace("\xa0", " ")
+    return s
 
-def parse_showingtime_text(text: str) -> Tuple[Optional[date], List[Dict[str, str]]]:
-    """Return (tour_date, stops[{address,start,end,deeplink}])."""
+def _fix_common_breaks(s: str) -> str:
+    """
+    Fix common ShowingTime PDF/HTML text breaks like 'W est' -> 'West' (but keep real word gaps),
+    and stray line artifacts.
+    """
+    s = _clean_unicode(s)
+    s = re.sub(r"\s{2,}", " ", s).strip()
+    # Turn 'W est', 'E xample' into 'West', 'Example'
+    s = re.sub(r"\b([A-Z])\s+([a-z]{2,})\b", r"\1\2", s)
+    # Keep words separated otherwise
+    return s
+
+def _lines_from_html(html: str) -> str:
+    # Convert common HTML separators to newlines, drop tags
+    txt = re.sub(r"(?i)<br\s*/?>", "\n", html)
+    txt = re.sub(r"(?i)</p>", "\n", txt)
+    txt = re.sub(r"(?s)<[^>]+>", " ", txt)
+    txt = _clean_unicode(txt)
+    txt = re.sub(r"\s{2,}", " ", txt)
+    return txt
+
+def _extract_text_from_pdf(file_bytes: bytes) -> str:
+    if not PyPDF2:
+        return ""
+    try:
+        reader = PyPDF2.PdfReader(io.BytesIO(file_bytes))
+        parts = []
+        for pg in reader.pages:
+            try:
+                parts.append(pg.extract_text() or "")
+            except Exception:
+                continue
+        return "\n".join(parts)
+    except Exception:
+        return ""
+
+def parse_showingtime_text(text: str) -> Tuple[Optional[date], List[Dict[str, str]], str, str]:
+    """
+    Return (tour_date, stops[{address,start,end,deeplink}], error, debug_text).
+    Robust logic:
+      • cleans unicode
+      • merges two consecutive lines when needed to find address
+      • then finds time on the same or next 2 lines
+    """
     if not text:
-        return None, []
-    lines = [_normalize_line(x) for x in re.split(r"[\r\n]+", text) if x.strip()]
+        return None, [], "Empty input", ""
 
-    # Detect tour date
+    raw_text = text  # keep for debug
+    text = _clean_unicode(text)
+    # Split into lines; keep order
+    raw_lines = re.split(r"[\r\n]+", text)
+    lines = [_fix_common_breaks(l) for l in raw_lines if l.strip()]
+
+    # Detect tour date near the top
     tdate: Optional[date] = None
-    for line in lines[:25]:
+    for line in lines[:40]:
         for pat in _DATE_PATTERNS:
             m = pat.search(line)
             if m:
@@ -248,29 +300,62 @@ def parse_showingtime_text(text: str) -> Tuple[Optional[date], List[Dict[str, st
         if tdate:
             break
 
-    # Extract stops
     stops: List[Dict[str, str]] = []
-    cur_addr: Optional[str] = None
-    for line in lines:
-        ma = _ADDR_RE.match(line)
-        if ma:
-            street_city = f"{ma.group(1)}, {ma.group(2)}"
-            st_zip = f"{ma.group(3)} {ma.group(4)}"
-            cur_addr = f"{street_city}, {st_zip}"
-            continue
-        mt = _TIME_RE.search(line)
-        if mt and cur_addr:
-            s1 = mt.group(1).upper().replace("AM", "AM").replace("PM", "PM")
-            s2 = mt.group(2).upper().replace("AM", "AM").replace("PM", "PM")
-            stops.append({
-                "address": cur_addr,
-                "start": s1,
-                "end": s2,
-                "deeplink": _zillow_deeplink_from_addr(cur_addr),
-            })
-            # keep cur_addr for multiple time lines if present
+    i = 0
+    n = len(lines)
+    while i < n:
+        L0 = lines[i].strip()
 
-    # Deduplicate (address+time)
+        # Try current line as address
+        m = _ADDR_RELAX.match(L0)
+
+        used_next = False
+        if not m and i + 1 < n:
+            # Try merging with next line (addresses often wrap)
+            L01 = (L0 + " " + lines[i + 1].strip())
+            L01 = _fix_common_breaks(L01)
+            m = _ADDR_RELAX.match(L01)
+            used_next = bool(m)
+
+        if m:
+            street = m.group("street").strip().rstrip(",")
+            city   = m.group("city").strip()
+            state  = m.group("state").strip()
+            zcode  = m.group("zip").strip()
+            addr_full = f"{street}, {city}, {state} {zcode}"
+
+            # After an address, search for time on this or next two lines
+            time_found = False
+            for j in range(i + 1, min(i + 4, n)):
+                mt = _TIME_RE.search(lines[j])
+                if mt:
+                    s1 = mt.group(1).upper().replace("AM", "AM").replace("PM", "PM")
+                    s2 = mt.group(2).upper().replace("AM", "AM").replace("PM", "PM")
+                    stops.append({
+                        "address": addr_full,
+                        "start": s1,
+                        "end": s2,
+                        "deeplink": _zillow_deeplink_from_addr(addr_full),
+                    })
+                    time_found = True
+                    break
+
+            # If no explicit time line is found, still register the stop with empty times
+            if not time_found:
+                stops.append({
+                    "address": addr_full,
+                    "start": "",
+                    "end": "",
+                    "deeplink": _zillow_deeplink_from_addr(addr_full),
+                })
+
+            # Advance pointer
+            i += 2 if used_next else 1
+            continue
+
+        i += 1
+
+    # Deduplicate by (address,start,end)
     seen = set()
     uniq: List[Dict[str, str]] = []
     for s in stops:
@@ -280,45 +365,31 @@ def parse_showingtime_text(text: str) -> Tuple[Optional[date], List[Dict[str, st
         seen.add(key)
         uniq.append(s)
 
-    return tdate, uniq
+    if not uniq:
+        return tdate, [], "No stops found. Double-check that this is a ShowingTime tour Print page or PDF.", "\n".join(lines)
 
-def parse_showingtime_print_url(url: str) -> Tuple[Optional[date], List[Dict[str, str]], str]:
+    return tdate, uniq, "", "\n".join(lines)
+
+def parse_showingtime_print_url(url: str) -> Tuple[Optional[date], List[Dict[str, str]], str, str]:
     if not url:
-        return None, [], "Empty URL"
+        return None, [], "Empty URL", ""
     try:
-        r = requests.get(url, timeout=15)
+        r = requests.get(url, timeout=20)
         if not r.ok:
-            return None, [], f"HTTP {r.status_code}"
+            return None, [], f"HTTP {r.status_code}", ""
         html = r.text
-        txt = re.sub(r"<br\s*/?>", "\n", html, flags=re.I)
-        txt = re.sub(r"</p>", "\n", txt, flags=re.I)
-        txt = re.sub(r"<[^>]+>", " ", txt, flags=re.I)
-        txt = re.sub(r"\s{2,}", " ", txt)
-        tdate, stops = parse_showingtime_text(txt)
-        if not stops:
-            return tdate, [], "No stops found on Print page"
-        return tdate, stops, ""
+        txt = _lines_from_html(html)
+        return parse_showingtime_text(txt)
     except Exception as e:
-        return None, [], f"{e}"
+        return None, [], f"{e}", ""
 
-def parse_showingtime_pdf(file_bytes: bytes) -> Tuple[Optional[date], List[Dict[str, str]], str]:
+def parse_showingtime_pdf(file_bytes: bytes) -> Tuple[Optional[date], List[Dict[str, str]], str, str]:
     if not PyPDF2:
-        return None, [], "PyPDF2 not installed. Add PyPDF2 to requirements.txt"
-    try:
-        reader = PyPDF2.PdfReader(io.BytesIO(file_bytes))
-        text_parts = []
-        for page in reader.pages:
-            try:
-                text_parts.append(page.extract_text() or "")
-            except Exception:
-                continue
-        full = "\n".join(text_parts)
-        tdate, stops = parse_showingtime_text(full)
-        if not stops:
-            return tdate, [], "No stops found in PDF"
-        return tdate, stops, ""
-    except Exception as e:
-        return None, [], f"{e}"
+        return None, [], "PyPDF2 not installed. Add PyPDF2 to requirements.txt", ""
+    txt = _extract_text_from_pdf(file_bytes)
+    if not txt:
+        return None, [], "Could not extract text from PDF", ""
+    return parse_showingtime_text(txt)
 
 
 # ───────────────────────────── UI Helpers ─────────────────────────────
@@ -434,22 +505,26 @@ def render_tours_tab(state: dict):
     tdate_parsed: Optional[date] = parsed.get("tdate")
     stops_parsed: List[Dict[str,str]] = parsed.get("stops") or []
     parse_err: str = parsed.get("err") or ""
+    dbg_text: str = parsed.get("dbg") or ""
 
     # Parse action
     if st.button("Parse", key="__st_parse_btn__", use_container_width=True):
-        tdate_parsed, stops_parsed, parse_err = None, [], ""
+        tdate_parsed, stops_parsed, parse_err, dbg_text = None, [], "", ""
         if (print_url or "").strip():
-            tdate_parsed, stops_parsed, parse_err = parse_showingtime_print_url(print_url.strip())
+            tdate_parsed, stops_parsed, parse_err, dbg_text = parse_showingtime_print_url(print_url.strip())
         elif uploaded_pdf is not None:
             file_bytes = uploaded_pdf.getvalue()
-            tdate_parsed, stops_parsed, parse_err = parse_showingtime_pdf(file_bytes)
+            tdate_parsed, stops_parsed, parse_err, dbg_text = parse_showingtime_pdf(file_bytes)
         else:
             parse_err = "Provide a Print URL or upload a PDF."
-        st.session_state["__st_parsed__"] = {"tdate": tdate_parsed, "stops": stops_parsed, "err": parse_err}
+        st.session_state["__st_parsed__"] = {"tdate": tdate_parsed, "stops": stops_parsed, "err": parse_err, "dbg": dbg_text}
         _safe_rerun()
 
     if parse_err:
         st.warning(parse_err)
+        if dbg_text:
+            with st.expander("Debug: extracted text"):
+                st.text(dbg_text[:6000])
 
     # Preview + Add all
     if stops_parsed:
@@ -485,7 +560,6 @@ def render_tours_tab(state: dict):
             if append_existing:
                 same_day = [t for t in fetch_tours_for_client(client_norm) if str(t.get("tour_date") or "") == str(final_date)]
                 if same_day:
-                    # Append to the most recently created tour on that date
                     same_day_sorted = sorted(same_day, key=lambda x: x.get("created_at") or "", reverse=True)
                     target_tid = int(same_day_sorted[0]["id"])
 
@@ -508,12 +582,10 @@ def render_tours_tab(state: dict):
 
             if errs == 0:
                 st.success("Tour added.")
-                # Clear parsed buffer after successful add
                 st.session_state["__st_parsed__"] = {}
             else:
                 st.warning(f"Added with {errs} error(s).")
 
-            # Offer quick open of report
             if st.button("▦ Open tours report for client", use_container_width=True):
                 st.session_state["__tours_report_for__"] = {"norm": client_norm, "name": sel_name}
                 _safe_rerun()
@@ -539,7 +611,6 @@ def render_tours_tab(state: dict):
             for c in inactive:
                 _client_row_with_report(c["name"], c.get("name_norm",""), c["id"], active=False)
 
-    # If a report is selected, render it below
     rep = st.session_state.get("__tours_report_for__")
     if rep:
         st.markdown("---")
