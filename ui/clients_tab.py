@@ -2,7 +2,7 @@
 import os, re, io
 from datetime import datetime
 from html import escape
-from typing import List, Dict, Any, Optional, Tuple, OrderedDict
+from typing import List, Dict, Any, Optional, Tuple
 from urllib.parse import unquote
 
 import streamlit as st
@@ -30,63 +30,24 @@ def _sb_ok() -> bool:
     except Exception:
         return False
 
-# =========================
-# Helpers
-# =========================
 def _norm_tag(s: str) -> str:
     return re.sub(r"\s+", " ", (s or "").strip()).lower()
 
-def _slug_simple(s: str) -> str:
-    a = (s or "").strip().lower()
+# === CRITICAL: use the EXACT same slugger as Tours tab ===
+def _slug_addr(addr: str) -> str:
+    a = (addr or "").strip().lower()
     a = re.sub(r"[^\w\s,-]", "", a).replace(",", "")
     return re.sub(r"\s+", "-", a).strip("-")
 
-# Robust address normalizer so "St" == "Street", directions unify, etc.
-SUFFIX_MAP = {
-    "st": "street", "street": "street",
-    "rd": "road", "road": "road",
-    "ave": "avenue", "av": "avenue", "avenue": "avenue",
-    "blvd": "boulevard", "boulevard": "boulevard",
-    "dr": "drive", "drive": "drive",
-    "ln": "lane", "lane": "lane",
-    "ct": "court", "court": "court",
-    "pl": "place", "place": "place",
-    "ter": "terrace", "terrace": "terrace",
-    "way": "way",
-    "pkwy": "parkway", "parkway": "parkway",
-    "cir": "circle", "circle": "circle",
-    "hwy": "highway", "highway": "highway",
-}
-DIR_MAP = {"n":"north","s":"south","e":"east","w":"west","north":"north","south":"south","east":"east","west":"west"}
+# Minimal zpid pull (for dedupe)
+_ZPID_RE = re.compile(r'(\d{6,})_zpid', re.I)
 
-def _normalize_addr_for_slug(addr: str) -> str:
-    """
-    Collapse common differences: "St" vs "Street", "E" vs "East", punctuation/case.
-    Also normalizes "NC" vs "Nc" etc. End result is slug-safe.
-    """
-    s = (addr or "").strip().lower()
-    s = unquote(s)
-    s = re.sub(r"[^\w\s,-]", " ", s)  # drop punctuation except , and -
-    s = re.sub(r"\s+", " ", s).strip()
+def _zpid_from_url(url: str) -> str:
+    m = _ZPID_RE.search(url or "")
+    return (m.group(1) if m else "").strip()
 
-    # token-by-token normalization
-    tokens = s.replace(",", " ").split()
-    out = []
-    for tok in tokens:
-        if tok in DIR_MAP:
-            out.append(DIR_MAP[tok])
-        elif tok in SUFFIX_MAP:
-            out.append(SUFFIX_MAP[tok])
-        else:
-            out.append(tok)
-    norm = " ".join(out)
-
-    # collapse multiple spaces and hyphenate
-    norm = re.sub(r"\s+", " ", norm).strip()
-    return _slug_simple(norm)
-
+# Human title from URL if address missing
 def address_text_from_url(url: str) -> str:
-    """Human title from Zillow URL when DB 'address' missing."""
     if not url: return ""
     u = unquote(url)
     m = re.search(r"/homedetails/([^/]+)/\d{6,}_zpid/", u, re.I)
@@ -102,18 +63,20 @@ def _pretty_sent_at(iso_str: str) -> str:
     if not iso_str:
         return ""
     try:
-        # Python can parse '...+00:00' and '...Z' (replace Z)
         s = iso_str.replace("Z", "+00:00")
         dt = datetime.fromisoformat(s)
         try:
-            # Convert to ET if zoneinfo exists
-            from zoneinfo import ZoneInfo  # py>=3.9
-            dt_local = dt.astimezone(ZoneInfo("America/New_York"))
+            from zoneinfo import ZoneInfo
+            dt = dt.astimezone(ZoneInfo("America/New_York"))
         except Exception:
-            dt_local = dt  # fallback: leave as-is
-        return dt_local.strftime("%b %-d, %Y • %-I:%M %p")
+            pass
+        # handle platforms where %-d / %-I unsupported (Windows)
+        fmt = "%b %d, %Y • %I:%M %p"
+        out = dt.strftime(fmt)
+        # strip leading zero in hour
+        out = re.sub(r"\b0(\d:)", r"\1", out)
+        return out
     except Exception:
-        # Fallback: show date only
         m = re.match(r"^(\d{4}-\d{2}-\d{2})", iso_str)
         return (m.group(1) if m else iso_str)
 
@@ -230,8 +193,7 @@ def fetch_sent_for_client(client_norm: str, limit: int = 5000):
 @st.cache_data(ttl=120, show_spinner=False)
 def fetch_tour_address_slugs(client_norm: str) -> Dict[str, int]:
     """
-    Returns a dict {address_slug: count_of_occurrences_in_all_tours} for the client.
-    Used to tag sent listings that were toured.
+    Returns {address_slug: count_in_all_tours} using the SAME slugger as Tours.
     """
     out: Dict[str, int] = {}
     if not (_sb_ok() and client_norm.strip()):
@@ -246,7 +208,7 @@ def fetch_tour_address_slugs(client_norm: str) -> Dict[str, int]:
         rows = sq.data or []
         for r in rows:
             addr = (r.get("address") or "").strip()
-            slug = (r.get("address_slug") or _normalize_addr_for_slug(addr)).strip()
+            slug = (r.get("address_slug") or _slug_addr(addr)).strip()
             if slug:
                 out[slug] = out.get(slug, 0) + 1
         return out
@@ -357,7 +319,7 @@ def _render_client_report_view(client_display_name: str, client_norm: str):
     with colF3:
         st.caption(f"{total} total logged")
 
-    # Cross-check: toured slugs
+    # Cross-check: toured slugs (built with the SAME slugger)
     toured_slugs = fetch_tour_address_slugs(client_norm)  # dict slug -> count
     toured_set = set(toured_slugs.keys())
 
@@ -376,45 +338,59 @@ def _render_client_report_view(client_display_name: str, client_norm: str):
     rows_f = [r for r in rows if _match(r)]
 
     # ======= HARD DEDUPE (no repeats ever) =======
-    # key priority: canonical → zpid → normalized address slug (robust)
-    def _dedupe_key(r: Dict[str, Any]) -> str:
+    # Track seen by all identities so variants cannot slip through.
+    seen_canon: set = set()
+    seen_zpid:  set = set()
+    seen_slug:  set = set()
+    unique_rows: List[Dict[str, Any]] = []
+
+    for r in rows_f:  # rows_f is newest-first already
         canon = (r.get("canonical") or "").strip().lower()
-        if canon:
-            return "c:" + canon
-        zpid = (r.get("zpid") or "").strip().lower()
-        if zpid:
-            return "z:" + zpid
-        # derive address text then normalized slug
-        addr = (r.get("address") or "").strip()
+        zpid  = (r.get("zpid") or "").strip()
+        url   = (r.get("url") or "").strip()
+        addr  = (r.get("address") or "").strip()
+
+        if not zpid:
+            zpid = _zpid_from_url(url)
+
         if not addr:
-            addr = address_text_from_url((r.get("url") or "").strip())
-        slug = _normalize_addr_for_slug(addr)
-        return "a:" + slug
+            addr = address_text_from_url(url)
 
-    deduped: Dict[str, Dict[str, Any]] = {}
-    # rows_f is already newest-first; keep the FIRST we see for each key
-    for r in rows_f:
-        k = _dedupe_key(r)
-        if k not in deduped:
-            deduped[k] = r
-    rows_u = list(deduped.values())
+        slug = _slug_addr(addr)
 
-    count = len(rows_u)
+        # Skip if any identity was seen
+        if canon and canon in seen_canon:
+            continue
+        if zpid and zpid in seen_zpid:
+            continue
+        if slug and slug in seen_slug:
+            continue
+
+        # Accept row, then mark all identities as seen
+        unique_rows.append(r)
+        if canon:
+            seen_canon.add(canon)
+        if zpid:
+            seen_zpid.add(zpid)
+        if slug:
+            seen_slug.add(slug)
+
+    count = len(unique_rows)
     st.caption(f"{count} unique listing{'s' if count!=1 else ''}")
 
-    if not rows_u:
+    if not unique_rows:
         st.info("No results match the current filters.")
         return
 
     # Render
     items_html = []
-    for r in rows_u:
+    for r in unique_rows:
         url = (r.get("url") or "").strip()
         addr = (r.get("address") or "").strip()
         if not addr:
             addr = address_text_from_url(url) or "Listing"
 
-        slug = _normalize_addr_for_slug(addr)
+        slug = _slug_addr(addr)
         toured = slug in toured_set
         toured_count = toured_slugs.get(slug, 0)
 
@@ -423,7 +399,6 @@ def _render_client_report_view(client_display_name: str, client_norm: str):
 
         camp_chip = ""
         if sel_campaign is None and camp:
-            # Show campaign chip (more subtle) only in "All campaigns"
             camp_chip = (
                 f"<span style='font-size:11px;font-weight:700;padding:2px 6px;border-radius:999px;"
                 f"background:#e2e8f0;margin-left:6px;'>{escape(camp)}</span>"
@@ -459,7 +434,7 @@ def _render_client_report_view(client_display_name: str, client_norm: str):
     # Export filtered+deduped
     with st.expander("Export filtered report"):
         import pandas as pd
-        df = pd.DataFrame(rows_u)
+        df = pd.DataFrame(unique_rows)
         buf = io.StringIO(); df.to_csv(buf, index=False)
         st.download_button(
             "Download CSV (unique only)",
