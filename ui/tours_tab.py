@@ -33,13 +33,6 @@ def _sb_ok() -> bool:
     try: return bool(SUPABASE)
     except NameError: return False
 
-# ---------- Secrets/env ----------
-for k in ["GOOGLE_MAPS_API_KEY"]:
-    try:
-        if k in st.secrets and st.secrets[k]: os.environ[k] = st.secrets[k]
-    except Exception:
-        pass
-
 REQUEST_TIMEOUT = 12
 UA_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36",
@@ -207,12 +200,30 @@ def log_sent_for_stops(client_norm: str, stops: List[Dict[str,str]], tour_date: 
         return False, str(e)
 
 # ---------- Parsing (Print URL / PDF) ----------
-DATE_PAT = re.compile(r"Buy(?:er|ers?)'?s?\s+Tour\s*-\s*[A-Za-z]+,\s*([A-Za-z]+\s+\d{1,2},\s*\d{4})", re.I)
-# Address + time window (captures address, start, end)
-STOP_PAT = re.compile(
-    r"(\d{1,6}[^,\n]+?,\s*[A-Za-z\.\-\' ]+?,\s*[A-Z]{2}\s*\d{5}(?:-\d{4})?)\s+(\d{1,2}:\d{2}\s*[AP]M)\s*-\s*(\d{1,2}:\d{2}\s*[AP]M)",
+# Allow various dash types between times
+DASH = r"[-\u2013\u2014\u2212]"  # -, –, —, −
+
+DATE_PAT = re.compile(
+    r"Buy(?:er|ers?)'?s?\s+Tour\s*"+DASH+r"\s*[A-Za-z]+,\s*([A-Za-z]+\s+\d{1,2},\s*\d{4})",
     re.I
 )
+DATE_FALLBACK = re.compile(r"([A-Za-z]+\s+\d{1,2},\s*\d{4})")
+
+# Address + time window (captures address, start, end)
+# - more permissive characters in street/city
+# - flexible dash and optional spaces around times (e.g., 9:00AM–9:30AM)
+STOP_PAT = re.compile(
+    rf"(\d{{1,6}}\s+[A-Za-z0-9\.\-'/\s]+?,\s*[A-Za-z\.\-'\s]+?,\s*[A-Z]{{2}}\s*\d{{5}}(?:-\d{{4}})?)\s+(\d{{1,2}}:\d{{2}}\s*[AP]M)\s*{DASH}\s*(\d{{1,2}}:\d{{2}}\s*[AP]M)",
+    re.I
+)
+
+# Extra tolerant fallback: allow tight AM/PM (no space) and noise between address/time
+STOP_PAT2 = re.compile(
+    rf"(\d{{1,6}}\s+[A-Za-z0-9\.\-'/\s]+?,\s*[A-Za-z\.\-'\s]+?,\s*[A-Z]{{2}}\s*\d{{5}}(?:-\d{{4}})?)"
+    rf".{{0,60}}?(\d{{1,2}}:\d{{2}}\s*[AP]M)\s*{DASH}\s*(\d{{1,2}}:\d{{2}}\s*[AP]M)",
+    re.I
+)
+
 # Buyer name (optional)
 BUYER_PAT = re.compile(r"Buyer'?s?\s+name\s*:\s*([A-Za-z][A-Za-z\-\s']+)", re.I)
 
@@ -225,8 +236,19 @@ def _coerce_date(s: str):
     return None
 
 def _flatten_text(txt: str) -> str:
-    # normalize whitespace to make regex robust
-    return re.sub(r"\s+", " ", (txt or "")).strip()
+    # normalize whitespace & unify dashes so regex is robust
+    if not txt: return ""
+    t = txt.replace("\xa0", " ")
+    # unify common dashes to hyphen to help both patterns
+    t = t.replace("\u2013", "-").replace("\u2014", "-").replace("\u2212", "-")
+    t = re.sub(r"\s+", " ", t).strip()
+    return t
+
+def _normalize_time(tok: str) -> str:
+    tok = tok.upper().replace(" ", "")
+    # insert single space before AM/PM
+    tok = re.sub(r"(AM|PM)$", r" \1", tok)
+    return tok
 
 def _extract_stops(flat_text: str) -> Tuple[Optional[datetime.date], Optional[str], List[Dict[str,str]]]:
     date_obj = None
@@ -236,22 +258,34 @@ def _extract_stops(flat_text: str) -> Tuple[Optional[datetime.date], Optional[st
     dm = DATE_PAT.search(flat_text)
     if dm:
         date_obj = _coerce_date(dm.group(1))
+    if not date_obj:
+        dm2 = DATE_FALLBACK.search(flat_text)
+        if dm2:
+            date_obj = _coerce_date(dm2.group(1))
 
     bm = BUYER_PAT.search(flat_text)
     if bm:
         buyer_name = bm.group(1).strip()
 
-    for m in STOP_PAT.finditer(flat_text):
+    matches = list(STOP_PAT.finditer(flat_text))
+    if not matches:
+        matches = list(STOP_PAT2.finditer(flat_text))
+
+    for m in matches:
         addr = re.sub(r"\s+", " ", m.group(1)).strip()
-        start = m.group(2).upper().replace(" ", "")
-        end   = m.group(3).upper().replace(" ", "")
+        start = _normalize_time(m.group(2))
+        end   = _normalize_time(m.group(3))
+        # guard: ensure we really have ", City, ST ZIP"
+        if not re.search(r",\s*[A-Za-z\.\-'\s]+,\s*[A-Z]{2}\s*\d{5}", addr):
+            continue
         stops.append({
             "address": addr,
-            "start": start.replace("AM"," AM").replace("PM"," PM"),
-            "end":   end.replace("AM"," AM").replace("PM"," PM"),
+            "start": start,
+            "end":   end,
             "address_slug": slugify_address(addr),
             "deeplink": zillow_deeplink_from_address(addr),
         })
+
     # de-dupe while keeping order
     seen = set(); uniq=[]
     for s in stops:
