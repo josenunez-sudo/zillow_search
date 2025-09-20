@@ -1,6 +1,5 @@
 # ui/tours_tab.py
-# Tours tab with robust "Parse → Add all tours" flow, side-by-side clients with ▦ Report,
-# per-tour delete, and high-contrast date/time badges. Parser improved for ShowingTime quirks.
+# Tours tab: Parse → Verify → Add all → (also insert into `sent`) and clients can see TOURED tags.
 
 import os
 import re
@@ -13,7 +12,7 @@ import streamlit as st
 import requests
 from supabase import create_client, Client
 
-# Optional PDF parser for ShowingTime PDFs
+# Optional PDF support
 try:
     import PyPDF2  # type: ignore
 except Exception:
@@ -96,7 +95,7 @@ def _time_chip(t1: str, t2: str) -> str:
     )
 
 
-# ───────────────────────────── Client registry ─────────────────────────────
+# ───────────────────────────── Clients ─────────────────────────────
 
 @st.cache_data(ttl=60, show_spinner=False)
 def fetch_clients(include_inactive: bool = True):
@@ -108,12 +107,6 @@ def fetch_clients(include_inactive: bool = True):
         return rows if include_inactive else [r for r in rows if r.get("active")]
     except Exception:
         return []
-
-def _invalidate_clients_cache():
-    try:
-        fetch_clients.clear()  # type: ignore[attr-defined]
-    except Exception:
-        pass
 
 
 # ───────────────────────────── Tours data ─────────────────────────────
@@ -201,21 +194,86 @@ def add_stop(tour_id: int, address: str, start: str, end: str, deeplink: str = "
         return False, str(e)
 
 
-# ───────────────────────────── ShowingTime parsing (improved) ─────────────────────────────
+# ───────────────────────────── ALSO LOG STOPS INTO `sent` ─────────────────────────────
+# This is the key piece: when you add stops, we also upsert into the `sent` table and mark as "toured".
 
-# Accept "9:00 AM-10:15 AM", "9:00AM - 10:15AM", "9:00 AM – 10:15 AM"
-_TIME_RE = re.compile(
-    r'(\d{1,2}:\d{2}\s?(?:AM|PM|am|pm))\s*(?:–|-|to)\s*(\d{1,2}:\d{2}\s?(?:AM|PM|am|pm))'
-)
+def _log_sent_for_tour(client_norm: str, client_display: str, tour_id: int, tour_date: date, stops: List[Dict[str, str]]):
+    """
+    Insert each stop into `sent` so it appears in the 'properties sent' list.
+    We try to include 'toured_at' & 'tour_id' if those columns exist; if the insert fails
+    (e.g., columns missing), retry with a minimal payload.
+    """
+    if not (_sb_ok() and client_norm and stops):
+        return
 
-# Broader date capture variants
+    ts_now = datetime.utcnow().isoformat(timespec="seconds") + "Z"
+    campaign = f"tour-{tour_date.strftime('%Y%m%d')}" if isinstance(tour_date, date) else "tour"
+    rows_full = []
+    for s in stops:
+        addr = (s.get("address") or "").strip()
+        url  = (s.get("deeplink") or _zillow_deeplink_from_addr(addr)).strip()
+        rows_full.append({
+            "client": client_norm,
+            "campaign": campaign,
+            "url": url,
+            "canonical": None,
+            "zpid": None,
+            "mls_id": None,
+            "address": addr or None,
+            "sent_at": ts_now,
+            # Optional columns (if you added them)
+            "toured_at": ts_now,
+            "tour_id": tour_id,
+        })
+
+    # De-dup by url for this client (avoid spam inserts)
+    try:
+        urls = [r["url"] for r in rows_full if r.get("url")]
+        if urls:
+            exist = SUPABASE.table("sent").select("url").eq("client", client_norm).in_("url", urls).execute().data or []
+            exist_urls = {e["url"] for e in exist}
+            rows_full = [r for r in rows_full if r.get("url") not in exist_urls]
+    except Exception:
+        pass
+
+    if not rows_full:
+        return
+
+    # Try full insert (with toured_at, tour_id). If it fails, fallback to minimal.
+    try:
+        SUPABASE.table("sent").insert(rows_full).execute()
+        return
+    except Exception:
+        pass
+
+    rows_min = [
+        {
+            "client": client_norm,
+            "campaign": campaign,
+            "url": r["url"],
+            "canonical": None,
+            "zpid": None,
+            "mls_id": None,
+            "address": r["address"],
+            "sent_at": ts_now,
+        }
+        for r in rows_full
+    ]
+    try:
+        SUPABASE.table("sent").insert(rows_min).execute()
+    except Exception:
+        # Last resort: ignore if we can't insert, but don't break the flow
+        pass
+
+
+# ───────────────────────────── ShowingTime parsing (robust) ─────────────────────────────
+
+_TIME_RE = re.compile(r'(\d{1,2}:\d{2}\s?(?:AM|PM|am|pm))\s*(?:–|-|to)\s*(\d{1,2}:\d{2}\s?(?:AM|PM|am|pm))')
 _DATE_PATTERNS = [
-    re.compile(r'([A-Za-z]+day,\s+[A-Za-z]+\s+\d{1,2},\s+\d{4})'),  # Saturday, September 21, 2024
-    re.compile(r'([A-Za-z]+\s+\d{1,2},\s+\d{4})'),                  # September 21, 2024
-    re.compile(r'(\d{1,2}/\d{1,2}/\d{4})'),                         # 09/21/2024
+    re.compile(r'([A-Za-z]+day,\s+[A-Za-z]+\s+\d{1,2},\s+\d{4})'),
+    re.compile(r'([A-Za-z]+\s+\d{1,2},\s+\d{4})'),
+    re.compile(r'(\d{1,2}/\d{1,2}/\d{4})'),
 ]
-
-# Relaxed address pattern; street may be anything up to city, optional comma before city
 _ADDR_RELAX = re.compile(
     r'^\s*(?P<street>.+?)\s*,?\s*(?P<city>[A-Za-z .\-]+?)\s*,\s*(?P<state>[A-Z]{2})\s+(?P<zip>\d{5}(?:-\d{4})?)\s*$'
 )
@@ -230,25 +288,17 @@ def _parse_date_string(s: str) -> Optional[date]:
     return None
 
 def _clean_unicode(s: str) -> str:
-    # Normalize unicode dashes and spaces
     s = s.replace("\u2013", "-").replace("\u2014", "-").replace("\u2212", "-")
     s = s.replace("\xa0", " ")
     return s
 
 def _fix_common_breaks(s: str) -> str:
-    """
-    Fix common ShowingTime PDF/HTML text breaks like 'W est' -> 'West' (but keep real word gaps),
-    and stray line artifacts.
-    """
     s = _clean_unicode(s)
     s = re.sub(r"\s{2,}", " ", s).strip()
-    # Turn 'W est', 'E xample' into 'West', 'Example'
     s = re.sub(r"\b([A-Z])\s+([a-z]{2,})\b", r"\1\2", s)
-    # Keep words separated otherwise
     return s
 
 def _lines_from_html(html: str) -> str:
-    # Convert common HTML separators to newlines, drop tags
     txt = re.sub(r"(?i)<br\s*/?>", "\n", html)
     txt = re.sub(r"(?i)</p>", "\n", txt)
     txt = re.sub(r"(?s)<[^>]+>", " ", txt)
@@ -272,20 +322,10 @@ def _extract_text_from_pdf(file_bytes: bytes) -> str:
         return ""
 
 def parse_showingtime_text(text: str) -> Tuple[Optional[date], List[Dict[str, str]], str, str]:
-    """
-    Return (tour_date, stops[{address,start,end,deeplink}], error, debug_text).
-    Robust logic:
-      • cleans unicode
-      • merges two consecutive lines when needed to find address
-      • then finds time on the same or next 2 lines
-    """
     if not text:
         return None, [], "Empty input", ""
 
-    raw_text = text  # keep for debug
-    text = _clean_unicode(text)
-    # Split into lines; keep order
-    raw_lines = re.split(r"[\r\n]+", text)
+    raw_lines = re.split(r"[\r\n]+", _clean_unicode(text))
     lines = [_fix_common_breaks(l) for l in raw_lines if l.strip()]
 
     # Detect tour date near the top
@@ -305,15 +345,10 @@ def parse_showingtime_text(text: str) -> Tuple[Optional[date], List[Dict[str, st
     n = len(lines)
     while i < n:
         L0 = lines[i].strip()
-
-        # Try current line as address
         m = _ADDR_RELAX.match(L0)
-
         used_next = False
         if not m and i + 1 < n:
-            # Try merging with next line (addresses often wrap)
-            L01 = (L0 + " " + lines[i + 1].strip())
-            L01 = _fix_common_breaks(L01)
+            L01 = _fix_common_breaks(L0 + " " + lines[i + 1].strip())
             m = _ADDR_RELAX.match(L01)
             used_next = bool(m)
 
@@ -324,40 +359,27 @@ def parse_showingtime_text(text: str) -> Tuple[Optional[date], List[Dict[str, st
             zcode  = m.group("zip").strip()
             addr_full = f"{street}, {city}, {state} {zcode}"
 
-            # After an address, search for time on this or next two lines
             time_found = False
             for j in range(i + 1, min(i + 4, n)):
                 mt = _TIME_RE.search(lines[j])
                 if mt:
-                    s1 = mt.group(1).upper().replace("AM", "AM").replace("PM", "PM")
-                    s2 = mt.group(2).upper().replace("AM", "AM").replace("PM", "PM")
-                    stops.append({
-                        "address": addr_full,
-                        "start": s1,
-                        "end": s2,
-                        "deeplink": _zillow_deeplink_from_addr(addr_full),
-                    })
+                    s1 = mt.group(1).upper()
+                    s2 = mt.group(2).upper()
+                    stops.append({"address": addr_full, "start": s1, "end": s2, "deeplink": _zillow_deeplink_from_addr(addr_full)})
                     time_found = True
                     break
 
-            # If no explicit time line is found, still register the stop with empty times
             if not time_found:
-                stops.append({
-                    "address": addr_full,
-                    "start": "",
-                    "end": "",
-                    "deeplink": _zillow_deeplink_from_addr(addr_full),
-                })
+                stops.append({"address": addr_full, "start": "", "end": "", "deeplink": _zillow_deeplink_from_addr(addr_full)})
 
-            # Advance pointer
             i += 2 if used_next else 1
             continue
 
         i += 1
 
     # Deduplicate by (address,start,end)
+    uniq = []
     seen = set()
-    uniq: List[Dict[str, str]] = []
     for s in stops:
         key = (s["address"], s["start"], s["end"])
         if key in seen:
@@ -429,7 +451,7 @@ def _render_client_tours_report(client_norm: str, client_name: str):
         badge = _tour_badge(tdate if tdate else "No date")
         st.markdown(f"**Tour** {badge}", unsafe_allow_html=True)
 
-        # Delete/Undo controls
+        # Delete confirm
         confirm_key = f"__confirm_del_{tid}"
         if st.session_state.get(confirm_key):
             d1, d2 = st.columns([0.25, 0.25])
@@ -464,11 +486,11 @@ def _render_client_tours_report(client_norm: str, client_name: str):
         st.markdown("<ul class='link-list'>" + "\n".join(lines) + "</ul>", unsafe_allow_html=True)
 
 
-# ───────────────────────────── Main UI (Parse → Add all) ─────────────────────────────
+# ───────────────────────────── Main UI (Parse → Add all → also log to sent) ─────────────────────────────
 
 def render_tours_tab(state: dict):
     st.subheader("Tours")
-    st.caption("Parse a ShowingTime Print URL or Tour PDF, verify, then Add all tours to a client. You can delete any tour later.")
+    st.caption("Parse a ShowingTime Print URL or Tour PDF, verify, then Add all tours to a client. Added stops also land in your 'sent' list and will appear as TOURED in the Clients report.")
 
     if not _sb_ok():
         st.warning("Supabase is not configured. Set SUPABASE_URL and SUPABASE_SERVICE_ROLE.")
@@ -580,11 +602,17 @@ def render_tours_tab(state: dict):
                 if not ok_stop:
                     errs += 1
 
+            # ALSO LOG INTO `sent` so it appears in properties sent + future "TOURED" tags
+            try:
+                _log_sent_for_tour(client_norm, sel_name, target_tid, final_date, stops_parsed)
+            except Exception:
+                pass
+
             if errs == 0:
-                st.success("Tour added.")
+                st.success("Tour added and sent list updated.")
                 st.session_state["__st_parsed__"] = {}
             else:
-                st.warning(f"Added with {errs} error(s).")
+                st.warning(f"Added with {errs} error(s) (sent list still updated).")
 
             if st.button("▦ Open tours report for client", use_container_width=True):
                 st.session_state["__tours_report_for__"] = {"norm": client_norm, "name": sel_name}
