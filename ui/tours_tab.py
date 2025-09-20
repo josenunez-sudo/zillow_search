@@ -1,6 +1,5 @@
 # ui/tours_tab.py
-import os
-import re
+import os, re
 from datetime import datetime, date
 from html import escape
 from typing import List, Dict, Any, Optional, Tuple
@@ -11,19 +10,15 @@ from supabase import create_client, Client
 
 # ---------- Optional PDF support ----------
 try:
-    import PyPDF2  # ensure "PyPDF2" is in requirements.txt
+    import PyPDF2  # make sure "PyPDF2" is in requirements.txt
 except Exception:
     PyPDF2 = None
 
 
-# ---------- Page-local styles (App Store / macOS Mail blue buttons) ----------
+# ---------- Styles (App Store / macOS Mail blue buttons) ----------
 st.markdown("""
 <style>
-/* App Store / macOS Mail style blue buttons (works in both themes) */
-.blue-btn-zone div.stButton > button,
-.blue-btn-zone .stButton > button,
-.blue-btn-zone [data-testid="baseButton-secondary"] > button,
-.blue-btn-zone [data-testid="baseButton-primary"] > button {
+.blue-btn-zone .stButton > button {
   background: linear-gradient(180deg, #0A84FF 0%, #0060DF 100%) !important;
   color: #FFFFFF !important;
   font-weight: 800 !important;
@@ -34,19 +29,15 @@ st.markdown("""
   transform: translateY(0) !important;
   transition: transform .08s ease, box-shadow .12s ease, filter .08s ease !important;
 }
-.blue-btn-zone div.stButton > button:hover,
 .blue-btn-zone .stButton > button:hover {
   transform: translateY(-1px) !important;
   box-shadow: 0 14px 30px rgba(10,132,255,.42), 0 4px 10px rgba(0,0,0,.20) !important;
   filter: brightness(1.06) !important;
 }
-.blue-btn-zone div.stButton > button:active,
-.blue-btn-zone .stButton > button:active {
-  transform: translateY(0) scale(.99) !important;
-}
+.blue-btn-zone .stButton > button:active { transform: translateY(0) scale(.99) !important; }
 
-/* Light separators used in lists */
-:root { --row-border: #e2e8f0; }
+/* light separators */
+:root { --row-border:#e2e8f0; }
 html[data-theme="dark"], .stApp [data-theme="dark"] { --row-border:#0b1220; }
 </style>
 """, unsafe_allow_html=True)
@@ -92,15 +83,13 @@ def _canonicalize_zillow(url: str) -> Tuple[str, Optional[str]]:
     m_z = re.search(r'(\d{6,})_zpid', base, re.I)
     return canon, (m_z.group(1) if m_z else None)
 
+
 # ---------- Clients ----------
 @st.cache_data(ttl=60, show_spinner=False)
 def fetch_clients():
     if not SUPABASE: return []
     try:
-        rows = SUPABASE.table("clients")\
-            .select("id,name,name_norm,active")\
-            .order("name", desc=False)\
-            .execute().data or []
+        rows = SUPABASE.table("clients").select("id,name,name_norm,active").order("name", desc=False).execute().data or []
         # hide "test test"
         return [r for r in rows if r.get("name_norm") != _norm_tag("test test")]
     except Exception:
@@ -108,44 +97,59 @@ def fetch_clients():
 
 
 # ---------- ShowingTime parsing ----------
+_BAD_AFTER_NUM = r"(?:Beds?|Baths?|Sqft|Canceled|Cancelled|Confirmed|Reason|Presented|Access|Alarm|Instructions|Agent|Buyer)\b"
 _STREET_TYPES = r"(?:St|Street|Ave|Avenue|Dr|Drive|Ln|Lane|Rd|Road|Blvd|Boulevard|Ct|Court|Pl|Place|Ter|Terrace|Way|Cir|Circle|Pkwy|Parkway|Hwy|Highway)"
-FULL_ADDR_RE = re.compile(
-    rf"\b\d{{1,6}}\s+[A-Za-z0-9.\-']+(?:\s+[A-Za-z0-9.\-']+)*\s+{_STREET_TYPES}"
-    rf"(?:\s+[A-Za-z0-9.\-']+)?\s*,\s*[A-Za-z .'\-]+\s*,\s*[A-Z]{{2}}\s*\d{{5}}(?:-\d{{4}})?\b",
-    re.I
+# Safer address regex: house number + up to 4 street words + street type (+ optional post word), then ", City, ST ZIP"
+ADDR_RE = re.compile(
+    rf"""\b
+    (?P<num>\d{{1,6}})\s+(?!{_BAD_AFTER_NUM})
+    (?P<name>(?:[A-Za-z0-9.\-']+\s+){{0,4}}[A-Za-z0-9.\-']+)\s+
+    (?P<stype>{_STREET_TYPES})
+    (?:\s+(?P<post>[A-Za-z0-9.\-']+))?
+    \s*,\s*
+    (?P<city>[A-Za-z .'\-]+?)\s*,\s*
+    (?P<state>[A-Z]{{2}})\s*
+    (?P<zip>\d{{5}}(?:-\d{{4}})?)
+    \b""",
+    re.I | re.X
 )
+
 TIME_RE = re.compile(r'(\d{1,2}:\d{2}\s*(?:AM|PM))\s*[-–]\s*(\d{1,2}:\d{2}\s*(?:AM|PM))', re.I)
 DATE_HEADER_RE = re.compile(r'(?:Buyer|Agent)[^\n]{0,80}Tour\s*-\s*[A-Za-z]+,\s*([A-Za-z]+)\s*(\d{1,2}),\s*(\d{4})', re.I)
 GENERIC_DATE_RE = re.compile(r'([A-Za-z]+)\s+(\d{1,2}),\s*(\d{4})')
 
 def _month_to_num(m: str) -> int:
-    try:
-        return datetime.strptime(m[:3], "%b").month
-    except Exception:
-        return datetime.strptime(m, "%B").month
+    try: return datetime.strptime(m[:3], "%b").month
+    except Exception: return datetime.strptime(m, "%B").month
+
+def _fix_pdf_spacing(s: str) -> str:
+    # Join accidental single-letter splits inside words: "V arina" -> "Varina"
+    return re.sub(r'([A-Za-z])\s([a-z])', r'\1\2', s)
 
 def _extract_text_from_pdf(file) -> str:
     if not PyPDF2: return ""
     try:
-        rd = PyPDF2.PdfReader(file)
-        buf = []
-        for p in rd.pages:
-            buf.append(p.extract_text() or "")
-        return "\n".join(buf)
+        reader = PyPDF2.PdfReader(file)
+        out = []
+        for p in reader.pages:
+            t = p.extract_text() or ""
+            out.append(_fix_pdf_spacing(t))
+        return "\n".join(out)
     except Exception:
         return ""
 
 def _html_to_text(html: str) -> str:
-    txt = re.sub(r'<script[\\s\\S]*?</script>', ' ', html, flags=re.I)
-    txt = re.sub(r'<style[\\s\\S]*?</style>', ' ', txt, flags=re.I)
+    txt = re.sub(r'<script[\s\S]*?</script>', ' ', html, flags=re.I)
+    txt = re.sub(r'<style[\s\S]*?</style>', ' ', txt, flags=re.I)
     txt = re.sub(r'<[^>]+>', ' ', txt)
     txt = txt.replace("&nbsp;", " ")
-    return re.sub(r'\\s+', ' ', txt).strip()
+    txt = re.sub(r'\s+', ' ', txt).strip()
+    return _fix_pdf_spacing(txt)
 
 def _fetch_html(url: str) -> str:
     try:
         r = requests.get(url, timeout=12, headers={
-            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36"
+            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126 Safari/537.36"
         })
         return r.text if r.ok else ""
     except Exception:
@@ -153,10 +157,8 @@ def _fetch_html(url: str) -> str:
 
 def _status_in_window(txt: str) -> str:
     u = txt.upper()
-    if "CANCELLED" in u or "CANCELED" in u:
-        return "CANCELED"
-    if "CONFIRMED" in u:
-        return "CONFIRMED"
+    if "CANCELLED" in u or "CANCELED" in u: return "CANCELED"
+    if "CONFIRMED" in u: return "CONFIRMED"
     return ""
 
 def _parse_tour_text(txt: str) -> Dict[str, Any]:
@@ -173,13 +175,21 @@ def _parse_tour_text(txt: str) -> Dict[str, Any]:
             tdate = date(int(year), _month_to_num(mon), int(day))
 
     stops: List[Dict[str, Any]] = []
-    for am in FULL_ADDR_RE.finditer(txt):
-        addr_clean = am.group(0).strip()  # address only
-        pos = am.start()
+    for am in ADDR_RE.finditer(txt):
+        # Rebuild a clean, address-only string from groups to avoid “00 Beds…” noise
+        num   = am.group("num").strip()
+        name  = re.sub(r'\s+', ' ', am.group("name").strip())
+        stype = am.group("stype").strip()
+        post  = am.group("post") or ""
+        city  = re.sub(r'\s+', ' ', am.group("city").strip())
+        state = am.group("state").strip().upper()
+        zcode = am.group("zip").strip()
 
-        # local window to find time/status near the address
-        win_start = max(0, pos - 220)
-        win_end   = min(len(txt), pos + 220)
+        addr_clean = f"{num} {name} {stype}" + (f" {post}" if post else "") + f", {city}, {state} {zcode}"
+
+        # Time/status: prefer a small look-behind window so we don’t capture unrelated tokens
+        win_start = max(0, am.start() - 140)
+        win_end   = min(len(txt), am.end() + 80)
         window = txt[win_start:win_end]
 
         tm = TIME_RE.search(window)
@@ -192,17 +202,14 @@ def _parse_tour_text(txt: str) -> Dict[str, Any]:
         stat = _status_in_window(window)
 
         stops.append({
-            "address": addr_clean,
+            "address": addr_clean,                               # <-- address-only
             "start": t1.replace("AM"," AM").replace("PM"," PM").strip(),
             "end":   t2.replace("AM"," AM").replace("PM"," PM").strip(),
             "deeplink": _address_to_deeplink(addr_clean),
             "status": stat
         })
 
-    return {
-        "tour_date": (tdate.isoformat() if tdate else None),
-        "stops": stops
-    }
+    return {"tour_date": (tdate.isoformat() if tdate else None), "stops": stops}
 
 def parse_showingtime_input(url: str, uploaded_pdf) -> Dict[str, Any]:
     if uploaded_pdf is not None:
@@ -225,8 +232,7 @@ def parse_showingtime_input(url: str, uploaded_pdf) -> Dict[str, Any]:
 
 # ---------- DB helpers ----------
 def _create_or_get_tour(client_norm: str, client_display: str, tour_url: Optional[str], tour_date: date) -> int:
-    if not SUPABASE:
-        raise RuntimeError("Supabase not configured.")
+    if not SUPABASE: raise RuntimeError("Supabase not configured.")
     q = SUPABASE.table("tours").select("id,url").eq("client", client_norm).eq("tour_date", tour_date.isoformat()).limit(1).execute()
     rows = q.data or []
     if rows:
@@ -242,13 +248,11 @@ def _create_or_get_tour(client_norm: str, client_display: str, tour_url: Optiona
         "tour_date": tour_date.isoformat(),
         "status": "imported",
     }).execute()
-    if not ins.data:
-        raise RuntimeError("Create tour failed.")
+    if not ins.data: raise RuntimeError("Create tour failed.")
     return ins.data[0]["id"]
 
 def _insert_stops(tour_id: int, stops: List[Dict[str, Any]]) -> int:
-    if not SUPABASE:
-        return 0
+    if not SUPABASE: return 0
     existing = SUPABASE.table("tour_stops").select("address_slug").eq("tour_id", tour_id).limit(50000).execute().data or []
     seen = {e["address_slug"] for e in existing if e.get("address_slug")}
     rows = []
@@ -267,22 +271,18 @@ def _insert_stops(tour_id: int, stops: List[Dict[str, Any]]) -> int:
             "status": (s.get("status") or None),
         })
         seen.add(slug)
-    if not rows:
-        return 0
+    if not rows: return 0
     ins = SUPABASE.table("tour_stops").insert(rows).execute()
     return len(ins.data or [])
 
 def _insert_sent_for_stops(client_norm: str, stops: List[Dict[str, Any]], tour_date: date) -> int:
-    """Mark as 'toured' in sent (for Client/Run views). Campaign = toured-YYYYMMDD."""
-    if not SUPABASE or not client_norm or not stops:
-        return 0
+    if not SUPABASE or not client_norm or not stops: return 0
     now_iso = datetime.utcnow().isoformat(timespec="seconds") + "Z"
     campaign = f"toured-{tour_date.strftime('%Y%m%d')}"
     rows = []
     for s in stops:
         addr = (s.get("address") or "").strip()
-        if not addr:
-            continue
+        if not addr: continue
         url = (s.get("deeplink") or _address_to_deeplink(addr)).strip()
         canon, zpid = _canonicalize_zillow(url)
         rows.append({
@@ -295,8 +295,7 @@ def _insert_sent_for_stops(client_norm: str, stops: List[Dict[str, Any]], tour_d
             "address":  addr or None,
             "sent_at":  now_iso,
         })
-    if not rows:
-        return 0
+    if not rows: return 0
     try:
         ins = SUPABASE.table("sent").insert(rows).execute()
         return len(ins.data or [])
@@ -320,7 +319,7 @@ def _build_repeat_map(client_norm: str) -> Dict[tuple, int]:
     for t in tours:
         td = t["tour_date"]
         for slug in t2s.get(t["id"], []):
-            seen_count[slug] = seen_count.get(slug, 0) + 1
+            seen_count[slug] = seen_count.get( slug, 0) + 1
             rep[(slug, td)] = seen_count[slug]
     return rep
 
@@ -335,11 +334,8 @@ def _set_parsed(payload: Dict[str, Any]):
 
 # ---------- HTML helpers ----------
 def _date_badge_html(d: str) -> str:
-    return (
-        "<span style='display:inline-block;padding:2px 10px;border-radius:9999px;"
-        "background:#1d4ed8;color:#fff;font-weight:800;border:1px solid rgba(0,0,0,.15);'>"
-        f"{escape(d)}</span>"
-    )
+    return ("<span style='display:inline-block;padding:2px 10px;border-radius:9999px;"
+            "background:#1d4ed8;color:#fff;font-weight:800;border:1px solid rgba(0,0,0,.15);'>" + escape(d) + "</span>")
 
 def _status_tag_html(stat_upper: str) -> str:
     if stat_upper == "CONFIRMED":
@@ -368,7 +364,7 @@ def render_tours_tab(state: dict):
     with col2:
         uploaded = st.file_uploader("Or drop the **Tour PDF**", type=["pdf"])
 
-    cA, cB, _ = st.columns([0.25, 0.25, 0.5])
+    cA, cB, cC = st.columns([0.22, 0.22, 0.56])
     with cA:
         st.markdown("<div class='blue-btn-zone'>", unsafe_allow_html=True)
         do_parse = st.button("Parse", use_container_width=True, key="__parse_btn__")
@@ -376,6 +372,10 @@ def render_tours_tab(state: dict):
     with cB:
         st.markdown("<div class='blue-btn-zone'>", unsafe_allow_html=True)
         do_clear = st.button("Clear", use_container_width=True, key="__clear_btn__")
+        st.markdown("</div>", unsafe_allow_html=True)
+    with cC:
+        st.markdown("<div class='blue-btn-zone'>", unsafe_allow_html=True)
+        view_report = st.button("View report", use_container_width=True, key="__view_report__")
         st.markdown("</div>", unsafe_allow_html=True)
 
     if do_clear:
@@ -410,7 +410,7 @@ def render_tours_tab(state: dict):
         if stops:
             lis = []
             for s in stops:
-                addr = (s.get("address","").strip())
+                addr = (s.get("address","").strip())                 # address-only
                 href = (s.get("deeplink") or _address_to_deeplink(addr)).strip()
                 start = (s.get("start") or "").strip()
                 end   = (s.get("end") or "").strip()
@@ -444,9 +444,7 @@ def render_tours_tab(state: dict):
         client_names = [c["name"] for c in clients]
         client_norms = [c["name_norm"] for c in clients]
 
-        NO_CLIENT = "➤ No client (show ALL, no logging)"
-
-        # (A) Client display name for the tour record (real clients only)
+        # Display client (real client list only)
         if client_names:
             idx_disp = st.selectbox(
                 "Client display name (for the tour record)",
@@ -461,18 +459,18 @@ def render_tours_tab(state: dict):
             client_display = ""
             client_display_norm = ""
 
-        # (B) Optional logging of stops to a specific client (first = No client)
+        # Add all stops to client (first = No logging)
+        NO_CLIENT = "➤ No client (show ALL, no logging)"
         add_names = [NO_CLIENT] + client_names
         add_norms = [""         ] + client_norms
         idx_add = st.selectbox(
             "Add all stops to client (optional)",
             list(range(len(add_names))),
             format_func=lambda i: add_names[i],
-            index=0,  # first = No client
+            index=0,  # No logging by default
             key="__tour_add_to_client__"
         )
         chosen_norm = add_norms[idx_add]
-
         also_mark_sent = st.checkbox("Also mark these stops as “toured” in Sent", value=True)
 
         colAA, colBB = st.columns([0.35, 0.65])
@@ -484,7 +482,6 @@ def render_tours_tab(state: dict):
             if add_clicked:
                 try:
                     tdate_obj = datetime.fromisoformat(tdate).date() if tdate else date.today()
-                    # Always attach a tour under the display client
                     tour_id = _create_or_get_tour(
                         client_norm=client_display_norm,
                         client_display=client_display,
@@ -502,15 +499,39 @@ def render_tours_tab(state: dict):
             st.caption("Tip: choose **No client** if you only want to parse/preview without logging.")
 
     st.markdown("---")
+    st.markdown('<div id="report_anchor"></div>', unsafe_allow_html=True)
 
-    # ===== Tours report (auto-renders; no button to avoid tab reset) =====
+    # If the top "View report" button was pressed, scroll here (stay on Tours tab).
+    if st.session_state.get("__view_report__scroll__"):
+        st.session_state["__view_report__scroll__"] = False
+
+    # Inject smooth scroll when user clicks "View report"
+    if 'VIEW_REPORT_SCROLL_DONE' not in st.session_state:
+        st.session_state['VIEW_REPORT_SCROLL_DONE'] = False
+    if st.session_state['VIEW_REPORT_SCROLL_DONE'] is False:
+        # Bind a little script to the button click using a hidden element
+        pass
+    if view_report:
+        st.session_state['VIEW_REPORT_SCROLL_DONE'] = True
+        st.components.v1.html(
+            """
+            <script>
+              const el = parent.document.querySelector('#report_anchor');
+              if (el) { el.scrollIntoView({behavior: "smooth", block: "start"}); }
+            </script>
+            """,
+            height=0
+        )
+
+    # ===== Tours report (inline; the button above just scrolls here) =====
     st.markdown("### Tours report")
     clients2 = fetch_clients()
     names2 = [c["name"] for c in clients2]
     norms2 = [c["name_norm"] for c in clients2]
 
     if names2:
-        irep = st.selectbox("Pick a client", list(range(len(names2))), format_func=lambda i: names2[i], index=0, key="__tour_client_pick__")
+        irep = st.selectbox("Pick a client", list(range(len(names2))),
+                            format_func=lambda i: names2[i], index=0, key="__tour_client_pick__")
         _render_client_tours_report(names2[irep], norms2[irep])
     else:
         st.info("No clients found.")
