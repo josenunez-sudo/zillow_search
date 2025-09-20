@@ -40,18 +40,15 @@ if "__active_tab__" not in st.session_state:
     st.session_state["__active_tab__"] = "Run"
 
 with tab_run:
-    # Mark active while rendering this tab (so actions from here remember it)
-    st.session_state["__active_tab__"] = "Run"
+    # Do NOT set __active_tab__ here; actions in the Run tab can set it just-in-time if they rerun
     render_run_tab(state=st.session_state)
 
 with tab_clients:
-    # Mark active while rendering this tab (restores Clients' report button behavior)
-    st.session_state["__active_tab__"] = "Clients"
+    # Do NOT set __active_tab__ here; Clients tab actions will set it just before st.rerun()
     render_clients_tab()
 
 with tab_tours:
-    # Tours tab also sets this just before any rerun inside its own actions
-    st.session_state["__active_tab__"] = "Tours"
+    # Tours tab already sets __active_tab__ = "Tours" before calling st.rerun() in its actions
     render_tours_tab(state=st.session_state)
 
 # Re-select the remembered tab after reruns while keeping visible order fixed
