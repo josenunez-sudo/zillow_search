@@ -2,7 +2,7 @@ from core.styles import apply_page_base
 import streamlit as st
 from ui.run_tab import render_run_tab
 from ui.clients_tab import render_clients_tab
-from ui.tours_tab import render_tours_tab  # ← NEW
+from ui.tours_tab import render_tours_tab  # ⬅️ add this import
 
 apply_page_base()
 
@@ -19,4 +19,4 @@ with tab_clients:
     render_clients_tab()
 
 with tab_tours:
-    render_tours_tab()  # ← NEW
+    render_tours_tab()  # ⬅️ render the new Tours tab
