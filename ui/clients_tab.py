@@ -1,6 +1,8 @@
 # ui/clients_tab.py
 # Clients tab: list active/inactive clients + inline "Open sent listings report" below.
 # Keeps tab focus on Clients by setting __active_tab__ right before any rerun.
+# Adds cross-check: rows in the sent report show a "Toured" badge if their address
+# matches any Tour stop for that client (normalized slug match).
 
 import os
 import io
@@ -48,6 +50,23 @@ def _sb_ok() -> bool:
         return bool(SUPABASE)
     except NameError:
         return False
+
+def _slug_addr(addr: str) -> str:
+    a = (addr or "").strip().lower()
+    a = re.sub(r"[^\w\s,-]", "", a).replace(",", "")
+    return re.sub(r"\s+", "-", a).strip("-")
+
+def _address_text_from_url(url: str) -> str:
+    if not url:
+        return ""
+    u = unquote(url)
+    m = re.search(r"/homedetails/([^/]+)/\d{6,}_zpid/", u, re.I)
+    if m:
+        return re.sub(r"[-+]", " ", m.group(1)).strip().title()
+    m = re.search(r"/homes/([^/_]+)_rb/?", u, re.I)
+    if m:
+        return re.sub(r"[-+]", " ", m.group(1)).strip().title()
+    return ""
 
 # ---- Query-params helpers ----
 def _qp_get(name, default=None):
@@ -163,18 +182,51 @@ def fetch_sent_for_client(client_norm: str, limit: int = 5000):
     except Exception:
         return []
 
-# Helper: derive human-readable address text from Zillow URL if DB 'address' missing
-def address_text_from_url(url: str) -> str:
-    if not url:
-        return ""
-    u = unquote(url)
-    m = re.search(r"/homedetails/([^/]+)/\d{6,}_zpid/", u, re.I)
-    if m:
-        return re.sub(r"[-+]", " ", m.group(1)).strip().title()
-    m = re.search(r"/homes/([^/_]+)_rb/?", u, re.I)
-    if m:
-        return re.sub(r"[-+]", " ", m.group(1)).strip().title()
-    return ""
+# ---------- Tours cross-check ----------
+@st.cache_data(ttl=120, show_spinner=False)
+def fetch_tour_slugs_for_client(client_norm: str) -> set:
+    """
+    Return a set of address slugs for ALL tour stops for this client.
+    """
+    if not (_sb_ok() and client_norm.strip()):
+        return set()
+    try:
+        tq = (
+            SUPABASE.table("tours")
+            .select("id")
+            .eq("client", client_norm.strip())
+            .limit(5000)
+            .execute()
+        )
+        tours = [t["id"] for t in (tq.data or [])]
+        if not tours:
+            return set()
+        sq = (
+            SUPABASE.table("tour_stops")
+            .select("address,address_slug")
+            .in_("tour_id", tours)
+            .limit(50000)
+            .execute()
+        )
+        stops = sq.data or []
+        slugs = set()
+        for s in stops:
+            slug = s.get("address_slug") or _slug_addr(s.get("address") or "")
+            if slug:
+                slugs.add(slug)
+        return slugs
+    except Exception:
+        return set()
+
+def _slug_from_sent_row(row: Dict[str, Any]) -> str:
+    """Try to compute an address slug for a 'sent' record row."""
+    addr = (row.get("address") or "").strip()
+    if not addr:
+        # derive from the Zillow URL if possible
+        url = (row.get("url") or "").strip()
+        guess = _address_text_from_url(url)
+        addr = guess or url
+    return _slug_addr(addr)
 
 # ---------- UI pieces ----------
 def _client_row_icons(name: str, norm: str, cid: int, active: bool):
@@ -258,18 +310,28 @@ def _client_row_icons(name: str, norm: str, cid: int, active: bool):
     )
 
 def _render_client_report_view(client_display_name: str, client_norm: str):
-    """Render a report: address as hyperlink → Zillow, with Campaign filter and Search box."""
+    """Render a report: address as hyperlink → Zillow, with Campaign filter and Search box.
+       Adds a "Toured" badge if the address slug matches any tour stop for the client.
+    """
     st.markdown(f"### Report for {escape(client_display_name)}", unsafe_allow_html=True)
 
-    colX, _ = st.columns([1, 3])
+    colX, colY = st.columns([1, 3])
     with colX:
         if st.button("Close report", key=f"__close_report_{client_norm}"):
             st.session_state["__active_tab__"] = "Clients"  # keep focus on Clients
             _qp_set()  # clear query params
             _safe_rerun()
+    with colY:
+        # Optional helper: jump to Tours tab quickly
+        if st.button("Open Tours tab", key=f"__open_tours_{client_norm}"):
+            st.session_state["__active_tab__"] = "Tours"
+            _safe_rerun()
 
     rows = fetch_sent_for_client(client_norm)
     total = len(rows)
+
+    # Cross-check tour slugs once
+    tour_slugs = fetch_tour_slugs_for_client(client_norm)
 
     # Build campaign filter choices
     seen = []
@@ -321,22 +383,31 @@ def _render_client_report_view(client_display_name: str, client_norm: str):
         st.info("No results match the current filters.")
         return
 
+    # Render list with badges
     items_html = []
     for r in rows_f:
         url = (r.get("url") or "").strip()
-        addr = (r.get("address") or "").strip() or address_text_from_url(url) or "Listing"
+        addr_display = (r.get("address") or "").strip() or _address_text_from_url(url) or "Listing"
         sent_at = r.get("sent_at") or ""
         camp = (r.get("campaign") or "").strip()
         chip = ""
         if sel_campaign is None and camp:
             chip = f"<span style='font-size:11px; font-weight:700; padding:2px 6px; border-radius:999px; background:#e2e8f0; margin-left:6px;'>{escape(camp)}</span>"
+
+        # Cross-check badge
+        slug = _slug_from_sent_row(r)
+        toured_badge = ""
+        if slug and slug in tour_slugs:
+            toured_badge = "<span class='badge new' style='margin-left:6px;'>Toured</span>"
+
         items_html.append(
             f"""<li>
-                  <a href="{escape(url)}" target="_blank" rel="noopener">{escape(addr)}</a>
+                  <a href="{escape(url)}" target="_blank" rel="noopener">{escape(addr_display)}</a>
                   <span style="color:#64748b; font-size:12px; margin-left:6px;">{escape(sent_at)}</span>
-                  {chip}
+                  {chip}{toured_badge}
                 </li>"""
         )
+
     html = "<ul class='link-list'>" + "\n".join(items_html) + "</ul>"
     st.markdown(html, unsafe_allow_html=True)
 
