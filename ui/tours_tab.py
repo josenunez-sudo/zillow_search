@@ -1,417 +1,408 @@
 # ui/tours_tab.py
-# Tours tab: parse ShowingTime Print page or Tour PDF → list of Zillow links with readable date chips.
-# Self-contained to avoid circular imports.
+# Tours tab: parse ShowingTime print URL or PDF -> stops with date/time + address.
+# Cross-check with Supabase 'sent' by address slug, optional store to tours/tour_stops.
 
-import os, re, io, csv, requests
-from datetime import datetime
+import os, re, io, json, datetime
 from typing import List, Dict, Any, Optional, Tuple
-from html import unescape as html_unescape, escape
+from html import escape
 
+import requests
 import streamlit as st
-import streamlit.components.v1 as components
 
-# ---------- Optional PDF deps ----------
+# ---- Optional PDF dep (install via requirements.txt: PyPDF2==3.0.1)
 try:
-    from pdfminer.high_level import extract_text as pdfminer_extract_text  # preferred
-except Exception:
-    pdfminer_extract_text = None
-
-try:
-    import PyPDF2  # fallback
+    import PyPDF2  # type: ignore
 except Exception:
     PyPDF2 = None
 
-# ---------- Supabase (optional) ----------
-try:
-    from supabase import create_client, Client  # type: ignore
-except Exception:
-    Client = None  # noqa: N816
+# ---------- Supabase ----------
+from supabase import create_client, Client
 
 @st.cache_resource
-def _get_supabase() -> Optional["Client"]:
+def _get_supabase() -> Optional[Client]:
     try:
         url = os.getenv("SUPABASE_URL", st.secrets.get("SUPABASE_URL", ""))
         key = os.getenv("SUPABASE_SERVICE_ROLE", st.secrets.get("SUPABASE_SERVICE_ROLE", ""))
         if not url or not key:
             return None
-        return create_client(url, key)  # type: ignore
+        return create_client(url, key)
     except Exception:
         return None
 
 SUPABASE = _get_supabase()
 
-# ---------- High-contrast chip styles (Option D) ----------
-# Note: we only inject once per session
-if "__tours_css__" not in st.session_state:
-    st.markdown(
-        """
-        <style>
-        /* Date/Time chip – high-contrast, subtle gradient, readable in both themes */
-        .date-chip {
-          display:inline-flex; align-items:center; gap:6px;
-          padding:2px 10px; border-radius:999px; font-weight:800; letter-spacing:.2px;
-          font-size:12.5px; line-height:1; border:1px solid rgba(0,0,0,.18);
-          color:#0b1220; background:linear-gradient(180deg,#f9fafb 0%, #e5e7eb 100%);
-          box-shadow:0 2px 8px rgba(0,0,0,.10), inset 0 1px 0 rgba(255,255,255,.66);
-        }
-        html[data-theme="dark"] .date-chip, .stApp [data-theme="dark"] .date-chip {
-          color:#f8fafc; border-color:rgba(255,255,255,.18);
-          background:linear-gradient(180deg,#1f2937 0%, #111827 100%);
-          box-shadow:0 2px 10px rgba(0,0,0,.45), inset 0 1px 0 rgba(255,255,255,.06);
-        }
-        .date-chip .dot {
-          width:8px; height:8px; border-radius:999px; background:#2563eb;
-          box-shadow:0 0 0 2px rgba(37,99,235,.15);
-        }
-        html[data-theme="dark"] .date-chip .dot { background:#60a5fa; box-shadow:0 0 0 2px rgba(96,165,250,.20); }
-
-        /* Tight list like Run tab */
-        ul.tour-list { margin:6px 0 0.3rem 1.2rem; padding:0; list-style:disc; }
-        ul.tour-list li { margin:0.25rem 0; }
-        .results-wrap { position:relative; box-sizing:border-box; padding:8px 120px 4px 0; }
-        .copyall-btn { position:absolute; top:0; right:8px; z-index:5; padding:6px 10px; height:26px;
-                       border:0; border-radius:10px; color:#fff; font-weight:700; background:#1d4ed8;
-                       cursor:pointer; opacity:.95; }
-        </style>
-        """,
-        unsafe_allow_html=True,
-    )
-    st.session_state["__tours_css__"] = True
-
-
-# ---------- Small helpers ----------
-UA_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-    "Accept-Language": "en-US,en;q=0.9",
-    "Cache-Control": "no-cache",
-}
-
-def _slug(s: str) -> str:
-    return re.sub(r"[^a-z0-9]+", "-", (s or "").lower()).strip("-")
-
-def _zillow_deeplink_from_address(addr: str) -> str:
-    # Good SMS unfurls. Works even without exact homedetails.
-    slug = _slug(re.sub(r"[,\s]+", " ", (addr or "").strip()))
-    return f"https://www.zillow.com/homes/{slug}_rb/"
-
-def _extract_text_from_pdf_bytes(data: bytes) -> str:
-    # Try pdfminer first (keeps order), fallback to PyPDF2, else "".
-    if pdfminer_extract_text:
-        try:
-            return pdfminer_extract_text(io.BytesIO(data)) or ""
-        except Exception:
-            pass
-    if PyPDF2:
-        try:
-            r = PyPDF2.PdfReader(io.BytesIO(data))
-            parts = []
-            for p in r.pages:
-                try:
-                    parts.append(p.extract_text() or "")
-                except Exception:
-                    continue
-            return "\n".join(parts)
-        except Exception:
-            pass
-    return ""
-
-def _get_url_text(url: str) -> str:
-    try:
-        r = requests.get(url, headers=UA_HEADERS, timeout=15)
-        if not r.ok:
-            return ""
-        html = r.text
-        # Strip tags into text; keep spacing
-        text = re.sub(r"<script\b[^>]*>.*?</script>", " ", html, flags=re.I | re.S)
-        text = re.sub(r"<style\b[^>]*>.*?</style>", " ", text, flags=re.I | re.S)
-        text = re.sub(r"<[^>]+>", " ", text)
-        text = html_unescape(text)
-        text = re.sub(r"[ \t\r\f\v]+", " ", text)
-        text = re.sub(r"\s*\n+\s*", "\n", text)
-        return text
-    except Exception:
-        return ""
-
-def _clean_lines(text: str) -> List[str]:
-    text = text.replace("\xa0", " ")
-    text = re.sub(r"[ \t\r\f\v]+", " ", text)
-    lines = [ln.strip() for ln in text.splitlines()]
-    return [ln for ln in lines if ln]
-
-# Address patterns (resilient to commas/newlines)
-ADDR_PATTERNS = [
-    # 123 Main St, City, ST 12345
-    re.compile(r"\b\d{1,6}\s+[A-Za-z0-9.#/\- ]+?,\s*[A-Za-z .'-]+,\s*[A-Z]{2}\s*\d{5}(?:-\d{4})?\b"),
-    # 123 Main St City, ST 12345  (missing comma after street)
-    re.compile(r"\b\d{1,6}\s+[A-Za-z0-9.#/\- ]+?\s+[A-Za-z .'-]+,\s*[A-Z]{2}\s*\d{5}(?:-\d{4})?\b"),
-]
-
-TIME_RANGE_RE = re.compile(
-    r"\b(\d{1,2}:\d{2}\s?(?:AM|PM))\s*(?:–|-|to|–|—)\s*(\d{1,2}:\d{2}\s?(?:AM|PM))\b",
-    re.I,
-)
-
-DATE_CANDIDATE_RE = re.compile(
-    r"\b(?:Tour\s*Date|Date)\s*[:\-]?\s*([A-Za-z]{3,9}\s+\d{1,2},\s+\d{4})\b|"
-    r"\b([A-Za-z]{3,9}\s+\d{1,2},\s+\d{4})\b"
-)
-
-def _find_first_date(text: str) -> Optional[str]:
-    m = DATE_CANDIDATE_RE.search(text)
-    if not m:
-        return None
-    ds = m.group(1) or m.group(2)
-    try:
-        dt = datetime.strptime(ds, "%B %d, %Y")
-        return dt.strftime("%a, %b %d, %Y")
-    except Exception:
-        return ds.strip()
-
-def _nearest_address(lines: List[str], i: int) -> Optional[str]:
-    # Check current, next, prev lines; then merge with neighbor and test again
-    candidates: List[str] = []
-    for j in (i, i + 1, i - 1):
-        if 0 <= j < len(lines):
-            candidates.append(lines[j])
-    for text in candidates:
-        for rx in ADDR_PATTERNS:
-            m = rx.search(text)
-            if m:
-                return m.group(0).strip()
-    # merge heuristics
-    merges = []
-    if 0 <= i < len(lines) - 1:
-        merges.append(lines[i] + " " + lines[i + 1])
-    if i > 0:
-        merges.append(lines[i - 1] + " " + lines[i])
-    for text in merges:
-        for rx in ADDR_PATTERNS:
-            m = rx.search(text)
-            if m:
-                return m.group(0).strip()
-    return None
-
-def _parse_showingtime_text(text: str) -> Tuple[Optional[str], List[Dict[str, str]]]:
-    """
-    Return (tour_date_str, stops[])
-    stops: {address, start, end, time_text, zillow_url}
-    """
-    if not text:
-        return None, []
-    date_str = _find_first_date(text)
-    lines = _clean_lines(text)
-    stops: List[Dict[str, str]] = []
-
-    # Strategy: for each line with a time-range, associate the nearest address line.
-    for i, ln in enumerate(lines):
-        tm = TIME_RANGE_RE.search(ln)
-        if not tm:
-            continue
-        start, end = tm.group(1).upper().replace(" ", ""), tm.group(2).upper().replace(" ", "")
-        addr = _nearest_address(lines, i)
-        if not addr:
-            # try a little wider search window
-            for j in range(max(0, i - 3), min(len(lines), i + 4)):
-                addr = _nearest_address(lines, j)
-                if addr:
-                    break
-        if not addr:
-            # if still no address, skip this time range
-            continue
-
-        z = _zillow_deeplink_from_address(addr)
-        stops.append({
-            "address": addr,
-            "start": start,
-            "end": end,
-            "time_text": f"{start}–{end}",
-            "zillow_url": z,
-        })
-
-    # Deduplicate by (address, time_text)
-    uniq = {}
-    for s in stops:
-        key = (s["address"], s["time_text"])
-        if key not in uniq:
-            uniq[key] = s
-    return date_str, list(uniq.values())
-
-# ---------- Supabase helpers (optional) ----------
-@st.cache_data(ttl=60, show_spinner=False)
-def _fetch_clients_for_tours(include_inactive: bool = False) -> List[Dict[str, Any]]:
-    if not SUPABASE:
-        return []
-    try:
-        rows = SUPABASE.table("clients").select("id,name,name_norm,active").order("name", desc=False).execute().data or []
-        return rows if include_inactive else [r for r in rows if r.get("active")]
-    except Exception:
-        return []
+def _sb_ok() -> bool:
+    try: return bool(SUPABASE)
+    except NameError: return False
 
 def _norm_tag(s: str) -> str:
     return re.sub(r"\s+", " ", (s or "").strip()).lower()
 
-def _log_tour_stops(client_tag: str, tour_date: Optional[str], stops: List[Dict[str, str]]) -> Tuple[bool, str]:
-    """
-    Inserts tour stops into 'tours' table:
-    columns: client (text), tour_date (text), address (text), zillow_url (text), time_start (text), time_end (text), created_at (timestamp default)
-    If the table doesn't exist, this will fail gracefully.
-    """
-    if not SUPABASE or not client_tag.strip() or not stops:
-        return False, "Supabase not configured or no data."
-    rows = []
-    for s in stops:
-        rows.append({
-            "client": client_tag.strip(),
-            "tour_date": tour_date or "",
-            "address": s.get("address", ""),
-            "zillow_url": s.get("zillow_url", ""),
-            "time_start": s.get("start", ""),
-            "time_end": s.get("end", ""),
-        })
+# ---------- Clients (cached) ----------
+@st.cache_data(ttl=60, show_spinner=False)
+def fetch_clients(include_inactive: bool = False):
+    if not _sb_ok(): return []
     try:
-        SUPABASE.table("tours").insert(rows).execute()
-        return True, "ok"
-    except Exception as e:
-        return False, str(e)
+        rows = SUPABASE.table("clients").select("id,name,name_norm,active").order("name", desc=False).execute().data or []
+        rows = [r for r in rows if r.get("name_norm") != _norm_tag("test test")]
+        return rows if include_inactive else [r for r in rows if r.get("active")]
+    except Exception:
+        return []
 
-# ---------- Results list with copy (like Run tab) ----------
-def _results_list_with_copy(stops: List[Dict[str, str]], tour_date: Optional[str]):
-    li_html = []
-    for s in stops:
-        href = s.get("zillow_url") or ""
-        if not href:
-            continue
-        addr = s.get("address") or href
-        time_txt = s.get("time_text") or ""
-        chip = (
-            f"<span class='date-chip'><span class='dot'></span>"
-            f"{escape(tour_date) + ' • ' if tour_date else ''}{escape(time_txt)}</span>"
-        )
-        li_html.append(
-            f"<li><a href='{escape(href)}' target='_blank' rel='noopener'>{escape(addr)}</a> {chip}</li>"
-        )
+# ---------- Styles: high-contrast chips ----------
+def _apply_local_styles():
+    st.markdown("""
+    <style>
+      .tour-box { border:1px solid rgba(0,0,0,.08); border-radius:12px; padding:14px; }
+      .chip-date {
+        display:inline-block; padding:4px 10px; border-radius:999px;
+        font-weight:800; font-size:12.5px; letter-spacing:.2px;
+        color:#0f172a; background:linear-gradient(180deg,#fde68a 0%, #f59e0b 100%);
+        border:1px solid rgba(245,158,11,.45); box-shadow:0 6px 16px rgba(245,158,11,.22),0 1px 3px rgba(0,0,0,.08);
+      }
+      html[data-theme="dark"] .chip-date, .stApp [data-theme="dark"] .chip-date {
+        color:#111827; background:linear-gradient(180deg,#fde047 0%, #f59e0b 100%);
+        border:1px solid rgba(245,158,11,.55); box-shadow:0 6px 16px rgba(217,119,6,.45),0 1px 3px rgba(0,0,0,.35);
+      }
+      .chip-sent {
+        display:inline-block; padding:2px 8px; border-radius:999px; font-weight:800; font-size:11px;
+        color:#065f46; background:#dcfce7; border:1px solid rgba(5,150,105,.35);
+      }
+      html[data-theme="dark"] .chip-sent { color:#a7f3d0; background:#064e3b; border-color:rgba(167,243,208,.35);}
+      .small { font-size:12.5px; color:#64748b; }
+      .stop-card { border-bottom:1px solid rgba(0,0,0,.06); padding:10px 0; }
+      .stop-card:last-child { border-bottom:0; }
+      .addr { font-weight:700; }
+      .time { color:#475569; }
+      .actions { margin-top:6px; }
+      .list-link { text-decoration:none; font-weight:600; }
+    </style>
+    """, unsafe_allow_html=True)
 
-    items_html = "\n".join(li_html) if li_html else "<li>(no stops)</li>"
-    copy_lines = [s.get("zillow_url","").strip() for s in stops if s.get("zillow_url")]
-    copy_text = "\\n".join(copy_lines) + ("\\n" if copy_lines else "")
+# ---------- Helpers ----------
+UA_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36",
+}
 
-    html = f"""
-    <html><head><meta charset="utf-8" /></head>
-    <body>
-      <div class="results-wrap">
-        <button id="copyAll" class="copyall-btn" title="Copy clean URLs" aria-label="Copy clean URLs">Copy</button>
-        <ul class="tour-list" id="tourList">{items_html}</ul>
-      </div>
-      <script>
-        (function(){{
-          const btn=document.getElementById('copyAll');
-          const text = "{copy_text}".replaceAll("\\n", "\\n");
-          btn.addEventListener('click', async () => {{
-            try {{
-              await navigator.clipboard.writeText(text);
-              const prev=btn.textContent; btn.textContent='✓'; setTimeout(()=>{{ btn.textContent=prev; }}, 900);
-            }} catch(e) {{
-              const prev=btn.textContent; btn.textContent='×'; setTimeout(()=>{{ btn.textContent=prev; }}, 900);
-            }}
-          }});
-        }})();
-      </script>
-    </body></html>
+def _address_slug(addr: str) -> str:
+    a = (addr or "").lower()
+    a = re.sub(r"[^\w\s,-]", "", a).replace(",", "")
+    a = re.sub(r"\s+", "-", a.strip())
+    return a
+
+def _zillow_deeplink_for_address(addr: str) -> str:
+    slug = _address_slug(addr)
+    return f"https://www.zillow.com/homes/{slug}_rb/"
+
+def _extract_text_from_pdf(file_bytes: bytes) -> str:
+    if not PyPDF2:
+        raise RuntimeError("PyPDF2 not installed")
+    with io.BytesIO(file_bytes) as bio:
+        reader = PyPDF2.PdfReader(bio)
+        parts = []
+        for p in reader.pages:
+            try:
+                parts.append(p.extract_text() or "")
+            except Exception:
+                continue
+        return "\n".join(parts)
+
+def _fetch_print_html(url: str) -> str:
+    r = requests.get(url, headers=UA_HEADERS, timeout=15)
+    r.raise_for_status()
+    return r.text
+
+def _parse_date(text: str) -> Optional[str]:
+    # Try several patterns: "Tour Date: 9/19/2025", "Date: Friday, September 19, 2025", "9/19/2025"
+    pats = [
+        r"Tour Date\s*:\s*([0-9]{1,2}/[0-9]{1,2}/[0-9]{2,4})",
+        r"Date\s*:\s*([A-Za-z]+,\s+[A-Za-z]+\s+[0-9]{1,2},\s+[0-9]{4})",
+        r"\b([0-9]{1,2}/[0-9]{1,2}/[0-9]{2,4})\b",
+    ]
+    for p in pats:
+        m = re.search(p, text, re.I)
+        if m:
+            raw = m.group(1).strip()
+            # Normalize to YYYY-MM-DD for sorting/consistency; keep display as raw too
+            try:
+                dt = None
+                if re.match(r"^\d{1,2}/\d{1,2}/\d{2,4}$", raw):
+                    mm, dd, yy = [int(x) for x in raw.split("/")]
+                    yy = yy if yy > 99 else (2000 + yy)
+                    dt = datetime.date(yy, mm, dd)
+                else:
+                    # e.g. "Friday, September 19, 2025"
+                    dt = datetime.datetime.strptime(raw, "%A, %B %d, %Y").date()
+                return dt.isoformat()
+            except Exception:
+                return raw
+    return None
+
+def _parse_stops_from_text(text: str) -> Tuple[Optional[str], List[Dict[str, Any]]]:
     """
-    est_h = max(60, min(34 * max(1, len(li_html)) + 20, 700))
-    components.html(html, height=est_h, scrolling=False)
+    Extract tour_date + stop items of {address, start, end, raw_time}.
+    Heuristics that work for ShowingTime print page and their PDF text.
+    """
+    # Normalize whitespace
+    txt = re.sub(r"[ \t]+", " ", (text or ""))
+    txt = re.sub(r"\r", "", txt)
 
+    tour_date = _parse_date(txt)
 
-# ---------- Public entry point ----------
-def render_tours_tab(state: Optional[dict] = None):
+    # Candidate address lines and time ranges
+    # Address: "123 Main St, City, ST 12345" (capture apt/unit as well)
+    ADDR_RE = re.compile(r"(\d{1,6}\s+[^\n,]+,\s*[A-Za-z .\-']+,\s*[A-Z]{2}\s+\d{5}(?:-\d{4})?)")
+    # Time windows like "10:00 AM - 10:15 AM" or "1:15PM-1:30PM"
+    TIME_RE = re.compile(r"(\d{1,2}:\d{2}\s*[AP]M)\s*[-–]\s*(\d{1,2}:\d{2}\s*[AP]M)", re.I)
+
+    # Sometimes ShowingTime prints "Appt Time:" or "Time:" near the address
+    BLOCK_RE = re.compile(r"(Address|Property|Location)[:\s]+(.+?)\s+(?:Appt\s*Time|Time)[:\s]+(.{1,40}?[AP]M\s*[-–]\s*.{1,40}?[AP]M)", re.I | re.DOTALL)
+
+    stops: List[Dict[str, Any]] = []
+
+    # First try structured "Address: ... Time: ..." blocks
+    for m in BLOCK_RE.finditer(txt):
+        addr = m.group(2).strip()
+        when = m.group(3).strip()
+        tm = TIME_RE.search(when)
+        start, end = (tm.group(1).strip(), tm.group(2).strip()) if tm else ("", "")
+        stops.append({"address": addr, "start": start, "end": end, "raw_time": when})
+
+    # If nothing found, fall back to scanning lines: match time, then nearest address line
+    if not stops:
+        # Split on newlines to keep proximity
+        lines = [re.sub(r"\s+", " ", ln).strip() for ln in (text or "").splitlines()]
+        # Pair by proximity: time line followed by an address line within next ~3 lines
+        for i, ln in enumerate(lines):
+            t = TIME_RE.search(ln)
+            if t:
+                # search forward for an address
+                addr = ""
+                for j in range(i+1, min(i+5, len(lines))):
+                    a = ADDR_RE.search(lines[j])
+                    if a:
+                        addr = a.group(1).strip()
+                        break
+                if addr:
+                    stops.append({"address": addr, "start": t.group(1).strip(), "end": t.group(2).strip(), "raw_time": ln})
+
+    # As a last resort, collect all addresses without times (still useful to save)
+    if not stops:
+        for a in ADDR_RE.finditer(txt):
+            stops.append({"address": a.group(1).strip(), "start": "", "end": "", "raw_time": ""})
+
+    # De-dup by address + time
+    uniq = {}
+    for s in stops:
+        key = (s.get("address",""), s.get("start",""), s.get("end",""))
+        if key not in uniq:
+            uniq[key] = s
+    stops = list(uniq.values())
+
+    return tour_date, stops
+
+def parse_tour_from_print_url(url: str) -> Tuple[Optional[str], List[Dict[str, Any]], Optional[str]]:
+    """Return (tour_date_iso, stops, err)."""
+    try:
+        html = _fetch_print_html(url)
+    except Exception as e:
+        return None, [], f"Fetch failed: {e}"
+
+    # Remove HTML tags to get text quickly
+    text = re.sub(r"<br\s*/?>", "\n", html, flags=re.I)
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = re.sub(r"&nbsp;", " ", text)
+    text = re.sub(r"\s+", " ", text)
+
+    td, stops = _parse_stops_from_text(text)
+    if not stops:
+        return td, [], "No stops found on the print page."
+    return td, stops, None
+
+def parse_tour_from_pdf(file_bytes: bytes) -> Tuple[Optional[str], List[Dict[str, Any]], Optional[str]]:
+    if not PyPDF2:
+        return None, [], "PyPDF2 not installed"
+    try:
+        txt = _extract_text_from_pdf(file_bytes)
+        td, stops = _parse_stops_from_text(txt)
+        if not stops:
+            return td, [], "No stops found in the PDF text."
+        return td, stops, None
+    except Exception as e:
+        return None, [], f"PDF parse error: {e}"
+
+# ---------- Sent cross-check ----------
+@st.cache_data(ttl=120, show_spinner=False)
+def _fetch_sent_for_client(client_norm: str, limit: int = 5000):
+    if not (_sb_ok() and client_norm.strip()):
+        return []
+    try:
+        cols = "url,address,sent_at,campaign,mls_id,canonical,zpid"
+        resp = SUPABASE.table("sent")\
+            .select(cols)\
+            .eq("client", client_norm.strip())\
+            .order("sent_at", desc=True)\
+            .limit(limit)\
+            .execute()
+        return resp.data or []
+    except Exception:
+        return []
+
+def _address_matches_sent(addr: str, sent_rows: List[Dict[str, Any]]) -> bool:
+    slug = _address_slug(addr)
+    if not slug:
+        return False
+    for r in sent_rows:
+        u = (r.get("url") or "").lower()
+        if not u:
+            continue
+        # If slug appears in the homedetails or homes path, count it
+        if "/homedetails/" in u or "/homes/" in u:
+            if slug in u:
+                return True
+    return False
+
+# ---------- Store to tours tables (optional) ----------
+def _store_tour(client_norm: str, client_display: str, tour_date_iso: Optional[str], stops: List[Dict[str, Any]]) -> Tuple[bool,str]:
+    if not (_sb_ok() and client_norm and stops):
+        return False, "Not configured or empty."
+    try:
+        # Insert parent tour
+        payload = {
+            "client": client_norm,
+            "client_display": client_display,
+            "tour_date": tour_date_iso or None,
+            "created_at": datetime.datetime.utcnow().isoformat(timespec="seconds") + "Z"
+        }
+        res = SUPABASE.table("tours").insert(payload).execute()
+        tour_id = (res.data or [{}])[0].get("id")
+        if not tour_id:
+            return False, "Insert tours row failed."
+
+        rows = []
+        for s in stops:
+            addr = s.get("address","")
+            start = s.get("start","")
+            end   = s.get("end","")
+            rows.append({
+                "tour_id": tour_id,
+                "address": addr,
+                "start": start,
+                "end": end,
+                "deeplink": _zillow_deeplink_for_address(addr) if addr else None
+            })
+        SUPABASE.table("tour_stops").insert(rows).execute()
+        return True, "Saved to tours/tour_stops."
+    except Exception as e:
+        # Table might not exist — don't fail the UI
+        return False, f"Save skipped/failed: {e}"
+
+# ---------- UI ----------
+def render_tours_tab(state: dict):
+    _apply_local_styles()
+
     st.subheader("Tours")
 
-    col1, col2 = st.columns([1.4, 1])
-    with col1:
-        url = st.text_input(
-            "ShowingTime URL (Print or Public link)",
-            placeholder="https://scheduling.showingtime.com/.../Tour/Print/30235965",
-            key="__tour_url__",
-        )
-    with col2:
-        pdf = st.file_uploader("Or drop a Tour PDF", type=["pdf"], key="__tour_pdf__")
+    colL, colR = st.columns([1.2, 1])
+    with colL:
+        tour_url = st.text_input("Paste ShowingTime Print URL", placeholder="https://scheduling.showingtime.com/.../Tour/Print/30235965")
+    with colR:
+        pdf_file = st.file_uploader("…or drop a Tour PDF", type=["pdf"])
 
-    cA, cB = st.columns([1, 1])
-    with cA:
-        parse_btn = st.button("Parse tour", use_container_width=True)
-    with cB:
-        reset_btn = st.button("Reset", use_container_width=True)
+    # Parse action
+    go = st.button("Parse tour", use_container_width=True)
+    tour_date_iso: Optional[str] = None
+    stops: List[Dict[str, Any]] = []
+    err: Optional[str] = None
 
-    if reset_btn:
-        st.session_state.pop("__tour_results__", None)
-        st.experimental_rerun()
-
-    # On parse
-    if parse_btn:
-        text = ""
-        src = ""
-        if url.strip():
-            text = _get_url_text(url.strip())
-            src = "url"
-        elif pdf is not None:
-            text = _extract_text_from_pdf_bytes(pdf.getvalue())
-            src = "pdf"
-
-        if not text:
-            st.error("Could not parse this tour. Please ensure it is the ShowingTime Print page or the exported Tour PDF.")
-            return
-
-        tour_date, stops = _parse_showingtime_text(text)
-        if not stops:
-            st.error("No stops found. Double-check that this is a ShowingTime tour PDF/print page.")
-            with st.expander("Debug (first 1200 chars)"):
-                st.code((text[:1200] + "…") if len(text) > 1200 else text)
-            return
-
-        st.session_state["__tour_results__"] = {
-            "date": tour_date,
-            "stops": stops,
-            "source": src,
-        }
-
-    data = st.session_state.get("__tour_results__")
-    if not data:
-        st.info("Paste a ShowingTime **Print** URL or **upload a PDF**, then click **Parse tour**.")
-        return
-
-    tour_date = data.get("date")
-    stops = data.get("stops") or []
-
-    # Results header
-    st.markdown("#### Stops")
-    _results_list_with_copy(stops, tour_date)
-
-    # Save to client (optional)
-    clients = _fetch_clients_for_tours(include_inactive=False)
-    names = [c["name"] for c in clients]
-    idx = st.selectbox("Add all stops to client (optional)", [-1] + list(range(len(names))), format_func=lambda i: ("— Select —" if i == -1 else names[i]), index=-1)
-    if idx != -1:
-        cli = clients[idx]
-        client_tag = _norm_tag(cli.get("name", ""))
-        if st.button(f"Save {len(stops)} stop(s) to client “{cli.get('name','')}”", use_container_width=True):
-            ok, msg = _log_tour_stops(client_tag, tour_date, stops)
-            if ok:
-                st.success("Saved tour stops.")
+    if go:
+        if tour_url.strip():
+            tour_date_iso, stops, err = parse_tour_from_print_url(tour_url.strip())
+        elif pdf_file is not None:
+            try:
+                buf = pdf_file.getvalue()
+            except Exception:
+                buf = None
+            if buf:
+                tour_date_iso, stops, err = parse_tour_from_pdf(buf)
             else:
-                st.warning(f"Could not save: {msg}")
+                err = "Could not read PDF bytes."
+        else:
+            err = "Provide a ShowingTime Print URL or upload a PDF."
 
-    # Export CSV of stops
-    with st.expander("Export stops (CSV)"):
-        s = io.StringIO()
-        w = csv.DictWriter(s, fieldnames=["address", "zillow_url", "time_start", "time_end", "date"])
-        w.writeheader()
-        for r in stops:
-            w.writerow({
-                "address": r.get("address",""),
-                "zillow_url": r.get("zillow_url",""),
-                "time_start": r.get("start",""),
-                "time_end": r.get("end",""),
-                "date": tour_date or "",
-            })
-        st.download_button("Download CSV", s.getvalue(), file_name=f"tour_{(tour_date or 'unknown').replace(',','').replace(' ','_')}.csv", mime="text/csv", use_container_width=True)
+        if err:
+            st.error("Could not parse this tour. Please ensure it is the ShowingTime Print page or the exported Tour PDF.")
+            with st.expander("Parser details"):
+                st.write(err)
+        elif not stops:
+            st.warning("No stops found. Double-check that this is a ShowingTime tour PDF/print page.")
+        else:
+            # Date chip
+            human_date = tour_date_iso
+            try:
+                if tour_date_iso and re.match(r"^\d{4}-\d{2}-\d{2}$", tour_date_iso):
+                    dt = datetime.date.fromisoformat(tour_date_iso)
+                    human_date = dt.strftime("%a, %b %d, %Y")
+            except Exception:
+                pass
+
+            st.markdown(
+                f"<div class='tour-box'><span class='chip-date' title='{escape(tour_date_iso or '')}'>"
+                f"{escape(human_date or 'Tour')}</span> &nbsp; "
+                f"<span class='small'>{len(stops)} stop{'s' if len(stops)!=1 else ''}</span></div>",
+                unsafe_allow_html=True
+            )
+            st.write("")
+
+            # Optional client for cross-check + storing
+            active_clients = fetch_clients(include_inactive=False)
+            names = [c["name"] for c in active_clients]
+            sentinel = -1
+            options = [sentinel] + list(range(len(names)))
+            idx = st.selectbox(
+                "Add all stops to client (optional)",
+                options,
+                format_func=lambda i: ("— Select —" if i == sentinel else names[i]),
+                index=0  # FIXED: valid index; first option is sentinel
+            )
+            chosen_client = active_clients[idx] if (idx is not None and idx >= 0 and idx < len(active_clients)) else None
+            client_norm = _norm_tag(chosen_client["name"]) if chosen_client else ""
+
+            # Cross-check with `sent`
+            sent_rows = _fetch_sent_for_client(client_norm) if chosen_client else []
+
+            # Show stops
+            for s in stops:
+                addr = s.get("address","").strip()
+                start = s.get("start","")
+                end   = s.get("end","")
+                deeplink = _zillow_deeplink_for_address(addr) if addr else ""
+                was_sent = _address_matches_sent(addr, sent_rows) if sent_rows else False
+
+                st.markdown("<div class='stop-card'>", unsafe_allow_html=True)
+                st.markdown(
+                    f"<div class='addr'>{escape(addr) if addr else '(address missing)'}</div>"
+                    f"<div class='time'>{escape(start)}"
+                    f"{(' – ' + escape(end)) if (start and end) else ''}</div>",
+                    unsafe_allow_html=True
+                )
+                actions = []
+                if deeplink:
+                    actions.append(f"<a class='list-link' href='{escape(deeplink)}' target='_blank' rel='noopener'>Zillow search</a>")
+                if was_sent:
+                    actions.append("<span class='chip-sent' title='Matched by address slug in sent links'>SENT</span>")
+                if actions:
+                    st.markdown("<div class='actions'>" + " &nbsp; ".join(actions) + "</div>", unsafe_allow_html=True)
+                st.markdown("</div>", unsafe_allow_html=True)
+
+            # Store all (optional)
+            if chosen_client:
+                if st.button(f"Add all stops to {chosen_client['name']}", use_container_width=True):
+                    ok, msg = _store_tour(client_norm, chosen_client["name"], tour_date_iso, stops)
+                    if ok:
+                        st.success("Tour saved.")
+                    else:
+                        st.warning(msg)
+
+    # Helpful note about dependencies
+    st.caption("Tip: If PDF parsing fails, make sure `PyPDF2` is in your requirements.txt.")
