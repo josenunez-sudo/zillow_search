@@ -316,7 +316,7 @@ def _build_repeat_map(client_norm: str) -> Dict[tuple, int]:
     ids = [t["id"] for t in tours]
     if not ids: return {}
     sq = SUPABASE.table("tour_stops").select("tour_id,address_slug").in_("tour_id", ids).limit(50000).execute()
-    stops = sq.data or []
+    stops = sq.data or {}
     t2s: Dict[int, List[str]] = {}
     for s in stops:
         t2s.setdefault(s["tour_id"], []).append(s["address_slug"])
@@ -369,7 +369,7 @@ def render_tours_tab(state: dict):
     with col2:
         uploaded = st.file_uploader("Or drop the **Tour PDF**", type=["pdf"])
 
-    cA, cB, cC = st.columns([0.22, 0.22, 0.56])
+    cA, cB = st.columns([0.22, 0.22])
     with cA:
         st.markdown("<div class='blue-btn-zone'>", unsafe_allow_html=True)
         do_parse = st.button("Parse", use_container_width=True, key="__parse_btn__")
@@ -377,10 +377,6 @@ def render_tours_tab(state: dict):
     with cB:
         st.markdown("<div class='blue-btn-zone'>", unsafe_allow_html=True)
         do_clear = st.button("Clear", use_container_width=True, key="__clear_btn__")
-        st.markdown("</div>", unsafe_allow_html=True)
-    with cC:
-        st.markdown("<div class='blue-btn-zone'>", unsafe_allow_html=True)
-        view_report_top = st.button("View report", use_container_width=True, key="__view_report_top__")
         st.markdown("</div>", unsafe_allow_html=True)
 
     if do_clear:
@@ -442,11 +438,6 @@ def render_tours_tab(state: dict):
         else:
             st.info("No stops to preview.")
 
-        # Extra View report button near preview
-        st.markdown("<div class='blue-btn-zone'>", unsafe_allow_html=True)
-        view_report_mid = st.button("View report", use_container_width=False, key="__view_report_mid__")
-        st.markdown("</div>", unsafe_allow_html=True)
-
         st.markdown("<div style='border-bottom:1px solid var(--row-border); margin:.5rem 0;'></div>", unsafe_allow_html=True)
 
         # ===== Add all stops flow =====
@@ -483,7 +474,7 @@ def render_tours_tab(state: dict):
         chosen_norm = add_norms[idx_add]
         also_mark_sent = st.checkbox("Also mark these stops as “toured” in Sent", value=True)
 
-        colAA, colBB, colCC = st.columns([0.35, 0.35, 0.30])
+        colAA, colCC = st.columns([0.4, 0.60])
         with colAA:
             can_add = bool(stops) and bool(tdate) and bool(client_display and client_display_norm)
             st.markdown("<div class='blue-btn-zone'>", unsafe_allow_html=True)
@@ -505,26 +496,8 @@ def render_tours_tab(state: dict):
                 except Exception as e:
                     st.error(f"Could not add stops. {e}")
 
-        with colBB:
-            # Report button in action row too
-            st.markdown("<div class='blue-btn-zone'>", unsafe_allow_html=True)
-            view_report_bottom = st.button("View report", use_container_width=True, key="__view_report_bottom__")
-            st.markdown("</div>", unsafe_allow_html=True)
-
         with colCC:
             st.caption("Tip: choose **No client** if you only want to parse/preview without logging.")
-
-        # Any of the "View report" buttons scroll down:
-        if view_report_top or view_report_mid or view_report_bottom:
-            st.components.v1.html(
-                """
-                <script>
-                  const el = parent.document.querySelector('#report_anchor');
-                  if (el) { el.scrollIntoView({behavior: "smooth", block: "start"}); }
-                </script>
-                """,
-                height=0
-            )
 
     st.markdown("---")
     st.markdown('<div id="report_anchor"></div>', unsafe_allow_html=True)
@@ -542,7 +515,8 @@ def render_tours_tab(state: dict):
                                 format_func=lambda i: names2[i], index=0, key="__tour_client_pick__")
         with colBtn:
             st.markdown("<div class='blue-btn-zone'>", unsafe_allow_html=True)
-            view_report_here = st.button("View report", use_container_width=True, key="__view_report_here__")
+            # The ONLY View report button in the entire tab:
+            st.button("View report", use_container_width=True, key="__view_report_here__")
             st.markdown("</div>", unsafe_allow_html=True)
             # (Button is primarily visual here; the section already shows the report for the selected client.)
 
