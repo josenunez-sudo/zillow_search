@@ -1,13 +1,13 @@
 # ui/run_tab.py
-import csv, io, re, asyncio
+import io, re, csv, asyncio, time
 from datetime import datetime
-from typing import List, Dict, Any
 from html import escape
+from typing import List, Dict, Any, Optional, Tuple
 
 import streamlit as st
 import streamlit.components.v1 as components
 
-# ---- Bring in your services/utils (adjust paths if your modules differ) ----
+# ---- services & utils imports (aligned with your modular split) ----
 from services.resolver import (
     resolve_from_source_url,
     process_single_row,
@@ -24,49 +24,21 @@ from services.clients import (
     log_sent_rows,
 )
 from services.tracking import make_trackable_url, bitly_shorten
+
 from utils.address import (
+    is_probable_url,
+    get_first_by_keys,
     URL_KEYS,
     MLS_ID_KEYS,
     PHOTO_KEYS,
-    is_probable_url,
-    get_first_by_keys,
+    # optional usaddress re-export
+    usaddress,
 )
 
-# Optional usaddress support: if your utils exposes it, import; else best-effort local import
-try:
-    from utils.address import usaddress  # re-exported in utils
-except Exception:
-    try:
-        import usaddress  # type: ignore
-    except Exception:
-        usaddress = None  # type: ignore
 
-
-# ---------- Query-params helpers ----------
-def _qp_get(name, default=None):
-    try:
-        qp = st.query_params
-        val = qp.get(name, default)
-        if isinstance(val, list) and val:
-            return val[0]
-        return val
-    except Exception:
-        qp = st.experimental_get_query_params()
-        return (qp.get(name, [default]) or [default])[0]
-
-
-def _qp_set(**kwargs):
-    try:
-        if kwargs:
-            st.query_params.update(kwargs)
-        else:
-            st.query_params.clear()
-    except Exception:
-        if kwargs:
-            st.experimental_set_query_params(**kwargs)
-        else:
-            st.experimental_set_query_params()
-
+# ---------- small helpers ----------
+def _norm_tag(s: str) -> str:
+    return re.sub(r"\s+", " ", (s or "").strip()).lower()
 
 def _safe_rerun():
     try:
@@ -78,8 +50,11 @@ def _safe_rerun():
             pass
 
 
-# ---------- Output builders (keep URL as the anchor text for clean SMS unfurls) ----------
+# ---------- output builders (kept local to Run tab) ----------
 def build_output(rows: List[Dict[str, Any]], fmt: str, use_display: bool = True, include_notes: bool = False):
+    """
+    When sharing links by SMS, we keep anchors as the raw URL (best unfurl).
+    """
     def pick_url(r):
         return r.get("preview_url") or r.get("zillow_url") or r.get("display_url") or ""
 
@@ -98,21 +73,20 @@ def build_output(rows: List[Dict[str, Any]], fmt: str, use_display: bool = True,
         items = []
         for r in rows:
             u = pick_url(r)
-            if not u:
-                continue
+            if not u: continue
             items.append(f'<li><a href="{escape(u)}" target="_blank" rel="noopener">{escape(u)}</a></li>')
         return "<ul>\n" + "\n".join(items) + "\n</ul>\n", "text/html"
 
+    # txt / md default to clean URL-per-line
     lines = []
     for r in rows:
         u = pick_url(r)
-        if u:
-            lines.append(u)
+        if u: lines.append(u)
     payload = "\n".join(lines) + ("\n" if lines else "")
     return payload, ("text/markdown" if fmt == "md" else "text/plain")
 
 
-# ---------- Results list (ALWAYS hyperlinks, tight vertical spacing) ----------
+# ---------- Results list (hyperlinks + copy all) ----------
 def results_list_with_copy_all(results: List[Dict[str, Any]], client_selected: bool):
     li_html = []
     for r in results:
@@ -120,7 +94,7 @@ def results_list_with_copy_all(results: List[Dict[str, Any]], client_selected: b
         if not href:
             continue
         safe_href = escape(href)
-        link_txt = href  # keep URL text for best SMS unfurls
+        link_txt = href  # raw URL as anchor text for best SMS unfurls
 
         badge_html = ""
         if client_selected:
@@ -176,52 +150,7 @@ def results_list_with_copy_all(results: List[Dict[str, Any]], client_selected: b
     components.html(html, height=est_h, scrolling=False)
 
 
-def _render_results_and_downloads(results: List[Dict[str, Any]], client_tag: str, campaign_tag: str, include_notes: bool, client_selected: bool, table_view: bool):
-    st.markdown("#### Results")
-    results_list_with_copy_all(results, client_selected=client_selected)
-
-    # Table OFF by default (remove dead space). Only render if toggled on.
-    if table_view:
-        import pandas as pd
-        cols = ["already_sent","dup_reason","dup_sent_at","display_url","zillow_url","preview_url","status","price","beds","baths","sqft","mls_id","input_address"]
-        df = pd.DataFrame([{c: r.get(c) for c in cols} for r in results])
-        st.dataframe(df, use_container_width=True, hide_index=True)
-
-    fmt_options = ["txt","csv","md","html"]
-    prev_fmt = (st.session_state.get("__results__") or {}).get("fmt")
-    default_idx = fmt_options.index(prev_fmt) if prev_fmt in fmt_options else 0
-    fmt = st.selectbox("Download format", fmt_options, index=default_idx)
-    payload, mime = build_output(results, fmt, use_display=True, include_notes=include_notes)
-    ts = datetime.utcnow().strftime("%Y%m%d%H%M%S")
-    tag = ("_" + re.sub(r'[^a-z0-9\-]+','', (client_tag or "").lower().replace(" ","-"))) if client_tag else ""
-    st.download_button("Export", data=payload, file_name=f"address_alchemist{tag}_{ts}.{fmt}", mime=mime, use_container_width=True)
-    st.session_state["__results__"] = {"results": results, "fmt": fmt}
-
-    # Thumbs (unchanged)
-    thumbs=[]
-    for r in results:
-        img = r.get("image_url")
-        if not img:
-            img, _ = get_thumbnail_and_log(r.get("input_address",""), r.get("preview_url") or r.get("zillow_url") or "", r.get("csv_photo"))
-        if img:
-            thumbs.append((r,img))
-    if thumbs:
-        st.markdown("#### Images")
-        cols = st.columns(3)
-        for i,(r,img) in enumerate(thumbs):
-            with cols[i%3]:
-                st.image(img, use_container_width=True)
-                mls_id = (r.get("mls_id") or "").strip()
-                addr = (r.get("input_address") or "").strip()
-                url = r.get("preview_url") or r.get("zillow_url") or r.get("display_url") or "#"
-                link_text = escape(addr) if addr else "View listing"
-                st.markdown(
-                    f"<div class='img-label'>{('<strong>MLS#: '+escape(mls_id)+'</strong><br/>' if mls_id else '')}<a href='{escape(url)}' target='_blank' rel='noopener'>{link_text}</a></div>",
-                    unsafe_allow_html=True
-                )
-
-
-# ---------- Public entry ----------
+# ---------- render_run_tab ----------
 def render_run_tab(state=None):
     NO_CLIENT = "➤ No client (show ALL, no logging)"
     ADD_SENTINEL = "➕ Add new client…"
@@ -231,7 +160,7 @@ def render_run_tab(state=None):
         active_clients = fetch_clients(include_inactive=False)
         names = [c["name"] for c in active_clients]
         options = [NO_CLIENT] + names + [ADD_SENTINEL]
-        sel_idx = st.selectbox("Client", list(range(len(options))), format_func=lambda i: options[i], index=0)
+        sel_idx = st.selectbox("Client", list(range(len(options))), format_func=lambda i: options[i], index=0, key="__client_select__")
         selected_client = None if sel_idx in (0, len(options)-1) else active_clients[sel_idx-1]
 
         if options[sel_idx] == ADD_SENTINEL:
@@ -252,60 +181,69 @@ def render_run_tab(state=None):
     with c1:
         use_shortlinks = st.checkbox("Use short links (Bitly)", value=False, help="Optional tracking; sharing uses clean Zillow links.")
     with c2:
-        # Default UNCHECKED per your request
-        enrich_details = st.checkbox("Enrich details", value=False)
+        enrich_details = st.checkbox("Enrich details", value=False)  # default unchecked per your spec
     with c3:
         show_details = st.checkbox("Show details under results", value=False)
     with c4:
         only_show_new = st.checkbox(
             "Only show NEW for this client",
             value=bool(selected_client),
-            help="Hide duplicates. Disabled when 'No client' is selected."
+            help="Hide duplicates. Disabled when 'No client' is selected.",
+            key="__only_new__"
         )
         if not selected_client:
             only_show_new = False
 
-    # Default: hide table (remove dead space). Toggle if desired.
-    table_view = st.checkbox("Show results as table", value=False, help="Easier to scan details")
+    # Default: hide table (remove dead space)
+    table_view = st.checkbox("Show results as table", value=False, help="Easier to scan details", key="__table_view__")
 
-    client_tag = re.sub(r"\s+", " ", (client_tag_raw or "").strip()).lower()
-    campaign_tag = re.sub(r"\s+", " ", (campaign_tag_raw or "").strip()).lower()
+    client_tag = _norm_tag(client_tag_raw)
+    campaign_tag = _norm_tag(campaign_tag_raw)
 
     st.markdown('<div class="center-box">', unsafe_allow_html=True)
     st.markdown("**Paste addresses or links** (one per line) _and/or_ **drop a CSV**")
-    paste = st.text_area("Paste addresses or links", placeholder="407 E Woodall St, Smithfield, NC 27577\nhttps://l.hms.pt/...\n123 US-301 S, Four Oaks, NC 27524", height=160, label_visibility="collapsed")
+    paste = st.text_area(
+        "Paste addresses or links",
+        placeholder="407 E Woodall St, Smithfield, NC 27577\nhttps://l.hms.pt/...\n123 US-301 S, Four Oaks, NC 27524",
+        height=160,
+        label_visibility="collapsed",
+        key="__paste__",
+    )
     opt1, opt2, opt3 = st.columns([1.15, 1, 1.2])
     with opt1:
-        remove_dupes = st.checkbox("Remove duplicates (pasted)", value=True)
+        remove_dupes = st.checkbox("Remove duplicates (pasted)", value=True, key="__rm_dupes__")
     with opt2:
-        trim_spaces = st.checkbox("Auto-trim (pasted)", value=True)
+        trim_spaces = st.checkbox("Auto-trim (pasted)", value=True, key="__trim__")
     with opt3:
-        show_preview = st.checkbox("Show preview (pasted)", value=True)
+        show_preview = st.checkbox("Show preview (pasted)", value=True, key="__preview__")
 
-    file = st.file_uploader("Upload CSV", type=["csv"], label_visibility="collapsed")
+    file = st.file_uploader("Upload CSV", type=["csv"], label_visibility="collapsed", key="__uploader__")
     st.markdown('</div>', unsafe_allow_html=True)
 
     # Parse pasted
     lines_raw = (paste or "").splitlines()
     lines_clean = []
     for ln in lines_raw:
-        ln = ln.strip() if trim_spaces else ln
-        if not ln:
+        ln0 = ln.strip() if trim_spaces else ln
+        if not ln0:
             continue
-        if remove_dupes and ln in lines_clean:
+        if remove_dupes and ln0 in lines_clean:
             continue
-        if is_probable_url(ln):
-            lines_clean.append(ln)
+        if is_probable_url(ln0):
+            lines_clean.append(ln0)
         else:
             if usaddress:
-                parts = usaddress.tag(ln)[0]  # type: ignore
-                norm = (parts.get("AddressNumber","") + " " +
-                        " ".join([parts.get(k,"") for k in ["StreetNamePreDirectional","StreetName","StreetNamePostType","OccupancyType","OccupancyIdentifier"]]).strip())
-                cityst = ((", " + parts.get("PlaceName","") + ", " + parts.get("StateName","") +
-                           (" " + parts.get("ZipCode","") if parts.get("ZipCode") else "")) if (parts.get("PlaceName") or parts.get("StateName")) else "")
-                lines_clean.append(re.sub(r"\s+"," ", (norm + cityst).strip()))
+                try:
+                    parts = usaddress.tag(ln0)[0]
+                    norm = (parts.get("AddressNumber","") + " " +
+                            " ".join([parts.get(k,"") for k in ["StreetNamePreDirectional","StreetName","StreetNamePostType","OccupancyType","OccupancyIdentifier"]]).strip())
+                    cityst = ((", " + parts.get("PlaceName","") + ", " + parts.get("StateName","") +
+                              (" " + parts.get("ZipCode","") if parts.get("ZipCode") else "")) if (parts.get("PlaceName") or parts.get("StateName")) else "")
+                    lines_clean.append(re.sub(r"\s+"," ", (norm + cityst).strip()))
+                except Exception:
+                    lines_clean.append(ln0)
             else:
-                lines_clean.append(ln)
+                lines_clean.append(ln0)
 
     count_pasted = len(lines_clean)
     csv_count = 0
@@ -318,18 +256,66 @@ def render_run_tab(state=None):
             csv_count = 0
 
     bits = [f"**{count_pasted}** pasted"]
-    if file is not None:
-        bits.append(f"**{csv_count}** CSV")
+    if file is not None: bits.append(f"**{csv_count}** CSV")
     st.caption(" • ".join(bits) + "  •  Paste short links or MLS pages too; we’ll resolve them to Zillow.")
 
     if show_preview and count_pasted:
         st.markdown("**Preview (pasted)** (first 5):")
-        st.markdown("<ul class='link-list'>" + "\n".join([f"<li>{escape(p)}</li>" for p in lines_clean[:5]]) + ("<li>…</li>" if count_pasted > 5 else "") + "</ul>", unsafe_allow_html=True)
+        st.markdown(
+            "<ul class='link-list'>" +
+            "\n".join([f"<li>{escape(p)}</li>" for p in lines_clean[:5]]) +
+            ("<li>…</li>" if count_pasted > 5 else "") +
+            "</ul>",
+            unsafe_allow_html=True
+        )
 
-    # Run
+    # POPPY RUN BUTTON
     st.markdown('<div class="run-zone">', unsafe_allow_html=True)
     clicked = st.button("🚀 Run", use_container_width=True, key="__run_btn__")
     st.markdown('</div>', unsafe_allow_html=True)
+
+    def _render_results_and_downloads(results: List[Dict[str, Any]], client_tag: str, campaign_tag: str, include_notes: bool, client_selected: bool):
+        st.markdown("#### Results")
+        results_list_with_copy_all(results, client_selected=client_selected)
+
+        # Table removed by default (no extra vertical space); toggle if needed.
+        if table_view:
+            import pandas as pd
+            cols = ["already_sent","dup_reason","dup_sent_at","display_url","zillow_url","preview_url","status","price","beds","baths","sqft","mls_id","input_address"]
+            df = pd.DataFrame([{c: r.get(c) for c in cols} for r in results])
+            st.dataframe(df, use_container_width=True, hide_index=True)
+
+        fmt_options = ["txt","csv","md","html"]
+        prev_fmt = (st.session_state.get("__results__") or {}).get("fmt")
+        default_idx = fmt_options.index(prev_fmt) if prev_fmt in fmt_options else 0
+        fmt = st.selectbox("Download format", fmt_options, index=default_idx, key="__fmt__")
+        payload, mime = build_output(results, fmt, use_display=True, include_notes=include_notes)
+        ts = datetime.utcnow().strftime("%Y%m%d%H%M%S")
+        tag = ("_" + re.sub(r'[^a-z0-9\-]+','', (client_tag or "").lower().replace(" ","-"))) if client_tag else ""
+        st.download_button("Export", data=payload, file_name=f"address_alchemist{tag}_{ts}.{fmt}", mime=mime, use_container_width=True, key="__export__")
+        st.session_state["__results__"] = {"results": results, "fmt": fmt}
+
+        # Thumbs (kept)
+        thumbs=[]
+        for r in results:
+            img = r.get("image_url")
+            if not img:
+                img, _ = get_thumbnail_and_log(r.get("input_address",""), r.get("preview_url") or r.get("zillow_url") or "", r.get("csv_photo"))
+            if img: thumbs.append((r,img))
+        if thumbs:
+            st.markdown("#### Images")
+            cols = st.columns(3)
+            for i,(r,img) in enumerate(thumbs):
+                with cols[i%3]:
+                    st.image(img, use_container_width=True)
+                    mls_id = (r.get("mls_id") or "").strip()
+                    addr = (r.get("input_address") or "").strip()
+                    url = r.get("preview_url") or r.get("zillow_url") or r.get("display_url") or "#"
+                    link_text = escape(addr) if addr else "View listing"
+                    st.markdown(
+                        f"<div class='img-label'>{('<strong>MLS#: '+escape(mls_id)+'</strong><br/>' if mls_id else '')}<a href='{escape(url)}' target='_blank' rel='noopener'>{link_text}</a></div>",
+                        unsafe_allow_html=True
+                    )
 
     if clicked:
         try:
@@ -371,73 +357,61 @@ def render_run_tab(state=None):
                 else:
                     res = process_single_row(row, delay=0.45, land_mode=True, defaults=defaults,
                                              require_state=True, mls_first=True, default_mls_name="", max_candidates=20)
+                    # also carry possible CSV photo col
+                    res["csv_photo"] = get_first_by_keys(row, PHOTO_KEYS)
                     results.append(res)
                 prog.progress(i/total, text=f"Resolved {i}/{total}")
             prog.progress(1.0, text="Links resolved")
 
-            # Normalize URLs to /homedetails/
+            # Normalize to /homedetails/ URLs where possible
             for r in results:
                 for key in ("zillow_url","display_url"):
                     if r.get(key):
                         r[key] = upgrade_to_homedetails_if_needed(r[key])
 
-            # Optional enrichment
             if enrich_details:
                 st.write("Enriching details (parallel)…")
                 results = asyncio.run(enrich_results_async(results))
 
-            # Compute preview + display URLs
+            # Build display/preview URLs + optional short links
+            client_tag_norm = _norm_tag(client_tag)
+            campaign_tag_norm = _norm_tag(campaign_tag)
             for r in results:
                 base = r.get("zillow_url")
                 r["preview_url"] = make_preview_url(base) if base else ""
-                display = make_trackable_url(base, client_tag, campaign_tag) if base else base
+                display = make_trackable_url(base, client_tag_norm, campaign_tag_norm) if base else base
                 if use_shortlinks and display:
                     short = bitly_shorten(display)
                     r["display_url"] = short or display
                 else:
                     r["display_url"] = display or base
 
-            client_selected = bool(client_tag.strip())
+            client_selected = bool(client_tag_norm.strip())
             if client_selected:
-                canon_set, zpid_set, canon_info, zpid_info = get_already_sent_maps(client_tag)
+                canon_set, zpid_set, canon_info, zpid_info = get_already_sent_maps(client_tag_norm)
                 results = mark_duplicates(results, canon_set, zpid_set, canon_info, zpid_info)
                 if only_show_new:
                     results = [r for r in results if not r.get("already_sent")]
                 if results:
-                    ok_log, info_log = log_sent_rows(results, client_tag, campaign_tag)
+                    ok_log, info_log = log_sent_rows(results, client_tag_norm, campaign_tag_norm)
                     st.success("Logged to Supabase.") if ok_log else st.warning(f"Supabase log skipped/failed: {info_log}")
             else:
                 for r in results:
                     r["already_sent"] = False
 
-            st.success(f"Processed {len(results)} item(s)" + (f" — CSV rows read: {csv_rows_count}" if file is not None else ""))
+            st.success(f"Processed {len(results)} item(s)" + (f" — CSV rows read: {csv_count}" if file is not None else ""))
 
-            _render_results_and_downloads(
-                results,
-                client_tag,
-                campaign_tag,
-                include_notes=enrich_details,
-                client_selected=client_selected,
-                table_view=table_view,
-            )
+            _render_results_and_downloads(results, client_tag_norm, campaign_tag_norm, include_notes=enrich_details, client_selected=client_selected)
 
         except Exception as e:
             st.error("We hit an error while processing.")
-            with st.expander("Details"):
-                st.exception(e)
+            with st.expander("Details"): st.exception(e)
 
-    # Restore previous results if present
+    # Restore previous results on first paint (if present)
     data = st.session_state.get("__results__") or {}
     results = data.get("results") or []
     if results and not clicked:
-        _render_results_and_downloads(
-            results,
-            client_tag,
-            campaign_tag,
-            include_notes=False,
-            client_selected=bool(client_tag.strip()),
-            table_view=table_view,
-        )
+        _render_results_and_downloads(results, client_tag, campaign_tag, include_notes=False, client_selected=bool(client_tag.strip()))
     else:
         if not clicked:
             st.info("Paste addresses or links (or upload CSV), then click **Run**.")
