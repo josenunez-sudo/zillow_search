@@ -2,7 +2,7 @@
 import os, re, io
 from datetime import datetime
 from html import escape
-from typing import List, Dict, Any, Optional, Tuple
+from typing import List, Dict, Any, Optional
 from urllib.parse import unquote
 
 import streamlit as st
@@ -33,20 +33,78 @@ def _sb_ok() -> bool:
 def _norm_tag(s: str) -> str:
     return re.sub(r"\s+", " ", (s or "").strip()).lower()
 
-# === CRITICAL: use the EXACT same slugger as Tours tab ===
-def _slug_addr(addr: str) -> str:
+# =========================
+# STRICT address slug (shared)
+# =========================
+_DIR_MAP = {
+    "n": "north", "s": "south", "e": "east", "w": "west",
+    "ne": "northeast", "nw": "northwest", "se": "southeast", "sw": "southwest"
+}
+_TYPE_MAP = {
+    "st": "street", "street": "street",
+    "ave": "avenue", "av": "avenue", "avenue": "avenue",
+    "dr": "drive", "drive": "drive",
+    "ln": "lane", "lane": "lane",
+    "rd": "road", "road": "road",
+    "blvd": "boulevard", "boulevard": "boulevard",
+    "ct": "court", "court": "court",
+    "pl": "place", "place": "place",
+    "ter": "terrace", "terrace": "terrace",
+    "way": "way",
+    "cir": "circle", "circle": "circle",
+    "pkwy": "parkway", "parkway": "parkway",
+    "hwy": "highway", "highway": "highway",
+    "sq": "square", "square": "square",
+    "trl": "trail", "trail": "trail",
+}
+
+_WORD_RE = re.compile(r"[A-Za-z0-9']+")
+
+def _canonical_words(addr: str) -> List[str]:
+    """
+    Lowercase, strip punctuation, normalize directionals and street types.
+    Keep only alnum words (drop commas/periods). Merge multiple whitespace.
+    """
+    s = (addr or "").strip().lower()
+    # Replace separators with spaces
+    s = re.sub(r"[,/]+", " ", s)
+    s = re.sub(r"[\-]+", " ", s)  # treat hyphen as separator for words
+    s = re.sub(r"\s+", " ", s).strip()
+
+    words: List[str] = []
+    for m in _WORD_RE.finditer(s):
+        w = m.group(0)
+
+        # expand directionals
+        if w in _DIR_MAP:
+            w = _DIR_MAP[w]
+
+        # normalize street type (only if it matches exactly a type token)
+        if w in _TYPE_MAP:
+            w = _TYPE_MAP[w]
+
+        words.append(w)
+    return words
+
+def _slug_addr_strict(addr: str) -> str:
+    words = _canonical_words(addr)
+    return "-".join(words)
+
+# Minimal previous slugger (kept only for fallback use if needed)
+def _slug_addr_loose(addr: str) -> str:
     a = (addr or "").strip().lower()
     a = re.sub(r"[^\w\s,-]", "", a).replace(",", "")
     return re.sub(r"\s+", "-", a).strip("-")
 
-# Minimal zpid pull (for dedupe)
+# =========================
+# URL/ZPID helpers
+# =========================
 _ZPID_RE = re.compile(r'(\d{6,})_zpid', re.I)
 
 def _zpid_from_url(url: str) -> str:
     m = _ZPID_RE.search(url or "")
     return (m.group(1) if m else "").strip()
 
-# Human title from URL if address missing
 def address_text_from_url(url: str) -> str:
     if not url: return ""
     u = unquote(url)
@@ -70,11 +128,8 @@ def _pretty_sent_at(iso_str: str) -> str:
             dt = dt.astimezone(ZoneInfo("America/New_York"))
         except Exception:
             pass
-        # handle platforms where %-d / %-I unsupported (Windows)
-        fmt = "%b %d, %Y • %I:%M %p"
-        out = dt.strftime(fmt)
-        # strip leading zero in hour
-        out = re.sub(r"\b0(\d:)", r"\1", out)
+        out = dt.strftime("%b %d, %Y • %I:%M %p")
+        out = re.sub(r"\b0(\d:)", r"\1", out)  # strip leading zero in hour
         return out
     except Exception:
         m = re.match(r"^(\d{4}-\d{2}-\d{2})", iso_str)
@@ -193,7 +248,8 @@ def fetch_sent_for_client(client_norm: str, limit: int = 5000):
 @st.cache_data(ttl=120, show_spinner=False)
 def fetch_tour_address_slugs(client_norm: str) -> Dict[str, int]:
     """
-    Returns {address_slug: count_in_all_tours} using the SAME slugger as Tours.
+    Returns {strict_slug: count_across_all_tours} using STRICT slugger,
+    ignoring DB's stored slug to avoid historical inconsistencies.
     """
     out: Dict[str, int] = {}
     if not (_sb_ok() and client_norm.strip()):
@@ -204,13 +260,15 @@ def fetch_tour_address_slugs(client_norm: str) -> Dict[str, int]:
         if not tours: return out
         ids = [t["id"] for t in tours]
         if not ids: return out
-        sq = SUPABASE.table("tour_stops").select("address,address_slug").in_("tour_id", ids).limit(50000).execute()
+        # Pull address text; recompute strict slug here
+        sq = SUPABASE.table("tour_stops").select("address").in_("tour_id", ids).limit(50000).execute()
         rows = sq.data or []
         for r in rows:
             addr = (r.get("address") or "").strip()
-            slug = (r.get("address_slug") or _slug_addr(addr)).strip()
-            if slug:
-                out[slug] = out.get(slug, 0) + 1
+            if not addr: 
+                continue
+            slug = _slug_addr_strict(addr)
+            out[slug] = out.get(slug, 0) + 1
         return out
     except Exception:
         return out
@@ -234,7 +292,7 @@ def _client_row(name: str, norm: str, cid: int, active: bool):
 
     with col_rep:
         if st.button("▦", key=f"rep_{cid}", help="Open report"):
-            st.session_state["__active_tab__"] = "Clients"   # stop tab flicker
+            st.session_state["__active_tab__"] = "Clients"   # keep focus on Clients tab
             _qp_set(report=norm, scroll="1")
             _safe_rerun()
 
@@ -299,7 +357,7 @@ def _render_client_report_view(client_display_name: str, client_norm: str):
     rows = fetch_sent_for_client(client_norm)
     total = len(rows)
 
-    # Campaign list
+    # Campaign picklist
     seen_camps = []
     for r in rows:
         c = (r.get("campaign") or "").strip()
@@ -319,11 +377,11 @@ def _render_client_report_view(client_display_name: str, client_norm: str):
     with colF3:
         st.caption(f"{total} total logged")
 
-    # Cross-check: toured slugs (built with the SAME slugger)
-    toured_slugs = fetch_tour_address_slugs(client_norm)  # dict slug -> count
+    # Cross-check: toured slugs using STRICT slugger
+    toured_slugs = fetch_tour_address_slugs(client_norm)  # dict strict_slug -> count
     toured_set = set(toured_slugs.keys())
 
-    # Filter rows by campaign/search
+    # Filter by campaign/search
     def _match(row) -> bool:
         if sel_campaign is not None:
             if (row.get("campaign") or "").strip() != sel_campaign:
@@ -338,13 +396,12 @@ def _render_client_report_view(client_display_name: str, client_norm: str):
     rows_f = [r for r in rows if _match(r)]
 
     # ======= HARD DEDUPE (no repeats ever) =======
-    # Track seen by all identities so variants cannot slip through.
     seen_canon: set = set()
     seen_zpid:  set = set()
     seen_slug:  set = set()
     unique_rows: List[Dict[str, Any]] = []
 
-    for r in rows_f:  # rows_f is newest-first already
+    for r in rows_f:  # newest-first from DB
         canon = (r.get("canonical") or "").strip().lower()
         zpid  = (r.get("zpid") or "").strip()
         url   = (r.get("url") or "").strip()
@@ -352,28 +409,25 @@ def _render_client_report_view(client_display_name: str, client_norm: str):
 
         if not zpid:
             zpid = _zpid_from_url(url)
-
         if not addr:
             addr = address_text_from_url(url)
 
-        slug = _slug_addr(addr)
+        strict_slug = _slug_addr_strict(addr)
+        loose_slug  = _slug_addr_loose(addr)  # extra safety for old rows
 
-        # Skip if any identity was seen
-        if canon and canon in seen_canon:
-            continue
-        if zpid and zpid in seen_zpid:
-            continue
-        if slug and slug in seen_slug:
-            continue
+        # Drop if any identity already seen
+        if canon and canon in seen_canon:   continue
+        if zpid and zpid in seen_zpid:      continue
+        if strict_slug and strict_slug in seen_slug: continue
+        if loose_slug and loose_slug in seen_slug:   continue
 
-        # Accept row, then mark all identities as seen
         unique_rows.append(r)
-        if canon:
-            seen_canon.add(canon)
-        if zpid:
-            seen_zpid.add(zpid)
-        if slug:
-            seen_slug.add(slug)
+
+        # Mark identities
+        if canon: seen_canon.add(canon)
+        if zpid:  seen_zpid.add(zpid)
+        if strict_slug: seen_slug.add(strict_slug)
+        if loose_slug:  seen_slug.add(loose_slug)
 
     count = len(unique_rows)
     st.caption(f"{count} unique listing{'s' if count!=1 else ''}")
@@ -382,7 +436,7 @@ def _render_client_report_view(client_display_name: str, client_norm: str):
         st.info("No results match the current filters.")
         return
 
-    # Render
+    # Render results with TOURED badge
     items_html = []
     for r in unique_rows:
         url = (r.get("url") or "").strip()
@@ -390,7 +444,7 @@ def _render_client_report_view(client_display_name: str, client_norm: str):
         if not addr:
             addr = address_text_from_url(url) or "Listing"
 
-        slug = _slug_addr(addr)
+        slug = _slug_addr_strict(addr)
         toured = slug in toured_set
         toured_count = toured_slugs.get(slug, 0)
 
@@ -473,7 +527,7 @@ def render_clients_tab():
             for c in inactive:
                 _client_row(c["name"], c.get("name_norm",""), c["id"], active=False)
 
-    # Report section at bottom
+    # Report section
     st.markdown('<div id="report_anchor"></div>', unsafe_allow_html=True)
     if report_norm_qp:
         display_name = next((c["name"] for c in all_clients if c.get("name_norm")==report_norm_qp), report_norm_qp)
