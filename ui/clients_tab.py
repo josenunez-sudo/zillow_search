@@ -1,18 +1,18 @@
 # ui/clients_tab.py
-# Clients tab with inline "Toured" date/time next to each sent listing hyperlink.
+# Clients tab: side-by-side Active / Inactive with ▦ Report button.
+# Report view shows sent listings; listings that were toured are tagged "TOURED (date time)".
 
 import os
 import re
-import io
 from datetime import datetime
 from typing import List, Dict, Any, Optional
 from html import escape
-from urllib.parse import unquote
 
 import streamlit as st
-
-# ---------- Supabase ----------
 from supabase import create_client, Client
+
+
+# ───────────────────────────── Supabase ─────────────────────────────
 
 @st.cache_resource
 def _get_supabase() -> Optional[Client]:
@@ -33,56 +33,57 @@ def _sb_ok() -> bool:
     except NameError:
         return False
 
-# ---------- Small utils ----------
+
+# ───────────────────────────── Utils ─────────────────────────────
+
 def _norm_tag(s: str) -> str:
     return re.sub(r"\s+", " ", (s or "").strip()).lower()
 
 def _slug_addr_for_match(s: str) -> str:
-    """
-    Slug used to match addresses across 'sent' and 'tour_stops'.
-    Make sure the same logic is used wherever you mark "TOURED" in other tabs.
-    """
     s = (s or "").lower()
     s = re.sub(r"[#,.]+", " ", s)
     s = re.sub(r"\s+", " ", s).strip()
     s = re.sub(r"[^a-z0-9]+", "-", s).strip("-")
     return s
 
-def _qp_get(name, default=None):
-    try:
-        qp = st.query_params  # Streamlit >= 1.34
-        val = qp.get(name, default)
-        if isinstance(val, list) and val:
-            return val[0]
-        return val
-    except Exception:
-        qp = st.experimental_get_query_params()
-        return (qp.get(name, [default]) or [default])[0]
+def address_text_from_url(url: str) -> str:
+    if not url:
+        return ""
+    from urllib.parse import unquote
+    u = unquote(url)
+    m = re.search(r"/homedetails/([^/]+)/\d{6,}_zpid/", u, re.I)
+    if m:
+        return re.sub(r"[-+]", " ", m.group(1)).strip().title()
+    m = re.search(r"/homes/([^/_]+)_rb/?", u, re.I)
+    if m:
+        return re.sub(r"[-+]", " ", m.group(1)).strip().title()
+    return ""
 
-def _qp_set(**kwargs):
-    try:
-        if kwargs:
-            st.query_params.update(kwargs)
-        else:
-            st.query_params.clear()
-    except Exception:
-        if kwargs:
-            st.experimental_set_query_params(**kwargs)
-        else:
-            st.experimental_set_query_params()
+def _time_chip(t1: str, t2: str) -> str:
+    txt = "–".join([x for x in [t1.strip(), t2.strip()] if x]) if (t1 or t2) else ""
+    if not txt:
+        return ""
+    return (
+        "<span style='display:inline-block;margin-left:8px;padding:2px 8px;border-radius:999px;"
+        "font-size:12px;font-weight:800;background:#1e40af1a;color:#1e3a8a;"
+        "border:1px solid #60a5fa;'>"
+        f"{escape(txt)}</span>"
+    )
 
-def _safe_rerun():
-    try:
-        st.rerun()
-    except Exception:
-        try:
-            st.experimental_rerun()
-        except Exception:
-            pass
+def _toured_chip(dt_iso: str) -> str:
+    # high-contrast amber chip for "TOURED"
+    label = (dt_iso or "").split("T")[0]
+    return (
+        "<span style='display:inline-block;margin-left:8px;padding:2px 10px;border-radius:999px;"
+        "font-size:12px;font-weight:900;background:#f59e0b1a;color:#92400e;border:1px solid #f59e0b;'>"
+        f"TOURED {escape(label)}</span>"
+    )
 
-# ---------- Clients registry helpers ----------
+
+# ───────────────────────────── Clients registry ─────────────────────────────
+
 @st.cache_data(ttl=60, show_spinner=False)
-def fetch_clients(include_inactive: bool = False):
+def fetch_clients(include_inactive: bool = True):
     if not _sb_ok():
         return []
     try:
@@ -92,11 +93,35 @@ def fetch_clients(include_inactive: bool = False):
     except Exception:
         return []
 
-def _invalidate_clients_cache():
+def upsert_client(name: str, active: bool = True, notes: str = None):
+    if not _sb_ok() or not (name or "").strip():
+        return False, "Not configured or empty name"
     try:
-        fetch_clients.clear()  # type: ignore[attr-defined]
-    except Exception:
-        pass
+        name_norm = _norm_tag(name)
+        payload = {"name": name.strip(), "name_norm": name_norm, "active": active}
+        if notes is not None:
+            payload["notes"] = notes
+        SUPABASE.table("clients").upsert(payload, on_conflict="name_norm").execute()
+        try:
+            fetch_clients.clear()  # type: ignore[attr-defined]
+        except Exception:
+            pass
+        return True, "ok"
+    except Exception as e:
+        return False, str(e)
+
+def toggle_client_active(client_id: int, new_active: bool):
+    if not _sb_ok() or not client_id:
+        return False, "Not configured"
+    try:
+        SUPABASE.table("clients").update({"active": new_active}).eq("id", client_id).execute()
+        try:
+            fetch_clients.clear()  # type: ignore[attr-defined]
+        except Exception:
+            pass
+        return True, "ok"
+    except Exception as e:
+        return False, str(e)
 
 def rename_client(client_id: int, new_name: str):
     if not _sb_ok() or not client_id or not (new_name or "").strip():
@@ -107,17 +132,10 @@ def rename_client(client_id: int, new_name: str):
         if existing and existing[0]["id"] != client_id:
             return False, "A client with that (normalized) name already exists."
         SUPABASE.table("clients").update({"name": new_name.strip(), "name_norm": new_norm}).eq("id", client_id).execute()
-        _invalidate_clients_cache()
-        return True, "ok"
-    except Exception as e:
-        return False, str(e)
-
-def toggle_client_active(client_id: int, new_active: bool):
-    if not _sb_ok() or not client_id:
-        return False, "Not configured"
-    try:
-        SUPABASE.table("clients").update({"active": new_active}).eq("id", client_id).execute()
-        _invalidate_clients_cache()
+        try:
+            fetch_clients.clear()  # type: ignore[attr-defined]
+        except Exception:
+            pass
         return True, "ok"
     except Exception as e:
         return False, str(e)
@@ -127,17 +145,19 @@ def delete_client(client_id: int):
         return False, "Not configured"
     try:
         SUPABASE.table("clients").delete().eq("id", client_id).execute()
-        _invalidate_clients_cache()
+        try:
+            fetch_clients.clear()  # type: ignore[attr-defined]
+        except Exception:
+            pass
         return True, "ok"
     except Exception as e:
         return False, str(e)
 
-# ---------- Sent lookups (for the report) ----------
+
+# ───────────────────────────── Sent & Tours lookups ─────────────────────────────
+
 @st.cache_data(ttl=120, show_spinner=False)
 def fetch_sent_for_client(client_norm: str, limit: int = 5000):
-    """
-    Returns: [{url, address, sent_at, campaign, mls_id, canonical, zpid}, ...]
-    """
     if not (_sb_ok() and client_norm.strip()):
         return []
     try:
@@ -152,66 +172,36 @@ def fetch_sent_for_client(client_norm: str, limit: int = 5000):
     except Exception:
         return []
 
-def address_text_from_url(url: str) -> str:
-    """Best-effort human address text from a Zillow URL when DB 'address' is empty."""
-    if not url:
-        return ""
-    u = unquote(url)
-    m = re.search(r"/homedetails/([^/]+)/\d{6,}_zpid/", u, re.I)
-    if m:
-        return re.sub(r"[-+]", " ", m.group(1)).strip().title()
-    m = re.search(r"/homes/([^/_]+)_rb/?", u, re.I)
-    if m:
-        return re.sub(r"[-+]", " ", m.group(1)).strip().title()
-    return ""
-
-# ---------- Tours cross-check (inline pill) ----------
 @st.cache_data(ttl=120, show_spinner=False)
-def _fetch_tour_map_for_client(client_norm: str):
+def fetch_toured_map(client_norm: str) -> Dict[str, Dict[str, str]]:
     """
-    Returns a dict: {address_slug: [ {date:'YYYY-MM-DD', start:'10:00 AM', end:'10:30 AM'}, ... ] }
-    Most-recent stop is first.
+    Returns { address_slug: { 'date': 'YYYY-MM-DD', 'start': '9:00 AM', 'end': '10:15 AM' } }
+    built from tours + tour_stops.
     """
+    out: Dict[str, Dict[str, str]] = {}
+    if not (_sb_ok() and client_norm.strip()):
+        return out
     try:
-        if not SUPABASE or not (client_norm or "").strip():
-            return {}
-        tours = SUPABASE.table("tours")\
-            .select("id,tour_date")\
-            .eq("client", client_norm.strip())\
-            .order("tour_date", desc=True)\
-            .limit(5000).execute().data or []
-        if not tours:
-            return {}
-        id_to_date = {t["id"]: t.get("tour_date") for t in tours}
-        tour_ids = [t["id"] for t in tours]
-
-        stops = SUPABASE.table("tour_stops")\
-            .select("tour_id,address,start,end")\
-            .in_("tour_id", tour_ids)\
-            .limit(20000).execute().data or []
-
-        by_slug = {}
-        for srow in stops:
-            slug = _slug_addr_for_match(srow.get("address", ""))
-            if not slug:
-                continue
-            item = {
-                "date": id_to_date.get(srow["tour_id"]),
-                "start": (srow.get("start") or ""),
-                "end": (srow.get("end") or "")
-            }
-            by_slug.setdefault(slug, []).append(item)
-
-        for slug, arr in by_slug.items():
-            arr.sort(key=lambda x: (x.get("date") or ""), reverse=True)
-        return by_slug
+        tours = SUPABASE.table("tours").select("id,tour_date").eq("client", client_norm.strip()).limit(2000).execute().data or []
+        ids = [t["id"] for t in tours if t.get("id")]
+        if not ids:
+            return out
+        stops = SUPABASE.table("tour_stops").select("tour_id,address,address_slug,start,end").in_("tour_id", ids).limit(10000).execute().data or []
+        id_to_date = {t["id"]: (t.get("tour_date") or "") for t in tours}
+        for s in stops:
+            slug = s.get("address_slug") or _slug_addr_for_match(s.get("address",""))
+            tdate = id_to_date.get(s.get("tour_id"), "")
+            if slug and tdate and slug not in out:
+                out[slug] = {"date": tdate, "start": s.get("start",""), "end": s.get("end","")}
+        return out
     except Exception:
-        return {}
+        return out
 
-# ---------- Row UI (name + ▦ ✎ ⟳ ⌫) ----------
+
+# ───────────────────────────── UI pieces ─────────────────────────────
+
 def _client_row_icons(name: str, norm: str, cid: int, active: bool):
-    # Single line with inline widgets aligned using columns
-    col_name, col_rep, col_ren, col_tog, col_del, col_sp = st.columns([8, 1, 1, 1, 1, 2])
+    col_name, col_rep, col_ren, col_tog, col_del, _ = st.columns([8, 1, 1, 1, 1, 2])
 
     with col_name:
         st.markdown(
@@ -222,8 +212,7 @@ def _client_row_icons(name: str, norm: str, cid: int, active: bool):
 
     with col_rep:
         if st.button("▦", key=f"rep_{cid}", help="Open report"):
-            _qp_set(report=norm, scroll="1")
-            _safe_rerun()
+            st.session_state["__client_report__"] = {"norm": norm, "name": name}
 
     with col_ren:
         if st.button("✎", key=f"rn_btn_{cid}", help="Rename"):
@@ -231,13 +220,10 @@ def _client_row_icons(name: str, norm: str, cid: int, active: bool):
 
     with col_tog:
         if st.button("⟳", key=f"tg_{cid}", help=("Deactivate" if active else "Activate")):
-            try:
-                rows = SUPABASE.table("clients").select("active").eq("id", cid).limit(1).execute().data or []
-                cur = rows[0]["active"] if rows else active
-                toggle_client_active(cid, (not cur))
-            except Exception:
-                toggle_client_active(cid, (not active))
-            _safe_rerun()
+            rows = SUPABASE.table("clients").select("active").eq("id", cid).limit(1).execute().data or []
+            cur = rows[0]["active"] if rows else active
+            toggle_client_active(cid, (not cur))
+            st.experimental_rerun()
 
     with col_del:
         if st.button("⌫", key=f"del_{cid}", help="Delete"):
@@ -253,7 +239,7 @@ def _client_row_icons(name: str, norm: str, cid: int, active: bool):
             if not ok:
                 st.warning(msg)
             st.session_state[f"__edit_{cid}"] = False
-            _safe_rerun()
+            st.experimental_rerun()
         if cc2.button("Cancel", key=f"rn_cancel_{cid}"):
             st.session_state[f"__edit_{cid}"] = False
         st.markdown("</div>", unsafe_allow_html=True)
@@ -265,148 +251,106 @@ def _client_row_icons(name: str, norm: str, cid: int, active: bool):
         if dc1.button("Confirm delete", key=f"del_yes_{cid}"):
             delete_client(cid)
             st.session_state[f"__del_{cid}"] = False
-            _safe_rerun()
+            st.experimental_rerun()
         if dc2.button("Cancel", key=f"del_no_{cid}"):
             st.session_state[f"__del_{cid}"] = False
         st.markdown("</div>", unsafe_allow_html=True)
 
     st.markdown("<div style='border-bottom:1px solid var(--row-border); margin:4px 0 2px 0;'></div>", unsafe_allow_html=True)
 
-# ---------- Client Report (with inline Toured pill) ----------
 def _render_client_report_view(client_display_name: str, client_norm: str):
-    """Report: hyperlink to Zillow with Campaign filter, Search, and inline 'Toured' date/time."""
     st.markdown(f"### Report for {escape(client_display_name)}", unsafe_allow_html=True)
 
-    colX, _ = st.columns([1, 3])
-    with colX:
-        if st.button("Close report", key=f"__close_report_{client_norm}"):
-            _qp_set()  # clear query params
-            _safe_rerun()
+    if st.button("Close report", key=f"__close_report_{client_norm}"):
+        st.session_state.pop("__client_report__", None)
+        st.experimental_rerun()
 
     rows = fetch_sent_for_client(client_norm)
     total = len(rows)
 
-    # Campaign filter
+    # Build 'toured' map for chips
+    toured_map = fetch_toured_map(client_norm)
+
+    # Filters
     seen = []
     for r in rows:
         c = (r.get("campaign") or "").strip()
         if c not in seen:
             seen.append(c)
     campaign_labels = ["All campaigns"] + [("— no campaign —" if c == "" else c) for c in seen]
-    campaign_keys = [None] + seen
+    campaign_keys   = [None] + seen
 
     colF1, colF2, colF3 = st.columns([1.2, 1.8, 1])
     with colF1:
-        sel_idx = st.selectbox(
-            "Filter by campaign",
-            list(range(len(campaign_labels))),
-            format_func=lambda i: campaign_labels[i],
-            index=0,
-            key=f"__camp_{client_norm}"
-        )
+        sel_idx = st.selectbox("Filter by campaign", list(range(len(campaign_labels))),
+                               format_func=lambda i: campaign_labels[i], index=0, key=f"__camp_{client_norm}")
         sel_campaign = campaign_keys[sel_idx]
     with colF2:
-        q = st.text_input(
-            "Search address / MLS / URL",
-            value="",
-            placeholder="e.g. 407 Woodall, 2501234, /homedetails/",
-            key=f"__q_{client_norm}"
-        )
+        q = st.text_input("Search address / MLS / URL", value="", placeholder="e.g. 407 Woodall, 2501234, /homedetails/", key=f"__q_{client_norm}")
         q_norm = q.strip().lower()
     with colF3:
         st.caption(f"{total} total logged")
 
     def _match(row) -> bool:
-        if sel_campaign is not None:
-            if (row.get("campaign") or "").strip() != sel_campaign:
-                return False
+        if sel_campaign is not None and (row.get("campaign") or "").strip() != sel_campaign:
+            return False
         if not q_norm:
             return True
         addr = (row.get("address") or "").lower()
-        mls = (row.get("mls_id") or "").lower()
-        url = (row.get("url") or "").lower()
+        mls  = (row.get("mls_id") or "").lower()
+        url  = (row.get("url") or "").lower()
         return (q_norm in addr) or (q_norm in mls) or (q_norm in url)
 
     rows_f = [r for r in rows if _match(r)]
     count = len(rows_f)
-    st.caption(f"{count} matching listing{'s' if count != 1 else ''}")
+    st.caption(f"{count} matching listing{'s' if count!=1 else ''}")
 
     if not rows_f:
         st.info("No results match the current filters.")
         return
 
-    # Build tour map once
-    tour_map = _fetch_tour_map_for_client(client_norm)
-
-    # Higher-contrast pill styling (readable in both themes)
-    tour_style = (
-        "display:inline-block;margin-left:8px;padding:2px 6px;border-radius:999px;"
-        "font-size:12px;font-weight:700;background:#dbeafe;color:#1e40af;"
-        "border:1px solid rgba(30,64,175,.25);"
-    )
-
     items_html = []
     for r in rows_f:
         url = (r.get("url") or "").strip()
-        addr_text = (r.get("address") or "").strip() or address_text_from_url(url) or "Listing"
+        addr = (r.get("address") or "").strip() or address_text_from_url(url) or "Listing"
         sent_at = r.get("sent_at") or ""
         camp = (r.get("campaign") or "").strip()
 
-        camp_chip = ""
-        if sel_campaign is None and camp:
-            camp_chip = (
-                "<span style='font-size:11px;font-weight:700;padding:2px 6px;"
-                "border-radius:999px;background:#e2e8f0;margin-left:6px;'>"
-                f"{escape(camp)}</span>"
-            )
+        # Compute slug from address (or from URL-derived address)
+        slug = _slug_addr_for_match(addr if addr else address_text_from_url(url))
+        toured_html = ""
+        if slug in toured_map:
+            tm = toured_map[slug]
+            dt = tm.get("date","")
+            start = tm.get("start","")
+            end   = tm.get("end","")
+            toured_html = f" {_toured_chip(dt)}{_time_chip(start, end)}"
 
-        # Inline tour pill (most recent stop)
-        slug = _slug_addr_for_match(addr_text)
-        tlist = tour_map.get(slug) or []
-        tour_pill = ""
-        if tlist:
-            most_recent = tlist[0]
-            d = (most_recent.get("date") or "")
-            s = (most_recent.get("start") or "")
-            e = (most_recent.get("end") or "")
-            time_txt = (f"{s}–{e}" if s and e else (s or e or ""))
-            if d or time_txt:
-                label = "🕑 Toured " + " ".join(x for x in [d, time_txt] if x).strip()
-                tour_pill = f"<span style='{tour_style}' title='This property was toured'>{escape(label)}</span>"
+        chip = ""
+        if sel_campaign is None and camp:
+            chip = f"<span style='font-size:11px; font-weight:700; padding:2px 6px; border-radius:999px; background:#e2e8f0; margin-left:6px;'>{escape(camp)}</span>"
 
         items_html.append(
             f"""<li>
-                  <a href="{escape(url)}" target="_blank" rel="noopener">{escape(addr_text)}</a>
-                  {tour_pill}
-                  <span style="color:#64748b;font-size:12px;margin-left:6px;">{escape(sent_at)}</span>
-                  {camp_chip}
+                  <a href="{escape(url)}" target="_blank" rel="noopener">{escape(addr)}</a>
+                  {toured_html}
+                  <span style="color:#64748b; font-size:12px; margin-left:6px;">{escape(sent_at)}</span>
+                  {chip}
                 </li>"""
         )
 
-    html = "<ul class='link-list'>" + "\n".join(items_html) + "</ul>"
-    st.markdown(html, unsafe_allow_html=True)
+    st.markdown("<ul class='link-list'>" + "\n".join(items_html) + "</ul>", unsafe_allow_html=True)
 
-    # Export filtered report
-    with st.expander("Export filtered report"):
-        import pandas as pd
-        df = pd.DataFrame(rows_f)
-        csv_buf = io.StringIO()
-        df.to_csv(csv_buf, index=False)
-        st.download_button(
-            "Download CSV",
-            data=csv_buf.getvalue(),
-            file_name=f"client_report_{client_norm}_{datetime.utcnow().strftime('%Y%m%d%H%M%S')}.csv",
-            mime="text/csv",
-            use_container_width=False
-        )
 
-# ---------- Public entry ----------
+# ───────────────────────────── Main ─────────────────────────────
+
 def render_clients_tab():
     st.subheader("Clients")
-    st.caption("")
+    st.caption("Manage clients and view sent listings. Listings that were toured are tagged TOURED with date/time.")
 
-    report_norm_qp = _qp_get("report", "")
-    want_scroll = _qp_get("scroll", "") in ("1", "true", "yes")
+    if not _sb_ok():
+        st.warning("Supabase is not configured.")
+        return
 
     all_clients = fetch_clients(include_inactive=True)
     active = [c for c in all_clients if c.get("active")]
@@ -420,7 +364,7 @@ def render_clients_tab():
             st.write("_No active clients_")
         else:
             for c in active:
-                _client_row_icons(c["name"], c.get("name_norm", ""), c["id"], active=True)
+                _client_row_icons(c["name"], c.get("name_norm",""), c["id"], active=True)
 
     with colB:
         st.markdown("### Inactive", unsafe_allow_html=True)
@@ -428,21 +372,9 @@ def render_clients_tab():
             st.write("_No inactive clients_")
         else:
             for c in inactive:
-                _client_row_icons(c["name"], c.get("name_norm", ""), c["id"], active=False)
+                _client_row_icons(c["name"], c.get("name_norm",""), c["id"], active=False)
 
-    st.markdown('<div id="report_anchor"></div>', unsafe_allow_html=True)
-    if report_norm_qp:
-        display_name = next((c["name"] for c in all_clients if c.get("name_norm") == report_norm_qp), report_norm_qp)
+    rep = st.session_state.get("__client_report__")
+    if rep:
         st.markdown("---")
-        _render_client_report_view(display_name, report_norm_qp)
-        if want_scroll:
-            st.components.v1.html(
-                """
-                <script>
-                  const el = parent.document.getElementById("report_anchor");
-                  if (el) { el.scrollIntoView({behavior: "smooth", block: "start"}); }
-                </script>
-                """,
-                height=0,
-            )
-            _qp_set(report=report_norm_qp)
+        _render_client_report_view(rep.get("name",""), rep.get("norm",""))
