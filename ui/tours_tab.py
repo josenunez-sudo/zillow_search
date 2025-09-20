@@ -400,37 +400,32 @@ def render_tours_tab(state: dict):
                     else:
                         st.error(msgc)
 
-        NO_CLIENT = "➤ No client (show ALL, no logging)"   # first item stays 'no logging'
+        NO_CLIENT = "➤ No client (show ALL, no logging)"   # first item & ALWAYS the default
         add_options = [NO_CLIENT] + client_names
 
-        # Default selection: first REAL client if any; otherwise 0 (No client)
-        default_idx = 1 if len(add_options) > 1 else 0
+        # <<< CHANGE: Always default to 'No client' (index 0) >>>
         sel_idx = st.selectbox(
             "Add all stops to client (optional)",
             list(range(len(add_options))),
             format_func=lambda i: add_options[i],
-            index=default_idx,
+            index=0,                           # <--- always default to No client
             key="__tour_client_sel__"
         )
 
         # Client display name dropdown (real clients only)
-        # Default to guessed client if present; else mirror the selected real client.
+        # Default to guessed client if present; else just first in list.
         display_default = 0
         if client_names:
             guessed_idx = next((i for i, nm in enumerate(client_names) if _norm_tag(nm) == _norm_tag(client_guess)), None)
             if guessed_idx is not None:
                 display_default = guessed_idx
-            else:
-                if sel_idx >= 1:
-                    display_default = sel_idx - 1
         display_choice = st.selectbox(
             "Client display name (for the tour record)",
             client_names if client_names else ["—"],
-            index=display_default if client_names else 0,
+            index=(display_default if client_names else 0),
             key="__tour_display_sel__"
         )
 
-        # Button is ALWAYS clickable; we validate selection on click.
         add_clicked = st.button("Add all stops to selected client", use_container_width=True, key="__add_all_btn__")
 
         if add_clicked:
@@ -494,4 +489,3 @@ def render_tours_tab(state: dict):
                                     st.experimental_rerun()
                             else:
                                 st.warning("Failed to remove stop.")
-
