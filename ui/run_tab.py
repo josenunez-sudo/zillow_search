@@ -1,5 +1,6 @@
 # ui/run_tab.py
-# Self-contained Run tab with your original behavior + clickable image thumbnails.
+# Run tab with: hyperlinks-only results, clickable thumbnails, and TOURED cross-check via Supabase tours/tour_stops.
+
 import os, csv, io, re, time, json, asyncio
 from datetime import datetime
 from typing import List, Dict, Any, Optional, Tuple
@@ -65,6 +66,34 @@ def _norm_tag(s: str) -> str:
 def _sb_ok() -> bool:
     try: return bool(SUPABASE)
     except NameError: return False
+
+# Slugify address exactly like the DB generated column
+SLUG_KEEP = re.compile(r"[^\w\s,-]")
+def address_to_slug(addr: str) -> str:
+    if not addr: return ""
+    s = SLUG_KEEP.sub("", addr.lower())
+    s = re.sub(r"\s+", "-", s.strip())
+    return s
+
+def address_text_from_url(url: str) -> str:
+    if not url: return ""
+    from urllib.parse import unquote
+    u = unquote(url)
+    m = re.search(r"/homedetails/([^/]+)/\d{6,}_zpid/", u, re.I)
+    if m:
+        return re.sub(r"[-+]", " ", m.group(1)).strip().title()
+    m = re.search(r"/homes/([^/_]+)_rb/?", u, re.I)
+    if m:
+        return re.sub(r"[-+]", " ", m.group(1)).strip().title()
+    return ""
+
+def result_to_slug(r: Dict[str, Any]) -> str:
+    # Prefer explicit input address; fall back to Zillow slug -> address.
+    addr = (r.get("input_address") or "").strip()
+    if not addr:
+        url = (r.get("preview_url") or r.get("zillow_url") or r.get("display_url") or "").strip()
+        addr = address_text_from_url(url)
+    return address_to_slug(addr)
 
 # URL helpers
 URL_KEYS = {"url","link","source url","source_url","listing url","listing_url","property url","property_url","href"}
@@ -205,7 +234,7 @@ def clean_land_street(street:str) -> str:
     s = re.sub(r"^\s*0[\s\-]+", "", s)
     tokens = re.split(r"[\s\-]+", s)
     if tokens and tokens[0].lower() in LAND_LEAD_TOKENS:
-        tokens = [t for t in tokens[1:] if t]; s = " ".join(tokens)
+        tokens = [t for t in tokens [1:] if t]; s = " ".join(tokens)
     s_lower = f" {s.lower()} "
     for pat,repl in HWY_EXPAND.items(): s_lower = re.sub(pat, f" {repl} ", s_lower)
     s = re.sub(r"\s+", " ", s_lower).strip()
@@ -643,25 +672,69 @@ def get_already_sent_maps(client_tag: str):
     except Exception:
         return set(), set(), {}, {}
 
+# ---------- NEW: Tours cross-check ----------
+@st.cache_data(ttl=120, show_spinner=False)
+def get_tour_slug_map(client_tag: str) -> Dict[str, Dict[str, str]]:
+    """
+    Returns { address_slug: {date: 'YYYY-MM-DD' or None, start: '10:00 AM', end:'10:15 AM'} }
+    for all stops across this client's tours (latest date wins per slug).
+    """
+    if not (_supabase_available() and client_tag.strip()):
+        return {}
+    try:
+        tours = SUPABASE.table("tours")\
+            .select("id,tour_date")\
+            .eq("client", client_tag.strip())\
+            .order("tour_date", desc=True)\
+            .limit(5000)\
+            .execute().data or []
+        if not tours: return {}
+        ids = [t["id"] for t in tours if t.get("id")]
+        stops: List[Dict[str, Any]] = []
+        for i in range(0, len(ids), 50):
+            batch = ids[i:i+50]
+            resp = SUPABASE.table("tour_stops")\
+                .select("tour_id,address,address_slug,start,end,deeplink")\
+                .in_("tour_id", batch)\
+                .limit(20000)\
+                .execute()
+            stops.extend(resp.data or [])
+        tdate = {t["id"]: (t.get("tour_date") or None) for t in tours}
+        by_slug: Dict[str, Dict[str,str]] = {}
+        for s in stops:
+            slug = (s.get("address_slug") or address_to_slug(s.get("address","")) or "").strip()
+            if not slug: continue
+            info = {"date": (tdate.get(s.get("tour_id")) or ""), "start": s.get("start","") or "", "end": s.get("end","") or ""}
+            prev = by_slug.get(slug)
+            # Keep the most recent date if multiple tours
+            if not prev or (info["date"] and prev.get("date") and str(info["date"]) > str(prev.get("date"))):
+                by_slug[slug] = info
+            elif not prev:
+                by_slug[slug] = info
+        return by_slug
+    except Exception:
+        return {}
+
 def mark_duplicates(results, canon_set, zpid_set, canon_info, zpid_info):
     for r in results:
         url = (r.get("preview_url") or r.get("zillow_url") or r.get("display_url") or "").strip()
         if not url:
-            r["already_sent"] = False; continue
-        canon, zpid = canonicalize_zillow(url)
-        reason = None; sent_when = ""; sent_url = ""
-        if canon and canon in canon_set:
-            reason = "canonical"; meta = canon_info.get(canon, {})
-            sent_when, sent_url = meta.get("sent_at",""), meta.get("url","")
-        elif zpid and zpid in zpid_set:
-            reason = "zpid"; meta = zpid_info.get(zpid, {})
-            sent_when, sent_url = meta.get("sent_at",""), meta.get("url","")
-        r["canonical"] = canon
-        r["zpid"] = zpid
-        r["already_sent"] = bool(reason)
-        r["dup_reason"] = reason
-        r["dup_sent_at"] = sent_when
-        r["dup_original_url"] = sent_url
+            r["already_sent"] = False
+        else:
+            canon, zpid = canonicalize_zillow(url)
+            reason = None; sent_when = ""; sent_url = ""
+            if canon and canon in canon_set:
+                reason = "canonical"; meta = canon_info.get(canon, {})
+                sent_when, sent_url = meta.get("sent_at",""), meta.get("url","")
+            elif zpid and zpid in zpid_set:
+                reason = "zpid"; meta = zpid_info.get(zpid, {})
+                sent_when, sent_url = meta.get("sent_at",""), meta.get("url","")
+            r["canonical"] = canon
+            r["zpid"] = zpid
+            r["already_sent"] = bool(reason)
+            r["dup_reason"] = reason
+            r["dup_sent_at"] = sent_when
+            r["dup_original_url"] = sent_url
     return results
 
 def log_sent_rows(results: List[Dict[str, Any]], client_tag: str, campaign_tag: str):
@@ -728,7 +801,7 @@ def build_output(rows: List[Dict[str, Any]], fmt: str, use_display: bool = True,
         return r.get("preview_url") or r.get("zillow_url") or r.get("display_url") or ""
 
     if fmt == "csv":
-        fields = ["input_address","mls_id","url","status","price","beds","baths","sqft","already_sent","dup_reason","dup_sent_at"]
+        fields = ["input_address","mls_id","url","status","price","beds","baths","sqft","already_sent","dup_reason","dup_sent_at","toured","toured_date","toured_start","toured_end"]
         if include_notes:
             fields += ["summary","highlights","remarks"]
         s = io.StringIO(); w = csv.DictWriter(s, fieldnames=fields); w.writeheader()
@@ -743,7 +816,6 @@ def build_output(rows: List[Dict[str, Any]], fmt: str, use_display: bool = True,
         for r in rows:
             u = pick_url(r)
             if not u: continue
-            # Keep anchor text = URL for clean sharing/unfurls
             items.append(f'<li><a href="{escape(u)}" target="_blank" rel="noopener">{escape(u)}</a></li>')
         return "<ul>\n" + "\n".join(items) + "\n</ul>\n", "text/html"
 
@@ -785,8 +857,7 @@ def render_run_tab(state: dict):
     with c1:
         use_shortlinks = st.checkbox("Use short links (Bitly)", value=False, help="Optional tracking; sharing uses clean Zillow links.")
     with c2:
-        # Default UNCHECKED
-        enrich_details = st.checkbox("Enrich details", value=False)
+        enrich_details = st.checkbox("Enrich details", value=False)  # default unchecked
     with c3:
         show_details = st.checkbox("Show details under results", value=False)
     with c4:
@@ -869,15 +940,25 @@ def render_run_tab(state: dict):
             if not href:
                 continue
             safe_href = escape(href)
-            link_txt = href  # keep the URL text for best SMS unfurls
+            link_txt = href  # keep URL text for best SMS unfurls
 
+            # Badges: duplicate/new + toured
             badge_html = ""
             if client_selected:
                 if r.get("already_sent"):
                     tip = f"Duplicate ({escape(r.get('dup_reason','') or '-')}); sent {escape(r.get('dup_sent_at') or '-')}"
-                    badge_html = f' <span class="badge dup" title="{tip}">Duplicate</span>'
+                    badge_html += f' <span class="badge dup" title="{tip}">Duplicate</span>'
                 else:
-                    badge_html = ' <span class="badge new" title="New for this client">NEW</span>'
+                    badge_html += ' <span class="badge new" title="New for this client">NEW</span>'
+                if r.get("toured"):
+                    dt = str(r.get("toured_date") or "")
+                    tm = str(r.get("toured_start") or "")
+                    title = ("Toured " + (dt + (" " + tm if tm else ""))).strip()
+                    badge_html += (
+                        ' <span class="badge tour" '
+                        'style="background:#e0f2fe;color:#075985;border:1px solid rgba(7,89,133,.35);" '
+                        f'title="{escape(title)}">TOURED</span>'
+                    )
 
             li_html.append(
                 f'<li style="margin:0.2rem 0;"><a href="{safe_href}" target="_blank" rel="noopener">{escape(link_txt)}</a>{badge_html}</li>'
@@ -928,10 +1009,11 @@ def render_run_tab(state: dict):
         st.markdown("#### Results")
         results_list_with_copy_all(results, client_selected=client_selected)
 
-        # Table removed by default (no dead space). Toggle above if you want it.
+        # Optional table
         if table_view:
             import pandas as pd
-            cols = ["already_sent","dup_reason","dup_sent_at","display_url","zillow_url","preview_url","status","price","beds","baths","sqft","mls_id","input_address"]
+            cols = ["already_sent","dup_reason","dup_sent_at","toured","toured_date","toured_start","toured_end",
+                    "display_url","zillow_url","preview_url","status","price","beds","baths","sqft","mls_id","input_address"]
             df = pd.DataFrame([{c: r.get(c) for c in cols} for r in results])
             st.dataframe(df, use_container_width=True, hide_index=True)
 
@@ -945,7 +1027,7 @@ def render_run_tab(state: dict):
         st.download_button("Export", data=payload, file_name=f"address_alchemist{tag}_{ts}.{fmt}", mime=mime, use_container_width=True)
         st.session_state["__results__"] = {"results": results, "fmt": fmt}
 
-        # Thumbs (now clickable images)
+        # Thumbs (clickable)
         thumbs=[]
         for r in results:
             img = r.get("image_url")
@@ -962,7 +1044,17 @@ def render_run_tab(state: dict):
                     url = r.get("preview_url") or r.get("zillow_url") or r.get("display_url") or "#"
                     alt = addr or (f"MLS# {mls_id}" if mls_id else "Listing")
 
-                    # Clickable image → listing
+                    toured_badge = ""
+                    if r.get("toured"):
+                        dt = str(r.get("toured_date") or "")
+                        tm = str(r.get("toured_start") or "")
+                        title = ("Toured " + (dt + (" " + tm if tm else ""))).strip()
+                        toured_badge = (
+                            f'<span class="badge tour" '
+                            f'style="background:#e0f2fe;color:#075985;border:1px solid rgba(7,89,133,.35);" '
+                            f'title="{escape(title)}">TOURED</span>'
+                        )
+
                     st.markdown(
                         f"""
                         <a href="{escape(url)}" target="_blank" rel="noopener" style="text-decoration:none;">
@@ -974,6 +1066,7 @@ def render_run_tab(state: dict):
                           <a href="{escape(url)}" target="_blank" rel="noopener">
                             {escape(addr) if addr else "View listing"}
                           </a>
+                          {toured_badge}
                         </div>
                         """,
                         unsafe_allow_html=True
@@ -1044,9 +1137,19 @@ def render_run_tab(state: dict):
                     r["display_url"] = display or base
 
             client_selected = bool(client_tag.strip())
+            # ---- NEW: tours map and mark
+            tour_map = get_tour_slug_map(client_tag) if client_selected else {}
+
             if client_selected:
                 canon_set, zpid_set, canon_info, zpid_info = get_already_sent_maps(client_tag)
                 results = mark_duplicates(results, canon_set, zpid_set, canon_info, zpid_info)
+                # mark toured
+                for r in results:
+                    info = tour_map.get(result_to_slug(r), {})
+                    r["toured"] = bool(info)
+                    r["toured_date"] = info.get("date") if info else ""
+                    r["toured_start"] = info.get("start") if info else ""
+                    r["toured_end"] = info.get("end") if info else ""
                 if only_show_new:
                     results = [r for r in results if not r.get("already_sent")]
                 if SUPABASE and results:
@@ -1055,6 +1158,7 @@ def render_run_tab(state: dict):
             else:
                 for r in results:
                     r["already_sent"] = False
+                    r["toured"] = False
 
             st.success(f"Processed {len(results)} item(s)" + (f" — CSV rows read: {csv_count}" if file is not None else ""))
 
@@ -1067,6 +1171,7 @@ def render_run_tab(state: dict):
     data = st.session_state.get("__results__") or {}
     results = data.get("results") or []
     if results and not clicked:
+        client_selected = bool(_norm_tag(st.session_state.get("client_tag","") or "").strip())  # best-effort
         _render_results_and_downloads(results, client_tag, campaign_tag, include_notes=False, client_selected=bool(client_tag.strip()))
     else:
         if not clicked:
