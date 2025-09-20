@@ -1,9 +1,8 @@
 # utils/address.py
-from __future__ import annotations
 import re
-from typing import Dict, Any, List, Optional, Set
+from typing import Dict, Any, List, Optional
 
-# --- Key sets used in CSV / dict extraction ---
+# Column/key aliases
 ADDR_PRIMARY = {"full_address","address","property address","property_address","site address","site_address",
                 "street address","street_address","listing address","listing_address","location"}
 NUM_KEYS   = {"street #","street number","street_no","streetnum","house_number","number","streetnumber"}
@@ -17,22 +16,18 @@ ZIP_KEYS   = {"zip","zip code","postal code","postalcode","zip_code","postal_cod
 MLS_ID_KEYS   = {"mls","mls id","mls_id","mls #","mls#","mls number","mlsnumber","listing id","listing_id"}
 MLS_NAME_KEYS = {"mls name","mls board","mls provider","source","source mls","mls source"}
 PHOTO_KEYS = {"photo","image","photo url","image url","picture","thumbnail","thumb","img","img url","img_url"}
-URL_KEYS = {"url","link","source url","source_url","listing url","listing_url","property url","property_url","href"}
+URL_KEYS   = {"url","link","source url","source_url","listing url","listing_url","property url","property_url","href"}
 
 def norm_key(k:str) -> str: return re.sub(r"\s+"," ", (k or "").strip().lower())
 
-def get_first_by_keys(row: Dict[str, Any], keys: Set[str]) -> str:
+def get_first_by_keys(row, keys):
     for k in row.keys():
         if norm_key(k) in keys:
             v = str(row[k]).strip()
             if v: return v
     return ""
 
-def is_probable_url(s: str) -> bool:
-    s = (s or "").strip()
-    return s.startswith("http://") or s.startswith("https://") or re.match(r"^[a-z]+://", s) is not None
-
-def extract_components(row: Dict[str,Any]) -> Dict[str,str]:
+def extract_components(row):
     n = { norm_key(k): (str(v).strip() if v is not None else "") for k,v in row.items() }
     for k in n.keys():
         if k in ADDR_PRIMARY and n[k]:
@@ -99,3 +94,13 @@ def generate_address_variants(street, city, state, zipc, defaults):
         parts = [sv] + [p for p in [city, st, z] if p]
         out.append(" ".join(parts))
     return [s for s in dict.fromkeys(out) if s.strip()]
+
+def is_probable_url(s: str) -> bool:
+    s = (s or "").strip()
+    return s.startswith("http://") or s.startswith("https://") or re.match(r"^[a-z]+://", s) is not None
+
+# Re-export optional usaddress handle for callers that want to use it
+try:
+    import usaddress  # type: ignore
+except Exception:
+    usaddress = None  # type: ignore
