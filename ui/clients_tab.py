@@ -164,9 +164,12 @@ def _dedupe_by_property(rows: List[Dict[str,Any]]) -> List[Dict[str,Any]]:
 
 # ================= Lazy Streamlit bits (run-time only) =================
 def _inject_css_once():
-    if st.session_state.get("__clients_css_injected__"):
+    # bump this when you change styles so Streamlit reinjects CSS
+    CSS_VER = "clients-css-2025-09-21a"
+    if st.session_state.get("__clients_css_version__") == CSS_VER:
         return
-    st.session_state["__clients_css_injected__"] = True
+    st.session_state["__clients_css_version__"] = CSS_VER
+
     st.markdown("""
     <style>
     :root { --row-border:#e2e8f0; --ink:#0f172a; --muted:#475569; }
@@ -588,22 +591,66 @@ def render_clients_tab():
     report_norm_qp = _qp_get("report", "")
     want_scroll    = _qp_get("scroll", "") in ("1","true","yes")
 
+    # Fetch once
     all_clients = fetch_clients(include_inactive=True)
     active   = [c for c in all_clients if c.get("active")]
     inactive = [c for c in all_clients if not c.get("active")]
 
     colA, colB = st.columns(2)
+
+    # ---- Active side (dropdown) ----
     with colA:
         st.markdown("### Active", unsafe_allow_html=True)
-        if not active: st.write("_No active clients_")
-        for c in active:
+        if not active:
+            st.write("_No active clients_")
+        else:
+            # Persist selection across reruns
+            active_idx_key = "__sel_active_client_idx__"
+            if active_idx_key not in st.session_state:
+                st.session_state[active_idx_key] = 0
+
+            # Clamp index in case the list size changed after a toggle/delete
+            if st.session_state[active_idx_key] >= len(active):
+                st.session_state[active_idx_key] = 0
+
+            sel_a = st.selectbox(
+                "Pick active client",
+                options=list(range(len(active))),
+                format_func=lambda i: active[i]["name"],
+                index=st.session_state[active_idx_key],
+                key="__sel_active_client__"
+            )
+            st.session_state[active_idx_key] = sel_a
+
+            c = active[sel_a]
             _client_row_icons(c["name"], c.get("name_norm",""), c["id"], active=True)
+
+    # ---- Inactive side (dropdown) ----
     with colB:
         st.markdown("### Inactive", unsafe_allow_html=True)
-        if not inactive: st.write("_No inactive clients_")
-        for c in inactive:
+        if not inactive:
+            st.write("_No inactive clients_")
+        else:
+            inactive_idx_key = "__sel_inactive_client_idx__"
+            if inactive_idx_key not in st.session_state:
+                st.session_state[inactive_idx_key] = 0
+
+            if st.session_state[inactive_idx_key] >= len(inactive):
+                st.session_state[inactive_idx_key] = 0
+
+            sel_i = st.selectbox(
+                "Pick inactive client",
+                options=list(range(len(inactive))),
+                format_func=lambda i: inactive[i]["name"],
+                index=st.session_state[inactive_idx_key],
+                key="__sel_inactive_client__"
+            )
+            st.session_state[inactive_idx_key] = sel_i
+
+            c = inactive[sel_i]
             _client_row_icons(c["name"], c.get("name_norm",""), c["id"], active=False)
 
+    # ---- Inline report stays the same ----
     st.markdown('<div id="report_anchor"></div>', unsafe_allow_html=True)
     if report_norm_qp:
         display_name = next((c["name"] for c in all_clients if c.get("name_norm")==report_norm_qp), report_norm_qp)
