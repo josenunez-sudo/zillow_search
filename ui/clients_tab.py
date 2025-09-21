@@ -1,13 +1,108 @@
 # ui/clients_tab.py
-import os, re
+import os, re, io
 from datetime import datetime
 from html import escape
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 
 import streamlit as st
 from supabase import create_client, Client
 
-# ---------------- Base wiring ----------------
+# =====================
+# Styles (icons + rows)
+# =====================
+st.markdown("""
+<style>
+:root { --row-border:#e2e8f0; --muted:#64748b; }
+html[data-theme="dark"], .stApp [data-theme="dark"] { --row-border:#0b1220; --muted:#cbd5e1; }
+
+.client-row { display:flex; align-items:center; justify-content:space-between; padding:10px 8px; border-bottom:1px solid var(--row-border); }
+.client-left { display:flex; align-items:center; gap:8px; min-width:0; }
+.client-name { font-weight:700; color:#111827; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+html[data-theme="dark"] .client-name { color:#fff; }
+.pill { font-size:11px; font-weight:800; padding:2px 10px; border-radius:999px; }
+.pill.active {
+  background: linear-gradient(180deg, #dcfce7 0%, #bbf7d0 100%);
+  color:#166534; border:1px solid rgba(5,150,105,.35);
+}
+html[data-theme="dark"] .pill.active {
+  background: linear-gradient(180deg, #064e3b 0%, #065f46 100%);
+  color:#a7f3d0; border-color:rgba(167,243,208,.35);
+}
+
+.iconbar { display:flex; align-items:center; gap:8px; }
+.iconbar .stButton > button {
+  min-width: 28px; height: 28px; padding:0 8px;
+  border-radius: 8px; border:1px solid rgba(0,0,0,.08);
+  font-weight:700; line-height:1; cursor:pointer;
+  background:#f8fafc; color:#64748b;
+  transition: transform .08s ease, box-shadow .12s ease, filter .08s ease;
+}
+html[data-theme="dark"] .iconbar .stButton > button {
+  background:#0f172a; color:#cbd5e1; border-color:rgba(255,255,255,.08);
+}
+.iconbar .stButton > button:hover { transform: translateY(-1px); }
+.iconbar .stButton > button:active { transform: translateY(0) scale(.98); }
+
+/* Report list */
+.report-item { margin:0.2rem 0; }
+.report-meta { color:var(--muted); font-size:12px; margin-left:6px; }
+.badge { display:inline-block; font-size:11px; font-weight:800; padding:2px 6px; border-radius:999px; margin-left:6px; }
+.badge.toured { background:#e0f2fe; color:#075985; border:1px solid #7dd3fc; }
+.badge.dup    { background:#fee2e2; color:#991b1b; border:1px solid #fecaca; }
+.section-rule { border-bottom:1px solid var(--row-border); margin:8px 0 6px 0; }
+</style>
+""", unsafe_allow_html=True)
+
+# =====================
+# Small utilities
+# =====================
+def _safe_rerun():
+    try:
+        st.rerun()
+    except Exception:
+        try:
+            st.experimental_rerun()
+        except Exception:
+            pass
+
+def _norm_tag(s: str) -> str:
+    return re.sub(r"\s+", " ", (s or "").strip()).lower()
+
+def _slug_addr(addr: str) -> str:
+    a = (addr or "").strip().lower()
+    a = re.sub(r"[^\w\s,-]", "", a).replace(",", "")
+    return re.sub(r"\s+", "-", a).strip("-")
+
+# ==============
+# Query params
+# ==============
+def _qp_get(name, default=None):
+    try:
+        qp = st.query_params
+        val = qp.get(name, default)
+        if isinstance(val, list) and val:
+            return val[0]
+        return val
+    except Exception:
+        qp = st.experimental_get_query_params()
+        return (qp.get(name, [default]) or [default])[0]
+
+def _qp_set(**kwargs):
+    """Use ONLY one API per run to avoid Streamlit warning."""
+    try:
+        if kwargs:
+            st.query_params.update(kwargs)
+        else:
+            st.query_params.clear()
+    except Exception:
+        if kwargs:
+            st.experimental_set_query_params(**kwargs)
+        else:
+            st.experimental_set_query_params()
+
+# =====================
+# Supabase client
+# =====================
 @st.cache_resource
 def get_supabase() -> Optional[Client]:
     try:
@@ -21,108 +116,18 @@ def get_supabase() -> Optional[Client]:
 
 SUPABASE = get_supabase()
 
-def _safe_rerun():
+def _sb_ok() -> bool:
     try:
-        st.rerun()
+        return bool(SUPABASE)
     except Exception:
-        try:
-            st.experimental_rerun()
-        except Exception:
-            pass
+        return False
 
-def _stay_on_clients():
-    st.session_state["__active_tab__"] = "Clients"
-
-def _norm_tag(s: str) -> str:
-    return re.sub(r"\s+", " ", (s or "").strip()).lower()
-
-# ---------------- Address normalization (dedupe key) ----------------
-SUFFIX_MAP = {
-    "st": "street", "street": "street",
-    "rd": "road", "road": "road",
-    "ave": "avenue", "av": "avenue", "avenue": "avenue",
-    "blvd": "boulevard", "boulevard": "boulevard",
-    "dr": "drive", "drive": "drive",
-    "ln": "lane", "lane": "lane",
-    "ct": "court", "court": "court",
-    "pl": "place", "place": "place",
-    "ter": "terrace", "terrace": "terrace",
-    "hwy": "highway", "highway": "highway",
-    "cir": "circle", "circle": "circle",
-    "pkwy": "parkway", "parkway": "parkway",
-    "sq": "square", "square": "square",
-}
-DIR_MAP = {
-    "n": "north", "s": "south", "e": "east", "w": "west",
-    "north": "north", "south": "south", "east": "east", "west": "west"
-}
-
-def _slug_addr(s: str) -> str:
-    s = (s or "").strip().lower()
-    s = re.sub(r"[^\w\s,/-]", " ", s)
-    s = re.sub(r"\s+", " ", s).strip()
-    return re.sub(r"[\s,/]+", "-", s)
-
-def _normalize_address_strong(addr: str) -> str:
-    """
-    Normalize an address to a single, dedupe-friendly key:
-      - lowercase, remove punctuation noise
-      - expand directions (E->east) and suffixes (st->street)
-      - keep city, state, zip if present
-    """
-    s = (addr or "").strip().lower()
-    if not s:
-        return ""
-    s = re.sub(r"[^\w\s,/-]", " ", s)
-    s = re.sub(r"\s+", " ", s).strip()
-    toks = s.replace(",", " , ").split()
-    out = []
-    for t in toks:
-        if t == ",":
-            out.append(",")
-            continue
-        if t in DIR_MAP:
-            out.append(DIR_MAP[t]); continue
-        if t in SUFFIX_MAP:
-            out.append(SUFFIX_MAP[t]); continue
-        out.append(t)
-    # re-join with commas normalized
-    s2 = " ".join(out)
-    s2 = re.sub(r"\s*,\s*", ", ", s2)
-    s2 = re.sub(r"\s+", " ", s2).strip()
-    return _slug_addr(s2)
-
-def _address_from_url_fallback(url: str) -> str:
-    """
-    If DB 'address' is empty, derive an address-like string from a Zillow URL:
-      - /homedetails/<slug>/<zpid>/
-      - /homes/<slug>_rb/
-    """
-    u = (url or "")
-    m = re.search(r"/homedetails/([^/]+)/\d{6,}_zpid/", u, re.I)
-    if m:
-        return m.group(1).replace("-", " ")
-    m = re.search(r"/homes/([^/_]+)_rb/?", u, re.I)
-    if m:
-        return m.group(1).replace("-", " ")
-    return ""
-
-def _property_key_from_row(row: Dict[str, Any]) -> str:
-    """
-    NEW: Always dedupe by normalized ADDRESS key (never by raw canonical URL).
-    We still parse from URL if the address field is blank.
-    This collapses /homes/ variations (st vs street, commas, capitalization, etc).
-    """
-    addr = (row.get("address") or "").strip()
-    if not addr:
-        addr = _address_from_url_fallback(row.get("url") or "")
-    return _normalize_address_strong(addr)
-
-# ---------------- Data access ----------------
+# =====================
+# DB helpers (clients)
+# =====================
 @st.cache_data(ttl=60, show_spinner=False)
 def fetch_clients(include_inactive: bool = False):
-    if not SUPABASE:
-        return []
+    if not _sb_ok(): return []
     try:
         rows = SUPABASE.table("clients").select("id,name,name_norm,active").order("name", desc=False).execute().data or []
         rows = [r for r in rows if r.get("name_norm") != _norm_tag("test test")]
@@ -130,9 +135,48 @@ def fetch_clients(include_inactive: bool = False):
     except Exception:
         return []
 
+def _invalidate_clients_cache():
+    try: fetch_clients.clear()  # type: ignore[attr-defined]
+    except Exception: pass
+
+def toggle_client_active(client_id: int, new_active: bool):
+    if not _sb_ok() or not client_id: return False, "Not configured"
+    try:
+        SUPABASE.table("clients").update({"active": new_active}).eq("id", client_id).execute()
+        _invalidate_clients_cache()
+        return True, "ok"
+    except Exception as e:
+        return False, str(e)
+
+def rename_client(client_id: int, new_name: str):
+    if not _sb_ok() or not client_id or not (new_name or "").strip(): return False, "Bad input"
+    try:
+        new_norm = _norm_tag(new_name)
+        existing = SUPABASE.table("clients").select("id").eq("name_norm", new_norm).limit(1).execute().data or []
+        if existing and existing[0]["id"] != client_id:
+            return False, "A client with that (normalized) name already exists."
+        SUPABASE.table("clients").update({"name": new_name.strip(), "name_norm": new_norm}).eq("id", client_id).execute()
+        _invalidate_clients_cache()
+        return True, "ok"
+    except Exception as e:
+        return False, str(e)
+
+def delete_client(client_id: int):
+    if not _sb_ok() or not client_id: return False, "Not configured"
+    try:
+        SUPABASE.table("clients").delete().eq("id", client_id).execute()
+        _invalidate_clients_cache()
+        return True, "ok"
+    except Exception as e:
+        return False, str(e)
+
+# ==========================
+# Sent + Tours for reports
+# ==========================
 @st.cache_data(ttl=120, show_spinner=False)
-def fetch_sent_for_client(client_norm: str, limit: int = 10000) -> List[Dict[str, Any]]:
-    if not (SUPABASE and client_norm.strip()):
+def fetch_sent_for_client(client_norm: str, limit: int = 5000):
+    """Return list of dicts: {url,address,sent_at,campaign,mls_id,canonical,zpid}"""
+    if not (_sb_ok() and client_norm.strip()):
         return []
     try:
         cols = "url,address,sent_at,campaign,mls_id,canonical,zpid"
@@ -146,231 +190,242 @@ def fetch_sent_for_client(client_norm: str, limit: int = 10000) -> List[Dict[str
     except Exception:
         return []
 
+def address_text_from_url(url: str) -> str:
+    if not url: return ""
+    from urllib.parse import unquote
+    u = unquote(url)
+    m = re.search(r"/homedetails/([^/]+)/\d{6,}_zpid/", u, re.I)
+    if m:
+        return re.sub(r"[-+]", " ", m.group(1)).strip().title()
+    m = re.search(r"/homes/([^/_]+)_rb/?", u, re.I)
+    if m:
+        return re.sub(r"[-+]", " ", m.group(1)).strip().title()
+    return ""
+
 @st.cache_data(ttl=120, show_spinner=False)
-def fetch_all_tour_addresses_for_client(client_norm: str) -> List[str]:
-    if not (SUPABASE and client_norm.strip()):
-        return []
+def fetch_tour_slugs_for_client(client_norm: str):
+    """Return a set of address slugs that appear in any tour for this client."""
+    if not (_sb_ok() and client_norm.strip()): return set()
     try:
-        tq = SUPABASE.table("tours").select("id").eq("client", client_norm.strip()).limit(5000).execute()
-        tours = tq.data or []
-        if not tours:
-            return []
-        ids = [t["id"] for t in tours]
-        if not ids:
-            return []
-        sq = SUPABASE.table("tour_stops").select("address").in_("tour_id", ids).limit(50000).execute()
+        tq = SUPABASE.table("tours").select("id").eq("client", client_norm).limit(5000).execute()
+        ids = [t["id"] for t in (tq.data or [])]
+        if not ids: return set()
+        sq = SUPABASE.table("tour_stops").select("address,address_slug").in_("tour_id", ids).limit(50000).execute()
         stops = sq.data or []
-        return [s.get("address") or "" for s in stops if (s.get("address") or "").strip()]
+        slugs = set()
+        for s in stops:
+            slug = s.get("address_slug") or _slug_addr(s.get("address",""))
+            if slug: slugs.add(slug)
+        return slugs
     except Exception:
-        return []
+        return set()
 
-def _build_toured_keyset(client_norm: str) -> set:
-    addrs = fetch_all_tour_addresses_for_client(client_norm)
-    return { _normalize_address_strong(a) for a in addrs if a.strip() }
-
-# ---------------- Query param helpers (new API only) ----------------
-def _qp_get(name: str, default=None):
-    try:
-        val = st.query_params.get(name, default)
-        if isinstance(val, list) and val:
-            return val[0]
-        return val
-    except Exception:
-        return st.session_state.get(f"__qp_{name}", default)
-
-def _qp_set(**kwargs):
-    try:
-        if kwargs:
-            st.query_params.update(kwargs)
-        else:
-            try:
-                st.query_params.clear()
-            except Exception:
-                for k in list(st.session_state.keys()):
-                    if k.startswith("__qp_"):
-                        del st.session_state[k]
-    except Exception:
-        for k, v in kwargs.items():
-            st.session_state[f"__qp_{k}"] = v
-
-# ---------------- UI bits ----------------
-def _toured_badge():
-    return "<span style='font-size:11px;font-weight:800;padding:2px 8px;border-radius:999px;background:#0b7f48;color:#ecfdf5;border:1px solid #16a34a;margin-left:6px;'>Toured</span>"
-
-def _campaign_chip(text: str):
-    if not text:
-        return ""
-    return f"<span style='font-size:11px;font-weight:700;padding:2px 6px;border-radius:999px;background:#e2e8f0;margin-left:6px;'>{escape(text)}</span>"
-
-# ---------------- Report builder (hard dedupe by property) ----------------
-def _dedupe_and_tag_rows(rows: List[Dict[str, Any]], toured_keys: set,
-                         sel_campaign: Optional[str], q_norm: str) -> List[Dict[str, Any]]:
+def _dedupe_by_property(rows: List[Dict[str,Any]]) -> List[Dict[str,Any]]:
     """
-    1) Filter by campaign and search.
-    2) Group rows by strong address key ONLY.
-    3) Keep the most recent sent_at per property.
-    4) Tag 'is_toured' if address key is in toured_keys.
+    Keep ONLY the most-recent entry per property for the report.
+    Priority key: (canonical lower) first, else (slug of address/url).
     """
-    def _match(row: Dict[str, Any]) -> bool:
-        if sel_campaign is not None:
-            if (row.get("campaign") or "").strip() != sel_campaign:
-                return False
-        if q_norm:
-            a = (row.get("address") or "").lower()
-            m = (row.get("mls_id") or "").lower()
-            u = (row.get("url") or "").lower()
-            if q_norm not in a and q_norm not in m and q_norm not in u:
-                return False
-        return True
-
-    filt = [r for r in rows if _match(r)]
-    if not filt:
-        return []
-
-    groups: Dict[str, Dict[str, Any]] = {}
-    for r in filt:
-        key = _property_key_from_row(r)
-        if not key:
-            # If we truly can't make a key, skip row (prevents weird dupes)
-            continue
-
-        # parse sent_at
-        sa = (r.get("sent_at") or "").strip()
+    # Normalize sent_at → comparable
+    def parse_ts(ts: str):
         try:
-            when = datetime.fromisoformat(sa.replace("Z", "+00:00"))
+            return datetime.fromisoformat(ts.replace("Z","+00:00"))
         except Exception:
-            when = datetime.min
+            return datetime.min
 
-        prev = groups.get(key)
-        if prev is None or when > prev["_when"]:
-            r["_when"] = when
-            r["_key"] = key
-            r["is_toured"] = (key in toured_keys)
-            groups[key] = r
+    buckets: Dict[str, Dict[str,Any]] = {}
+    for r in rows:
+        canon = (r.get("canonical") or "").strip().lower()
+        if not canon:
+            addr = (r.get("address") or "").strip() or address_text_from_url(r.get("url",""))
+            canon = _slug_addr(addr)
+        cur = buckets.get(canon)
+        if not cur or parse_ts(r.get("sent_at") or "") > parse_ts(cur.get("sent_at") or ""):
+            buckets[canon] = r
+    # Most recent first (original rows already desc by sent_at, so dict order is fine)
+    return list(buckets.values())
 
-    out = sorted(groups.values(), key=lambda x: x.get("_when", datetime.min), reverse=True)
-    for r in out:
-        r.pop("_when", None)
-        r.pop("_key", None)
-    return out
+# =================
+# Client row (icons)
+# =================
+def _client_row_icons(name: str, norm: str, cid: int, active: bool):
+    col_name, col_rep, col_ren, col_tog, col_del, col_sp = st.columns([8, 1, 1, 1, 1, 2])
 
-def _address_text(row: Dict[str, Any]) -> str:
-    addr = (row.get("address") or "").strip()
-    if addr:
-        return addr
-    u = (row.get("url") or "").strip()
-    a2 = _address_from_url_fallback(u).replace("-", " ").strip().title()
-    return a2 or "Listing"
+    with col_name:
+        st.markdown(
+            f"<span class='client-name'>{escape(name)}</span> "
+            f"<span class='pill {'active' if active else ''}'>{'active' if active else 'inactive'}</span>",
+            unsafe_allow_html=True
+        )
 
-def _format_sent_at(ts: str) -> str:
-    try:
-        dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
-        return dt.strftime("%b %d, %Y • %I:%M %p")
-    except Exception:
-        return ts or ""
+    with col_rep:
+        # ▦ Open report
+        if st.button("▦", key=f"rep_{cid}", help="Open report"):
+            st.session_state["__active_tab__"] = "Clients"  # prevent tab jump on rerun
+            _qp_set(report=norm, scroll="1")
+            _safe_rerun()
 
+    with col_ren:
+        # ✎ Rename
+        if st.button("✎", key=f"rn_btn_{cid}", help="Rename"):
+            st.session_state[f"__edit_{cid}"] = True
+
+    with col_tog:
+        # ⟳ Toggle active
+        if st.button("⟳", key=f"tg_{cid}", help=("Deactivate" if active else "Activate")):
+            try:
+                rows = SUPABASE.table("clients").select("active").eq("id", cid).limit(1).execute().data or []
+                cur = rows[0]["active"] if rows else active
+                toggle_client_active(cid, (not cur))
+            except Exception:
+                toggle_client_active(cid, (not active))
+            st.session_state["__active_tab__"] = "Clients"
+            _safe_rerun()
+
+    with col_del:
+        # ⌫ Delete
+        if st.button("⌫", key=f"del_{cid}", help="Delete"):
+            st.session_state[f"__del_{cid}"] = True
+
+    # Inline rename editor
+    if st.session_state.get(f"__edit_{cid}"):
+        st.markdown("<div class='section-rule'></div>", unsafe_allow_html=True)
+        new_name = st.text_input("New name", value=name, key=f"rn_val_{cid}")
+        cc1, cc2 = st.columns([0.2, 0.2])
+        if cc1.button("Save", key=f"rn_save_{cid}"):
+            ok, msg = rename_client(cid, new_name)
+            if not ok: st.warning(msg)
+            st.session_state[f"__edit_{cid}"] = False
+            st.session_state["__active_tab__"] = "Clients"
+            _safe_rerun()
+        if cc2.button("Cancel", key=f"rn_cancel_{cid}"):
+            st.session_state[f"__edit_{cid}"] = False
+
+    # Inline delete confirm
+    if st.session_state.get(f"__del_{cid}"):
+        st.markdown("<div class='section-rule'></div>", unsafe_allow_html=True)
+        dc1, dc2 = st.columns([0.25, 0.25])
+        if dc1.button("Confirm delete", key=f"del_yes_{cid}"):
+            delete_client(cid)
+            st.session_state[f"__del_{cid}"] = False
+            st.session_state["__active_tab__"] = "Clients"
+            _safe_rerun()
+        if dc2.button("Cancel", key=f"del_no_{cid}"):
+            st.session_state[f"__del_{cid}"] = False
+
+    st.markdown("<div class='section-rule'></div>", unsafe_allow_html=True)
+
+# ======================
+# Report renderer (inline)
+# ======================
 def _render_client_report_view(client_display_name: str, client_norm: str):
     st.markdown(f"### Report for {escape(client_display_name)}", unsafe_allow_html=True)
 
+    # Close button
     colX, _ = st.columns([1,3])
     with colX:
         if st.button("Close report", key=f"__close_report_{client_norm}"):
-            _stay_on_clients()
+            st.session_state["__active_tab__"] = "Clients"
             _qp_set()  # clear query params
             _safe_rerun()
 
-    rows = fetch_sent_for_client(client_norm)
-    total = len(rows)
+    # Fetch & cross-check
+    sent_rows = fetch_sent_for_client(client_norm)
+    tour_slugs = fetch_tour_slugs_for_client(client_norm)
 
+    if not sent_rows:
+        st.info("No listings have been sent to this client yet.")
+        return
+
+    # Filters
     seen_campaigns = []
-    for r in rows:
+    for r in sent_rows:
         c = (r.get("campaign") or "").strip()
-        if c not in seen_campaigns:
-            seen_campaigns.append(c)
-    labels = ["All campaigns"] + [("— no campaign —" if c == "" else c) for c in seen_campaigns]
-    keys   = [None] + seen_campaigns
+        if c not in seen_campaigns: seen_campaigns.append(c)
+    campaign_labels = ["All campaigns"] + [("— no campaign —" if c == "" else c) for c in seen_campaigns]
+    campaign_keys   = [None] + seen_campaigns
 
     colF1, colF2, colF3 = st.columns([1.2, 1.8, 1])
     with colF1:
-        idx = st.selectbox("Filter by campaign", list(range(len(labels))),
-                           format_func=lambda i: labels[i], index=0, key=f"__camp_{client_norm}")
-        sel_campaign = keys[idx]
+        sel_idx = st.selectbox("Filter by campaign",
+                               list(range(len(campaign_labels))),
+                               format_func=lambda i: campaign_labels[i], index=0,
+                               key=f"__camp_{client_norm}")
+        sel_campaign = campaign_keys[sel_idx]
     with colF2:
-        q = st.text_input("Search address / MLS / URL", value="", placeholder="e.g. 407 Woodall, 2501234, /homedetails/", key=f"__q_{client_norm}")
+        q = st.text_input("Search address / MLS / URL", value="", placeholder="e.g. 407 Woodall, 2501234, /homedetails/",
+                          key=f"__q_{client_norm}")
         q_norm = (q or "").strip().lower()
     with colF3:
-        st.caption(f"{total} total logged")
+        st.caption(f"{len(sent_rows)} total logged")
 
-    toured_keys = _build_toured_keyset(client_norm)
-    rows_u = _dedupe_and_tag_rows(rows, toured_keys, sel_campaign, q_norm)
-    count = len(rows_u)
+    # Filter rows
+    def _match(row) -> bool:
+        if sel_campaign is not None:
+            if (row.get("campaign") or "").strip() != sel_campaign:
+                return False
+        if not q_norm:
+            return True
+        addr = (row.get("address") or "").lower()
+        mls  = (row.get("mls_id") or "").lower()
+        url  = (row.get("url") or "").lower()
+        return (q_norm in addr) or (q_norm in mls) or (q_norm in url)
 
-    st.caption(f"{count} unique listing{'s' if count != 1 else ''} (deduped by property)")
+    filtered = [r for r in sent_rows if _match(r)]
 
-    if not rows_u:
-        st.info("No results match the current filters.")
-        return
+    # STRICT de-dupe for display (by property)
+    deduped = _dedupe_by_property(filtered)
+    st.caption(f"{len(deduped)} unique listing{'s' if len(deduped)!=1 else ''} (deduped by property)")
 
+    # Render list
     items_html = []
-    for r in rows_u:
+    for r in deduped:
         url = (r.get("url") or "").strip()
-        addr_txt = _address_text(r)
-        sent_at_h = _format_sent_at(r.get("sent_at") or "")
+        addr = (r.get("address") or "").strip() or address_text_from_url(url) or "Listing"
+        sent_at = r.get("sent_at") or ""
         camp = (r.get("campaign") or "").strip()
 
-        chip = "" if sel_campaign is not None else (_campaign_chip(camp) if camp else "")
-        toured = _toured_badge() if r.get("is_toured") else ""
+        # Toured badge via slug intersection
+        slug = _slug_addr(addr or address_text_from_url(url))
+        toured = slug in tour_slugs
+
+        meta = [f"<span class='report-meta'>{escape(sent_at)}</span>"]
+        if camp and sel_campaign is None:
+            meta.append(f"<span class='badge'>{escape(camp)}</span>")
+        if toured:
+            meta.append(f"<span class='badge toured'>Toured</span>")
 
         items_html.append(
-            f"""<li style="margin:0.25rem 0;">
-                  <a href="{escape(url)}" target="_blank" rel="noopener">{escape(addr_txt)}</a>
-                  <span style="color:#64748b; font-size:12px; margin-left:6px;">{escape(sent_at_h)}</span>
-                  {chip}{toured}
+            f"""<li class="report-item">
+                   <a href="{escape(url)}" target="_blank" rel="noopener">{escape(addr)}</a>
+                   {"".join(meta)}
                 </li>"""
         )
-    html = "<ul class='link-list'>" + "\n".join(items_html) + "</ul>"
-    st.markdown(html, unsafe_allow_html=True)
 
-    # Export filtered unique report
-    with st.expander("Export filtered (unique) report"):
-        import pandas as pd, io
-        df = pd.DataFrame(rows_u)
-        csv_buf = io.StringIO()
-        df.to_csv(csv_buf, index=False)
+    if not items_html:
+        st.warning("No results returned.")
+        return
+
+    st.markdown("<ul class='link-list'>" + "\n".join(items_html) + "</ul>", unsafe_allow_html=True)
+
+    # Export
+    with st.expander("Export filtered (deduped)"):
+        import pandas as pd
+        buf = io.StringIO()
+        pd.DataFrame(deduped).to_csv(buf, index=False)
         st.download_button(
             "Download CSV",
-            data=csv_buf.getvalue(),
-            file_name=f"client_report_unique_{client_norm}_{datetime.utcnow().strftime('%Y%m%d%H%M%S')}.csv",
+            data=buf.getvalue(),
+            file_name=f"client_report_{client_norm}_{datetime.utcnow().strftime('%Y%m%d%H%M%S')}.csv",
             mime="text/csv",
             use_container_width=False
         )
 
-# ---------------- Row widget for clients ----------------
-def _client_row(name: str, norm: str, cid: int, active: bool):
-    col_name, col_rep = st.columns([10, 1])
-
-    with col_name:
-        pill = "<span class='pill active'>active</span>" if active else "<span class='pill'>inactive</span>"
-        st.markdown(f"<span class='client-name'>{escape(name)}</span> {pill}", unsafe_allow_html=True)
-
-    with col_rep:
-        if st.button("▦", key=f"rep_{cid}", help="Open report"):
-            _stay_on_clients()
-            _qp_set(report=norm, scroll="1")
-            _safe_rerun()
-
-    st.markdown("<div style='border-bottom:1px solid rgba(148,163,184,.25); margin:4px 0 2px 0;'></div>", unsafe_allow_html=True)
-
-# ---------------- Main entry ----------------
+# ======================
+# Public entry point
+# ======================
 def render_clients_tab():
-    st.markdown("""
-    <style>
-    .client-name { font-weight:700; color:#111827; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
-    html[data-theme="dark"] .client-name, .stApp [data-theme="dark"] .client-name { color:#ffffff; }
-    .pill { font-size:11px; font-weight:800; padding:2px 10px; border-radius:999px; background:#e2e8f0; color:#0f172a; }
-    .pill.active { background:#dcfce7; color:#064e3b; border:1px solid rgba(5,150,105,.35);}
-    </style>
-    """, unsafe_allow_html=True)
+    st.subheader("Clients")
+    st.caption("Use the ▦ icon to open an inline report; ✎ rename; ⟳ toggle active; ⌫ delete.")
 
     report_norm_qp = _qp_get("report", "")
     want_scroll = _qp_get("scroll", "") in ("1","true","yes")
@@ -387,7 +442,7 @@ def render_clients_tab():
             st.write("_No active clients_")
         else:
             for c in active:
-                _client_row(c["name"], c.get("name_norm",""), c["id"], active=True)
+                _client_row_icons(c["name"], c.get("name_norm",""), c["id"], active=True)
 
     with colB:
         st.markdown("### Inactive", unsafe_allow_html=True)
@@ -395,13 +450,16 @@ def render_clients_tab():
             st.write("_No inactive clients_")
         else:
             for c in inactive:
-                _client_row(c["name"], c.get("name_norm",""), c["id"], active=False)
+                _client_row_icons(c["name"], c.get("name_norm",""), c["id"], active=False)
 
+    # Inline report section
     st.markdown('<div id="report_anchor"></div>', unsafe_allow_html=True)
     if report_norm_qp:
         display_name = next((c["name"] for c in all_clients if c.get("name_norm")==report_norm_qp), report_norm_qp)
         st.markdown("---")
         _render_client_report_view(display_name, report_norm_qp)
+
+        # Smooth scroll without switching tabs
         if want_scroll:
             st.components.v1.html(
                 """
@@ -411,8 +469,5 @@ def render_clients_tab():
                 </script>
                 """, height=0
             )
-            # keep report param, drop scroll
-            try:
-                st.query_params.update({"report": report_norm_qp})
-            except Exception:
-                st.session_state["__qp_report"] = report_norm_qp
+            # keep `report` but clear `scroll` so it doesn't keep jumping on every rerun
+            _qp_set(report=report_norm_qp)
