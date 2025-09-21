@@ -5,7 +5,13 @@ from html import escape
 from typing import List, Dict, Any, Optional, Tuple
 
 import streamlit as st
-from supabase import create_client, Client
+
+# --- Make supabase import SAFE so the module can import even if package is missing ---
+try:
+    from supabase import create_client, Client
+except Exception:
+    create_client = None
+    Client = Any  # type: ignore
 
 # =============== Styling (clear chips + visible badges) ===============
 st.markdown("""
@@ -127,7 +133,7 @@ def _norm_slug_from_text(text: str) -> str:
     s = s.replace("&", " and ")
     toks = re.split(r"[^a-z0-9]+", s)
     norm = [t for t in (_token_norm(t) for t in toks) if t]
-    return "-join".replace("-join", "-").join(norm)  # (keep hyphen join)
+    return "-".join(norm)
 
 _RE_HD = re.compile(r"/homedetails/([^/]+)/\d{6,}_zpid/?", re.I)
 _RE_HM = re.compile(r"/homes/([^/_]+)_rb/?", re.I)
@@ -189,11 +195,15 @@ def _qp_set(**kwargs):
 
 # ============== Supabase ==============
 @st.cache_resource
-def get_supabase() -> Optional[Client]:
+def get_supabase() -> Optional["Client"]:
+    # If supabase package isn't available, gracefully degrade
+    if create_client is None:
+        return None
     try:
         url = os.getenv("SUPABASE_URL", st.secrets.get("SUPABASE_URL", ""))
         key = os.getenv("SUPABASE_SERVICE_ROLE", st.secrets.get("SUPABASE_SERVICE_ROLE", ""))
-        if not url or not key: return None
+        if not url or not key:
+            return None
         return create_client(url, key)
     except Exception:
         return None
