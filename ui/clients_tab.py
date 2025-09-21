@@ -456,9 +456,10 @@ def _render_client_report_view(client_display_name: str, client_norm: str):
 
         meta: List[str] = []
         if date_tag:
-            meta.append(chip(date_tag))
+            meta.append(chip(f"date: {date_tag}"))
         if toured:
-            meta.append("<span class='toured-badge'>Toured</span>")
+            meta.append("<span class='toured-badge'>tag: Toured</span>")
+
 
         debug_html = ""
         if DEBUG_REPORT:
