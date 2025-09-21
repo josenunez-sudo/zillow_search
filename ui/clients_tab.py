@@ -13,21 +13,20 @@ except Exception:
     create_client = None
     Client = Any  # type: ignore
 
-# ====== Optional: flip to True to see per-row debug under each item ======
-DEBUG_REPORT = False
+DEBUG_REPORT = False  # set True if you want to see per-row debug info
 
 
 # ================= Basics (pure helpers; safe at import time) =================
 def _norm_tag(s: str) -> str:
     return re.sub(r"\s+", " ", (s or "").strip()).lower()
 
-def _fmt_ts(ts: str) -> str:
-    """Format ISO-ish/epoch-ish timestamps nicely; fall back to raw if needed."""
+def _fmt_ts_date_tag(ts: str) -> str:
+    """Return YYYYMMDD from epoch/ISO-ish strings; '' if cannot parse."""
     if ts is None or str(ts).strip() == "":
         return ""
     raw = str(ts).strip()
 
-    # Try epoch seconds/millis
+    # epoch seconds/millis
     try:
         if raw.isdigit():
             val = int(raw)
@@ -35,21 +34,21 @@ def _fmt_ts(ts: str) -> str:
                 d = datetime.utcfromtimestamp(val / 1000.0)
             else:
                 d = datetime.utcfromtimestamp(val)
-            return d.strftime("%b %d, %Y • %I:%M %p")
+            return d.strftime("%Y%m%d")
     except Exception:
         pass
 
-    # Try ISO with/without Z
+    # ISO
     try:
         d = datetime.fromisoformat(raw.replace("Z", "+00:00"))
-        return d.strftime("%b %d, %Y • %I:%M %p")
+        return d.strftime("%Y%m%d")
     except Exception:
-        return raw  # show something rather than nothing
+        return ""
 
-def _pick_timestamp_field(row: Dict[str, Any]) -> str:
+def _pick_timestamp_date_tag(row: Dict[str, Any]) -> str:
     """
-    Look for the first non-empty timestamp-ish field and format it.
-    We check several common keys to be resilient to schema differences.
+    Find first timestamp-like field and convert to YYYYMMDD.
+    If none found, try campaign if it looks like YYYYMMDD.
     """
     candidates = [
         "sent_at", "sentAt",
@@ -59,12 +58,16 @@ def _pick_timestamp_field(row: Dict[str, Any]) -> str:
         "ts", "timestamp"
     ]
     for k in candidates:
-        v = row.get(k)
-        nice = _fmt_ts(v if isinstance(v, str) else (str(v) if v is not None else ""))
-        if nice:
-            return nice
-    return ""  # none found
+        tag = _fmt_ts_date_tag(row.get(k))
+        if tag:
+            return tag
 
+    # fallback: campaign that is a pure 8-digit date
+    camp = (row.get("campaign") or "").strip()
+    if re.fullmatch(r"\d{8}", camp):
+        return camp
+
+    return ""
 
 # ------------- Property slug normalization (strong & symmetric) -------------
 _STTYPE = {
@@ -443,31 +446,25 @@ def _render_client_report_view(client_display_name: str, client_norm: str):
         url  = (r.get("url") or "").strip()
         addr = (r.get("address") or "").strip() or _address_text_from_url(url) or "Listing"
 
-        # DATE chip: pick first usable field (sent_at, created_at, etc.) and format
-        when = _pick_timestamp_field(r)
+        # Single DATE tag (YYYYMMDD)
+        date_tag = _pick_timestamp_date_tag(r)
 
-        # CAMPAIGN chip: show "— no campaign —" if blank
-        raw_camp = (r.get("campaign") or "").strip()
-        camp = raw_camp if raw_camp else "— no campaign —"
-
-        # Toured badge: robust slug match
+        # Toured badge (once)
         norm_pslug = _norm_slug_from_url(url) or _norm_slug_from_text(addr)
         toured = norm_pslug in tour_norm_slugs
 
         meta: List[str] = []
-        if when:
-            meta.append(chip(when))
-        meta.append(chip(camp))
+        if date_tag:
+            meta.append(chip(date_tag))
         if toured:
             meta.append("<span class='toured-badge'>Toured</span>")
 
         debug_html = ""
         if DEBUG_REPORT:
             debug_html = (
-                "<div style='font-size:10px;opacity:.75;margin-left:8px'>"
-                f"[debug] url={escape(url)} &nbsp; "
-                f"addr={escape(addr)} &nbsp; slug={escape(norm_pslug)} &nbsp; "
-                f"toured={'yes' if toured else 'no'}"
+                "<div style='font-size:10px;opacity:.7;margin-left:8px'>"
+                f"[dbg] date_tag={escape(date_tag or '-')}, camp={(r.get('campaign') or '')}, "
+                f"slug={escape(norm_pslug)}, toured={'yes' if toured else 'no'}"
                 "</div>"
             )
 
