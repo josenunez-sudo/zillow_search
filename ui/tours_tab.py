@@ -84,6 +84,56 @@ def _canonicalize_zillow(url: str) -> Tuple[str, Optional[str]]:
     m_z = re.search(r'(\d{6,})_zpid', base, re.I)
     return canon, (m_z.group(1) if m_z else None)
 
+# ---------- Robust "same-property" normalization (match Clients tab logic) ----------
+_STTYPE = {
+    "street":"st","st":"st","st.":"st",
+    "avenue":"ave","ave":"ave","ave.":"ave","av":"ave",
+    "road":"rd","rd":"rd","rd.":"rd",
+    "drive":"dr","dr":"dr","dr.":"dr",
+    "lane":"ln","ln":"ln","ln.":"ln",
+    "boulevard":"blvd","blvd":"blvd","blvd.":"blvd",
+    "court":"ct","ct":"ct","ct.":"ct",
+    "place":"pl","pl":"pl","pl.":"pl",
+    "terrace":"ter","ter":"ter","ter.":"ter",
+    "highway":"hwy","hwy":"hwy",
+    "parkway":"pkwy","pkwy":"pkwy",
+    "circle":"cir","cir":"cir",
+    "square":"sq","sq":"sq",
+}
+_DIR = {"north":"n","n":"n","south":"s","s":"s","east":"e","e":"e","west":"w","w":"w","n.":"n","s.":"s","e.":"e","w.":"w"}
+
+def _token_norm(tok: str) -> str:
+    t = tok.lower().strip(" .,#")
+    if t in _STTYPE: return _STTYPE[t]
+    if t in _DIR:    return _DIR[t]
+    if t in {"apt","unit","ste","lot"}: return ""
+    return re.sub(r"[^a-z0-9-]", "", t)
+
+def _norm_slug_from_text(text: str) -> str:
+    s = (text or "").lower().replace("&", " and ")
+    toks = re.split(r"[^a-z0-9]+", s)
+    norm = [t for t in (_token_norm(t) for t in toks) if t]
+    return "-".join(norm)
+
+_RE_HD = re.compile(r"/homedetails/([^/]+)/\d{6,}_zpid/?", re.I)
+_RE_HM = re.compile(r"/homes/([^/_]+)_rb/?", re.I)
+
+def _norm_slug_from_url(url: str) -> str:
+    u = (url or "").strip()
+    m = _RE_HD.search(u)
+    if m: return _norm_slug_from_text(m.group(1))
+    m = _RE_HM.search(u)
+    if m: return _norm_slug_from_text(m.group(1))
+    return ""
+
+def _address_text_from_url(url: str) -> str:
+    u = (url or "").strip()
+    m = _RE_HD.search(u)
+    if m: return re.sub(r"[-+]", " ", m.group(1)).title()
+    m = _RE_HM.search(u)
+    if m: return re.sub(r"[-+]", " ", m.group(1)).title()
+    return ""
+
 # ---------- Clients ----------
 @st.cache_data(ttl=60, show_spinner=False)
 def fetch_clients():
@@ -94,6 +144,29 @@ def fetch_clients():
         return [r for r in rows if r.get("name_norm") != _norm_tag("test test")]
     except Exception:
         return []
+
+# ---------- Sent slugs for a client (to tag tour stops as "Sent") ----------
+@st.cache_data(ttl=120, show_spinner=False)
+def fetch_sent_norm_slugs_for_client(client_norm: str) -> set:
+    """
+    Return normalized property slugs for every listing sent to this client.
+    Used to tag tour stops as 'Sent' when we already sent that property.
+    """
+    if not SUPABASE or not client_norm.strip():
+        return set()
+    try:
+        resp = SUPABASE.table("sent").select("url,address").eq("client", client_norm.strip()).limit(50000).execute()
+        rows = resp.data or []
+        out = set()
+        for r in rows:
+            url  = (r.get("url") or "").strip()
+            addr = (r.get("address") or "").strip() or _address_text_from_url(url)
+            norm_pslug = _norm_slug_from_url(url) or _norm_slug_from_text(addr)
+            if norm_pslug:
+                out.add(norm_pslug)
+        return out
+    except Exception:
+        return set()
 
 # ---------- ShowingTime parsing ----------
 _BAD_AFTER_NUM = r"(?:Beds?|Baths?|Sqft|Canceled|Cancelled|Confirmed|Reason|Presented|Access|Alarm|Instructions|Agent|Buyer)\b"
@@ -372,6 +445,10 @@ def _repeat_tag_html(n: int) -> str:
         return "<span style='padding:2px 8px;border-radius:9999px;font-size:11px;font-weight:800;background:#92400e;color:#fff7ed;border:1px solid #f59e0b;white-space:nowrap;margin-left:8px;'>2nd+ showing</span>"
     return ""
 
+def _sent_badge_html() -> str:
+    # Amber "Sent" badge (will be placed left of Scheduled/Confirmed/Time)
+    return "<span style='padding:2px 8px;border-radius:9999px;font-size:11px;font-weight:800;background:#fef9c3;color:#92400e;border:1px solid #fde68a;white-space:nowrap;'>Sent</span>"
+
 # ---------- Main renderer ----------
 def render_tours_tab(state: dict):
     # ===== Import (Parse) =====
@@ -552,6 +629,8 @@ def _render_client_tours_report(client_display: str, client_norm: str):
         return
 
     repeat_map = _build_repeat_map(client_norm)
+    # --- NEW: all 'sent' property slugs for this client (for Sent badge) ---
+    sent_norm_slugs = fetch_sent_norm_slugs_for_client(client_norm)
 
     for t in tours:
         td = t["tour_date"]
@@ -565,19 +644,31 @@ def _render_client_tours_report(client_display: str, client_norm: str):
         items = []
         for s in stops:
             addr = s.get("address") or ""
-            slug = s.get("address_slug") or _slug_addr(addr)
+            addr_slug = s.get("address_slug") or ""
             href = (s.get("deeplink") or _address_to_deeplink(addr)).strip()
             start = (s.get("start") or "").strip()
             end   = (s.get("end") or "").strip()
             when  = f"{start}–{end}" if (start and end) else (start or end or "")
-            visit = repeat_map.get((slug, td), 1)
+            visit = repeat_map.get((addr_slug, td), 1)
             stat  = _normalize_status(s.get("status"))
 
+            # --- NEW: robust slug for this stop, match against 'sent' slugs ---
+            norm_pslug = (
+                (_norm_slug_from_text(addr_slug) if addr_slug else "") or
+                _norm_slug_from_url(href) or
+                _norm_slug_from_text(addr)
+            )
+            was_sent = norm_pslug in sent_norm_slugs
+
             right_badges = []
+            # Sent badge goes FIRST (left of Scheduled/Confirmed/Time)
+            if was_sent:
+                right_badges.append(_sent_badge_html())
             if stat:
                 right_badges.append(_status_tag_html(stat))
             if when:
                 right_badges.append(_time_badge_html(when))
+
             rep_tag = _repeat_tag_html(visit)
 
             items.append(
