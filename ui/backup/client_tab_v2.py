@@ -2,7 +2,7 @@
 import os, re, io
 from datetime import datetime
 from html import escape
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 
 import streamlit as st
 
@@ -300,7 +300,8 @@ def fetch_sent_for_client(client_norm: str, limit: int = 5000):
     SUPABASE = get_supabase()
     if not (_sb_ok(SUPABASE) and client_norm.strip()): return []
     try:
-        cols = "url,address,sent_at,campaign,mls_id,canonical,zpid"
+        # include 'id' so we can delete rows precisely
+        cols = "id,url,address,sent_at,campaign,mls_id,canonical,zpid"
         resp = SUPABASE.table("sent").select(cols)\
             .eq("client", client_norm.strip())\
             .order("sent_at", desc=True)\
@@ -328,6 +329,33 @@ def fetch_tour_norm_slugs_for_client(client_norm: str) -> set:
         return out
     except Exception:
         return set()
+
+# ---- Sent-delete helpers ----
+def _invalidate_sent_cache():
+    try: fetch_sent_for_client.clear()  # type: ignore[attr-defined]
+    except Exception: pass
+
+def _delete_sent_rows_by_ids(ids: List[int]) -> Tuple[bool, str]:
+    SUPABASE = get_supabase()
+    if not (_sb_ok(SUPABASE) and ids):
+        return False, ("Nothing to delete" if not ids else "Not configured")
+    try:
+        SUPABASE.table("sent").delete().in_("id", ids).execute()
+        _invalidate_sent_cache()
+        return True, "ok"
+    except Exception as e:
+        return False, str(e)
+
+def _collect_ids_for_property(client_norm: str, all_sent_rows: List[Dict[str, Any]], prop_key: str) -> List[int]:
+    """Return all 'sent.id' that match the same-property key for this client."""
+    ids: List[int] = []
+    for r in all_sent_rows:
+        try:
+            if _property_key(r) == prop_key and r.get("id"):
+                ids.append(int(r["id"]))
+        except Exception:
+            continue
+    return ids
 
 
 # ================= UI bits =================
@@ -488,6 +516,53 @@ def _render_client_report_view(client_display_name: str, client_norm: str):
         return
 
     st.markdown("\n".join(md_lines), unsafe_allow_html=True)
+
+    # ---- Manage sent listings (delete) ----
+    # Build map: property key -> label, and property key -> all row ids (from full sent_rows)
+    propkey_to_label: Dict[str, str] = {}
+    propkey_to_ids: Dict[str, List[int]] = {}
+
+    for r in deduped:
+        url  = (r.get("url") or "").strip()
+        addr = (r.get("address") or "").strip() or _address_text_from_url(url) or "Listing"
+        key  = _property_key(r)
+        propkey_to_label[key] = addr
+
+    for key in list(propkey_to_label.keys()):
+        propkey_to_ids[key] = _collect_ids_for_property(client_norm, sent_rows, key)
+
+    with st.expander("Manage sent listings (delete)"):
+        # Disambiguate duplicate labels by suffixing counter
+        label_to_key: Dict[str, str] = {}
+        counts: Dict[str, int] = {}
+        for k, lbl in propkey_to_label.items():
+            c = counts.get(lbl, 0)
+            counts[lbl] = c + 1
+            if c == 0:
+                label_to_key[lbl] = k
+            else:
+                dis_lbl = f"{lbl}  · {c+1}"
+                label_to_key[dis_lbl] = k
+
+        choices = list(label_to_key.keys())
+        to_delete = st.multiselect(
+            "Select properties to delete (removes all 'sent' rows for those properties for this client):",
+            options=choices
+        )
+
+        if st.button("Delete selected properties", type="primary", use_container_width=False):
+            ids: List[int] = []
+            for lbl in to_delete:
+                key = label_to_key[lbl]
+                ids.extend(propkey_to_ids.get(key, []))
+            ids = sorted(set(ids))
+            ok, msg = _delete_sent_rows_by_ids(ids)
+            if ok:
+                st.success(f"Deleted {len(ids)} sent row(s) across {len(to_delete)} propert{'y' if len(to_delete)==1 else 'ies'}.")
+                st.session_state["__active_tab__"] = "Clients"
+                _safe_rerun()
+            else:
+                st.error(f"Delete failed: {msg}")
 
     # Export (deduped)
     with st.expander("Export filtered (deduped)"):
