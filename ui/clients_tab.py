@@ -2,13 +2,13 @@
 import os, re, io
 from datetime import datetime
 from html import escape
-from typing import List, Dict, Any, Optional, Tuple
+from typing import List, Dict, Any, Optional
 
 import streamlit as st
 from supabase import create_client, Client
 
 # =====================
-# Styles (icons + rows)
+# Minimal styles (keep your look; avoid clobbering tags)
 # =====================
 st.markdown("""
 <style>
@@ -43,18 +43,14 @@ html[data-theme="dark"] .iconbar .stButton > button {
 .iconbar .stButton > button:hover { transform: translateY(-1px); }
 .iconbar .stButton > button:active { transform: translateY(0) scale(.98); }
 
-/* Report list */
-.report-item { margin:0.2rem 0; }
-.report-meta { color:var(--muted); font-size:12px; margin-left:6px; }
-.badge { display:inline-block; font-size:11px; font-weight:800; padding:2px 6px; border-radius:999px; margin-left:6px; }
-.badge.toured { background:#e0f2fe; color:#075985; border:1px solid #7dd3fc; }
-.badge.dup    { background:#fee2e2; color:#991b1b; border:1px solid #fecaca; }
 .section-rule { border-bottom:1px solid var(--row-border); margin:8px 0 6px 0; }
+.report-item { margin:0.25rem 0; }
+.report-meta { color:var(--muted); font-size:12px; margin-left:8px; }
 </style>
 """, unsafe_allow_html=True)
 
 # =====================
-# Small utilities
+# Utilities
 # =====================
 def _safe_rerun():
     try:
@@ -73,6 +69,14 @@ def _slug_addr(addr: str) -> str:
     a = re.sub(r"[^\w\s,-]", "", a).replace(",", "")
     return re.sub(r"\s+", "-", a).strip("-")
 
+def _fmt_ts(ts: str) -> str:
+    # Expecting ISO (possibly with Z). Fall back to raw.
+    try:
+        d = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+        return d.strftime("%b %d, %Y • %I:%M %p")
+    except Exception:
+        return ts
+
 # ==============
 # Query params
 # ==============
@@ -88,7 +92,7 @@ def _qp_get(name, default=None):
         return (qp.get(name, [default]) or [default])[0]
 
 def _qp_set(**kwargs):
-    """Use ONLY one API per run to avoid Streamlit warning."""
+    """Use ONLY one API per run to avoid Streamlit's 'single query API' error."""
     try:
         if kwargs:
             st.query_params.update(kwargs)
@@ -223,9 +227,8 @@ def fetch_tour_slugs_for_client(client_norm: str):
 def _dedupe_by_property(rows: List[Dict[str,Any]]) -> List[Dict[str,Any]]:
     """
     Keep ONLY the most-recent entry per property for the report.
-    Priority key: (canonical lower) first, else (slug of address/url).
+    Key = lower(canonical) if present, else slug(address/url).
     """
-    # Normalize sent_at → comparable
     def parse_ts(ts: str):
         try:
             return datetime.fromisoformat(ts.replace("Z","+00:00"))
@@ -234,14 +237,13 @@ def _dedupe_by_property(rows: List[Dict[str,Any]]) -> List[Dict[str,Any]]:
 
     buckets: Dict[str, Dict[str,Any]] = {}
     for r in rows:
-        canon = (r.get("canonical") or "").strip().lower()
-        if not canon:
+        key = (r.get("canonical") or "").strip().lower()
+        if not key:
             addr = (r.get("address") or "").strip() or address_text_from_url(r.get("url",""))
-            canon = _slug_addr(addr)
-        cur = buckets.get(canon)
+            key = _slug_addr(addr)
+        cur = buckets.get(key)
         if not cur or parse_ts(r.get("sent_at") or "") > parse_ts(cur.get("sent_at") or ""):
-            buckets[canon] = r
-    # Most recent first (original rows already desc by sent_at, so dict order is fine)
+            buckets[key] = r
     return list(buckets.values())
 
 # =================
@@ -260,7 +262,7 @@ def _client_row_icons(name: str, norm: str, cid: int, active: bool):
     with col_rep:
         # ▦ Open report
         if st.button("▦", key=f"rep_{cid}", help="Open report"):
-            st.session_state["__active_tab__"] = "Clients"  # prevent tab jump on rerun
+            st.session_state["__active_tab__"] = "Clients"  # stay on tab after rerun
             _qp_set(report=norm, scroll="1")
             _safe_rerun()
 
@@ -315,7 +317,7 @@ def _client_row_icons(name: str, norm: str, cid: int, active: bool):
     st.markdown("<div class='section-rule'></div>", unsafe_allow_html=True)
 
 # ======================
-# Report renderer (inline)
+# Inline report renderer
 # ======================
 def _render_client_report_view(client_display_name: str, client_norm: str):
     st.markdown(f"### Report for {escape(client_display_name)}", unsafe_allow_html=True)
@@ -328,7 +330,6 @@ def _render_client_report_view(client_display_name: str, client_norm: str):
             _qp_set()  # clear query params
             _safe_rerun()
 
-    # Fetch & cross-check
     sent_rows = fetch_sent_for_client(client_norm)
     tour_slugs = fetch_tour_slugs_for_client(client_norm)
 
@@ -376,28 +377,39 @@ def _render_client_report_view(client_display_name: str, client_norm: str):
     deduped = _dedupe_by_property(filtered)
     st.caption(f"{len(deduped)} unique listing{'s' if len(deduped)!=1 else ''} (deduped by property)")
 
-    # Render list
+    # Render list with INLINE styles for tags to avoid CSS conflicts
+    def _chip(text: str) -> str:
+        # neutral chip for campaign
+        return f"<span style='font-size:11px;font-weight:700;padding:2px 6px;border-radius:999px;background:#e2e8f0;margin-left:8px;'>{escape(text)}</span>"
+
+    def _badge_toured() -> str:
+        # blue-ish "Toured" badge
+        return "<span style='font-size:11px;font-weight:800;padding:2px 6px;border-radius:999px;background:#e0f2fe;color:#075985;border:1px solid #7dd3fc;margin-left:8px;'>Toured</span>"
+
     items_html = []
     for r in deduped:
         url = (r.get("url") or "").strip()
         addr = (r.get("address") or "").strip() or address_text_from_url(url) or "Listing"
-        sent_at = r.get("sent_at") or ""
+        sent_at = _fmt_ts(r.get("sent_at") or "")
         camp = (r.get("campaign") or "").strip()
 
         # Toured badge via slug intersection
         slug = _slug_addr(addr or address_text_from_url(url))
         toured = slug in tour_slugs
 
-        meta = [f"<span class='report-meta'>{escape(sent_at)}</span>"]
-        if camp and sel_campaign is None:
-            meta.append(f"<span class='badge'>{escape(camp)}</span>")
+        # Meta line: date • time  |  campaign  |  Toured
+        meta_bits = []
+        if sent_at:
+            meta_bits.append(f"<span class='report-meta'>{escape(sent_at)}</span>")
+        if camp:
+            meta_bits.append(_chip(camp))
         if toured:
-            meta.append(f"<span class='badge toured'>Toured</span>")
+            meta_bits.append(_badge_toured())
 
         items_html.append(
             f"""<li class="report-item">
                    <a href="{escape(url)}" target="_blank" rel="noopener">{escape(addr)}</a>
-                   {"".join(meta)}
+                   {' '.join(meta_bits)}
                 </li>"""
         )
 
@@ -425,7 +437,7 @@ def _render_client_report_view(client_display_name: str, client_norm: str):
 # ======================
 def render_clients_tab():
     st.subheader("Clients")
-    st.caption("Use the ▦ icon to open an inline report; ✎ rename; ⟳ toggle active; ⌫ delete.")
+    st.caption("Use ▦ to open an inline report; ✎ rename; ⟳ toggle active; ⌫ delete.")
 
     report_norm_qp = _qp_get("report", "")
     want_scroll = _qp_get("scroll", "") in ("1","true","yes")
