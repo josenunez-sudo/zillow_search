@@ -2,7 +2,7 @@
 import os, re, io
 from datetime import datetime
 from html import escape
-from typing import List, Dict, Any, Optional, Tuple
+from typing import List, Dict, Any, Optional
 
 import streamlit as st
 
@@ -13,20 +13,58 @@ except Exception:
     create_client = None
     Client = Any  # type: ignore
 
+# ====== Optional: flip to True to see per-row debug under each item ======
+DEBUG_REPORT = False
+
 
 # ================= Basics (pure helpers; safe at import time) =================
 def _norm_tag(s: str) -> str:
     return re.sub(r"\s+", " ", (s or "").strip()).lower()
 
 def _fmt_ts(ts: str) -> str:
-    """Return a nice timestamp chip value; fall back to raw if parse fails."""
-    if not ts:
+    """Format ISO-ish/epoch-ish timestamps nicely; fall back to raw if needed."""
+    if ts is None or str(ts).strip() == "":
         return ""
+    raw = str(ts).strip()
+
+    # Try epoch seconds/millis
     try:
-        d = datetime.fromisoformat(ts.replace("Z","+00:00"))
+        if raw.isdigit():
+            val = int(raw)
+            if val > 10_000_000_000:  # ms
+                d = datetime.utcfromtimestamp(val / 1000.0)
+            else:
+                d = datetime.utcfromtimestamp(val)
+            return d.strftime("%b %d, %Y • %I:%M %p")
+    except Exception:
+        pass
+
+    # Try ISO with/without Z
+    try:
+        d = datetime.fromisoformat(raw.replace("Z", "+00:00"))
         return d.strftime("%b %d, %Y • %I:%M %p")
     except Exception:
-        return str(ts)
+        return raw  # show something rather than nothing
+
+def _pick_timestamp_field(row: Dict[str, Any]) -> str:
+    """
+    Look for the first non-empty timestamp-ish field and format it.
+    We check several common keys to be resilient to schema differences.
+    """
+    candidates = [
+        "sent_at", "sentAt",
+        "created_at", "createdAt",
+        "inserted_at", "insertedAt",
+        "updated_at", "updatedAt",
+        "ts", "timestamp"
+    ]
+    for k in candidates:
+        v = row.get(k)
+        nice = _fmt_ts(v if isinstance(v, str) else (str(v) if v is not None else ""))
+        if nice:
+            return nice
+    return ""  # none found
+
 
 # ------------- Property slug normalization (strong & symmetric) -------------
 _STTYPE = {
@@ -91,7 +129,6 @@ def _property_key(row: Dict[str, Any]) -> str:
     return "url::" + (url.lower())
 
 def _qp_get(name, default=None):
-    # Works on old/new Streamlit
     try:
         qp = st.query_params
         val = qp.get(name, default)
@@ -151,20 +188,6 @@ def _inject_css_once():
       color:#a7f3d0; border-color:rgba(167,243,208,.35);
     }
     .pill.inactive { opacity: 0.95; }
-
-    .iconbar { display:flex; align-items:center; gap:8px; }
-    .iconbar .stButton > button {
-      min-width: 28px; height: 28px; padding:0 8px;
-      border-radius: 8px; border:1px solid rgba(0,0,0,.08);
-      font-weight:700; line-height:1; cursor:pointer;
-      background:#f8fafc; color:#475569;
-      transition: transform .08s ease, box-shadow .12s ease, filter .08s ease;
-    }
-    html[data-theme="dark"] .iconbar .stButton > button {
-      background:#0f172a; color:#cbd5e1; border-color:rgba(255,255,255,.08);
-    }
-    .iconbar .stButton > button:hover { transform: translateY(-1px); }
-    .iconbar .stButton > button:active { transform: translateY(0) scale(.98); }
 
     .section-rule { border-bottom:1px solid var(--row-border); margin:8px 0 6px 0; }
     .report-item { margin:0.30rem 0; line-height:1.35; }
@@ -419,25 +442,40 @@ def _render_client_report_view(client_display_name: str, client_norm: str):
     for r in deduped:
         url  = (r.get("url") or "").strip()
         addr = (r.get("address") or "").strip() or _address_text_from_url(url) or "Listing"
-        when = _fmt_ts(r.get("sent_at") or "")
-        camp = (r.get("campaign") or "").strip()
 
-        # robust Toured check (normalized both sides)
+        # DATE chip: pick first usable field (sent_at, created_at, etc.) and format
+        when = _pick_timestamp_field(r)
+
+        # CAMPAIGN chip: show "— no campaign —" if blank
+        raw_camp = (r.get("campaign") or "").strip()
+        camp = raw_camp if raw_camp else "— no campaign —"
+
+        # Toured badge: robust slug match
         norm_pslug = _norm_slug_from_url(url) or _norm_slug_from_text(addr)
         toured = norm_pslug in tour_norm_slugs
 
         meta: List[str] = []
         if when:
             meta.append(chip(when))
-        # Always show a campaign chip; label empty as "— no campaign —"
-        meta.append(chip(camp if camp else "— no campaign —"))
+        meta.append(chip(camp))
         if toured:
             meta.append("<span class='toured-badge'>Toured</span>")
+
+        debug_html = ""
+        if DEBUG_REPORT:
+            debug_html = (
+                "<div style='font-size:10px;opacity:.75;margin-left:8px'>"
+                f"[debug] url={escape(url)} &nbsp; "
+                f"addr={escape(addr)} &nbsp; slug={escape(norm_pslug)} &nbsp; "
+                f"toured={'yes' if toured else 'no'}"
+                "</div>"
+            )
 
         items.append(
             f"""<li class="report-item">
                   <a href="{escape(url)}" target="_blank" rel="noopener">{escape(addr)}</a>
                   {' '.join(meta)}
+                  {debug_html}
                 </li>"""
         )
 
@@ -463,7 +501,6 @@ def _render_client_report_view(client_display_name: str, client_norm: str):
 
 # ============== Public entry (call this from app.py) ==============
 def render_clients_tab():
-    # Inject CSS only when this tab actually renders
     _inject_css_once()
 
     st.subheader("Clients")
@@ -488,7 +525,6 @@ def render_clients_tab():
         for c in inactive:
             _client_row_icons(c["name"], c.get("name_norm",""), c["id"], active=False)
 
-    # Inline report
     st.markdown('<div id="report_anchor"></div>', unsafe_allow_html=True)
     if report_norm_qp:
         display_name = next((c["name"] for c in all_clients if c.get("name_norm")==report_norm_qp), report_norm_qp)
