@@ -13,83 +13,8 @@ except Exception:
     create_client = None
     Client = Any  # type: ignore
 
-# =============== Styling (visible pills, meta chips, red toured badge) ===============
-st.markdown("""
-<style>
-:root { --row-border:#e2e8f0; --ink:#0f172a; --muted:#475569; }
-html[data-theme="dark"], .stApp [data-theme="dark"] {
-  --row-border:#0b1220; --ink:#f8fafc; --muted:#cbd5e1;
-}
 
-.client-row { display:flex; align-items:center; justify-content:space-between; padding:10px 8px; border-bottom:1px solid var(--row-border); }
-.client-left { display:flex; align-items:center; gap:8px; min-width:0; }
-.client-name { font-weight:700; color:var(--ink); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
-
-/* Pill base is now always visible */
-.pill {
-  font-size:11px; font-weight:800; padding:2px 10px; border-radius:999px;
-  background:#f1f5f9; color:#0f172a; border:1px solid #cbd5e1; display:inline-block;
-}
-html[data-theme="dark"] .pill {
-  background:#111827; color:#e5e7eb; border-color:#374151;
-}
-.pill.active {
-  background: linear-gradient(180deg, #dcfce7 0%, #bbf7d0 100%);
-  color:#166534; border:1px solid rgba(5,150,105,.35);
-}
-html[data-theme="dark"] .pill.active {
-  background: linear-gradient(180deg, #064e3b 0%, #065f46 100%);
-  color:#a7f3d0; border-color:rgba(167,243,208,.35);
-}
-/* explicit inactive variant */
-.pill.inactive { opacity: 0.95; }
-
-.iconbar { display:flex; align-items:center; gap:8px; }
-.iconbar .stButton > button {
-  min-width: 28px; height: 28px; padding:0 8px;
-  border-radius: 8px; border:1px solid rgba(0,0,0,.08);
-  font-weight:700; line-height:1; cursor:pointer;
-  background:#f8fafc; color:#475569;
-  transition: transform .08s ease, box-shadow .12s ease, filter .08s ease;
-}
-html[data-theme="dark"] .iconbar .stButton > button {
-  background:#0f172a; color:#cbd5e1; border-color:rgba(255,255,255,.08);
-}
-.iconbar .stButton > button:hover { transform: translateY(-1px); }
-.iconbar .stButton > button:active { transform: translateY(0) scale(.98); }
-
-.section-rule { border-bottom:1px solid var(--row-border); margin:8px 0 6px 0; }
-.report-item { margin:0.30rem 0; line-height:1.35; }
-
-/* Meta chip: stronger contrast */
-.meta-chip {
-  display:inline-block; font-size:11px; font-weight:800;
-  padding:2px 6px; border-radius:999px; margin-left:8px;
-  background:#eef2ff; color:#1e3a8a; border:1px solid #c7d2fe;
-}
-html[data-theme="dark"] .meta-chip {
-  background:#1f2937; color:#bfdbfe; border-color:#374151;
-}
-
-/* ---- RED toured badge ---- */
-.toured-badge {
-  display:inline-block; font-size:11px; font-weight:800;
-  padding:2px 6px; border-radius:999px; margin-left:8px;
-  background:#fee2e2; color:#991b1b; border:1px solid #fecaca;
-}
-html[data-theme="dark"] .toured-badge {
-  background:#7f1d1d; color:#fecaca; border-color:#ef4444;
-}
-</style>
-""", unsafe_allow_html=True)
-
-# ================= Basics =================
-def _safe_rerun():
-    try: st.rerun()
-    except Exception:
-        try: st.experimental_rerun()
-        except Exception: pass
-
+# ================= Basics (pure helpers; safe at import time) =================
 def _norm_tag(s: str) -> str:
     return re.sub(r"\s+", " ", (s or "").strip()).lower()
 
@@ -101,7 +26,6 @@ def _fmt_ts(ts: str) -> str:
         d = datetime.fromisoformat(ts.replace("Z","+00:00"))
         return d.strftime("%b %d, %Y • %I:%M %p")
     except Exception:
-        # show the raw value so the chip is still visible
         return str(ts)
 
 # ------------- Property slug normalization (strong & symmetric) -------------
@@ -126,14 +50,11 @@ def _token_norm(tok: str) -> str:
     t = tok.lower().strip(" .,#")
     if t in _STTYPE: return _STTYPE[t]
     if t in _DIR:    return _DIR[t]
-    # unify apartment/unit markers (drop)
     if t in {"apt","unit","ste","lot"}: return ""
     return re.sub(r"[^a-z0-9-]", "", t)
 
 def _norm_slug_from_text(text: str) -> str:
-    # Turn any address-ish text into a comparable slug
-    s = (text or "").lower()
-    s = s.replace("&", " and ")
+    s = (text or "").lower().replace("&", " and ")
     toks = re.split(r"[^a-z0-9]+", s)
     norm = [t for t in (_token_norm(t) for t in toks) if t]
     return "-".join(norm)
@@ -157,7 +78,6 @@ def _address_text_from_url(url: str) -> str:
     if m: return re.sub(r"[-+]", " ", m.group(1)).title()
     return ""
 
-# ------------- Strong “same-property” key -------------
 def _property_key(row: Dict[str, Any]) -> str:
     url = (row.get("url") or "").strip()
     addr = (row.get("address") or "").strip() or _address_text_from_url(url)
@@ -170,8 +90,8 @@ def _property_key(row: Dict[str, Any]) -> str:
     if zpid: return "zpid::" + zpid
     return "url::" + (url.lower())
 
-# ============== Query params (use one API only) ==============
 def _qp_get(name, default=None):
+    # Works on old/new Streamlit
     try:
         qp = st.query_params
         val = qp.get(name, default)
@@ -190,8 +110,89 @@ def _qp_set(**kwargs):
         if kwargs: st.experimental_set_query_params(**kwargs)
         else:      st.experimental_set_query_params()
 
-# ============== Supabase ==============
-@st.cache_resource
+def _dedupe_by_property(rows: List[Dict[str,Any]]) -> List[Dict[str,Any]]:
+    def ts(row):
+        try: return datetime.fromisoformat((row.get("sent_at") or "").replace("Z","+00:00"))
+        except Exception: return datetime.min
+    best: Dict[str, Dict[str,Any]] = {}
+    for r in rows:
+        key = _property_key(r)
+        if key not in best or ts(r) > ts(best[key]):
+            best[key] = r
+    return list(best.values())
+
+
+# ================= Lazy Streamlit bits (run-time only) =================
+def _inject_css_once():
+    if st.session_state.get("__clients_css_injected__"):
+        return
+    st.session_state["__clients_css_injected__"] = True
+    st.markdown("""
+    <style>
+    :root { --row-border:#e2e8f0; --ink:#0f172a; --muted:#475569; }
+    html[data-theme="dark"], .stApp [data-theme="dark"] {
+      --row-border:#0b1220; --ink:#f8fafc; --muted:#cbd5e1;
+    }
+    .client-row { display:flex; align-items:center; justify-content:space-between; padding:10px 8px; border-bottom:1px solid var(--row-border); }
+    .client-left { display:flex; align-items:center; gap:8px; min-width:0; }
+    .client-name { font-weight:700; color:var(--ink); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+
+    .pill {
+      font-size:11px; font-weight:800; padding:2px 10px; border-radius:999px;
+      background:#f1f5f9; color:#0f172a; border:1px solid #cbd5e1; display:inline-block;
+    }
+    html[data-theme="dark"] .pill { background:#111827; color:#e5e7eb; border-color:#374151; }
+    .pill.active {
+      background: linear-gradient(180deg, #dcfce7 0%, #bbf7d0 100%);
+      color:#166534; border:1px solid rgba(5,150,105,.35);
+    }
+    html[data-theme="dark"] .pill.active {
+      background: linear-gradient(180deg, #064e3b 0%, #065f46 100%);
+      color:#a7f3d0; border-color:rgba(167,243,208,.35);
+    }
+    .pill.inactive { opacity: 0.95; }
+
+    .iconbar { display:flex; align-items:center; gap:8px; }
+    .iconbar .stButton > button {
+      min-width: 28px; height: 28px; padding:0 8px;
+      border-radius: 8px; border:1px solid rgba(0,0,0,.08);
+      font-weight:700; line-height:1; cursor:pointer;
+      background:#f8fafc; color:#475569;
+      transition: transform .08s ease, box-shadow .12s ease, filter .08s ease;
+    }
+    html[data-theme="dark"] .iconbar .stButton > button {
+      background:#0f172a; color:#cbd5e1; border-color:rgba(255,255,255,.08);
+    }
+    .iconbar .stButton > button:hover { transform: translateY(-1px); }
+    .iconbar .stButton > button:active { transform: translateY(0) scale(.98); }
+
+    .section-rule { border-bottom:1px solid var(--row-border); margin:8px 0 6px 0; }
+    .report-item { margin:0.30rem 0; line-height:1.35; }
+
+    .meta-chip {
+      display:inline-block; font-size:11px; font-weight:800;
+      padding:2px 6px; border-radius:999px; margin-left:8px;
+      background:#eef2ff; color:#1e3a8a; border:1px solid #c7d2fe;
+    }
+    html[data-theme="dark"] .meta-chip { background:#1f2937; color:#bfdbfe; border-color:#374151; }
+
+    .toured-badge {
+      display:inline-block; font-size:11px; font-weight:800;
+      padding:2px 6px; border-radius:999px; margin-left:8px;
+      background:#fee2e2; color:#991b1b; border:1px solid #fecaca;
+    }
+    html[data-theme="dark"] .toured-badge { background:#7f1d1d; color:#fecaca; border-color:#ef4444; }
+    </style>
+    """, unsafe_allow_html=True)
+
+def _safe_rerun():
+    try: st.rerun()
+    except Exception:
+        try: st.experimental_rerun()
+        except Exception: pass
+
+# ============== Supabase (lazy + safe) ==============
+@st.cache_resource(show_spinner=False)
 def get_supabase() -> Optional["Client"]:
     if create_client is None:
         return None
@@ -204,15 +205,15 @@ def get_supabase() -> Optional["Client"]:
     except Exception:
         return None
 
-SUPABASE = get_supabase()
-def _sb_ok() -> bool:
+def _sb_ok(SUPABASE) -> bool:
     try: return bool(SUPABASE)
     except Exception: return False
 
-# ============== DB helpers ==============
+# ============== DB helpers (lazy supabase handle) ==============
 @st.cache_data(ttl=60, show_spinner=False)
-def fetch_clients(include_inactive: bool = False):
-    if not _sb_ok(): return []
+def fetch_clients(include_inactive: bool = False) -> List[Dict[str, Any]]:
+    SUPABASE = get_supabase()
+    if not _sb_ok(SUPABASE): return []
     try:
         rows = SUPABASE.table("clients").select("id,name,name_norm,active").order("name", desc=False).execute().data or []
         return ([r for r in rows if r.get("active")] if not include_inactive else rows)
@@ -224,7 +225,8 @@ def _invalidate_clients_cache():
     except Exception: pass
 
 def toggle_client_active(client_id: int, new_active: bool):
-    if not _sb_ok() or not client_id: return False, "Not configured"
+    SUPABASE = get_supabase()
+    if not _sb_ok(SUPABASE) or not client_id: return False, "Not configured"
     try:
         SUPABASE.table("clients").update({"active": new_active}).eq("id", client_id).execute()
         _invalidate_clients_cache()
@@ -233,7 +235,8 @@ def toggle_client_active(client_id: int, new_active: bool):
         return False, str(e)
 
 def rename_client(client_id: int, new_name: str):
-    if not _sb_ok() or not client_id or not (new_name or "").strip(): return False, "Bad input"
+    SUPABASE = get_supabase()
+    if not _sb_ok(SUPABASE) or not client_id or not (new_name or "").strip(): return False, "Bad input"
     try:
         new_norm = _norm_tag(new_name)
         existing = SUPABASE.table("clients").select("id").eq("name_norm", new_norm).limit(1).execute().data or []
@@ -246,7 +249,8 @@ def rename_client(client_id: int, new_name: str):
         return False, str(e)
 
 def delete_client(client_id: int):
-    if not _sb_ok() or not client_id: return False, "Not configured"
+    SUPABASE = get_supabase()
+    if not _sb_ok(SUPABASE) or not client_id: return False, "Not configured"
     try:
         SUPABASE.table("clients").delete().eq("id", client_id).execute()
         _invalidate_clients_cache()
@@ -254,10 +258,10 @@ def delete_client(client_id: int):
     except Exception as e:
         return False, str(e)
 
-# ---- Sent + Tours ----
 @st.cache_data(ttl=120, show_spinner=False)
 def fetch_sent_for_client(client_norm: str, limit: int = 5000):
-    if not (_sb_ok() and client_norm.strip()): return []
+    SUPABASE = get_supabase()
+    if not (_sb_ok(SUPABASE) and client_norm.strip()): return []
     try:
         cols = "url,address,sent_at,campaign,mls_id,canonical,zpid"
         resp = SUPABASE.table("sent").select(cols)\
@@ -270,11 +274,8 @@ def fetch_sent_for_client(client_norm: str, limit: int = 5000):
 
 @st.cache_data(ttl=120, show_spinner=False)
 def fetch_tour_norm_slugs_for_client(client_norm: str) -> set:
-    """
-    Return *normalized* slugs for every tour stop for this client.
-    We normalize the stored address_slug (or the address) using the same token rules as Sent.
-    """
-    if not (_sb_ok() and client_norm.strip()): return set()
+    SUPABASE = get_supabase()
+    if not (_sb_ok(SUPABASE) and client_norm.strip()): return set()
     try:
         tq = SUPABASE.table("tours").select("id").eq("client", client_norm).limit(5000).execute()
         ids = [t["id"] for t in (tq.data or [])]
@@ -291,19 +292,8 @@ def fetch_tour_norm_slugs_for_client(client_norm: str) -> set:
     except Exception:
         return set()
 
-# ---- Display de-dupe (keep newest per property) ----
-def _dedupe_by_property(rows: List[Dict[str,Any]]) -> List[Dict[str,Any]]:
-    def ts(row):
-        try: return datetime.fromisoformat((row.get("sent_at") or "").replace("Z","+00:00"))
-        except Exception: return datetime.min
-    best: Dict[str, Dict[str,Any]] = {}
-    for r in rows:
-        key = _property_key(r)
-        if key not in best or ts(r) > ts(best[key]):
-            best[key] = r
-    return list(best.values())
 
-# ================= Client row (▦ ✎ ⟳ ⌫) =================
+# ================= UI bits =================
 def _client_row_icons(name: str, norm: str, cid: int, active: bool):
     col_name, col_rep, col_ren, col_tog, col_del, col_sp = st.columns([8, 1, 1, 1, 1, 2])
 
@@ -329,7 +319,8 @@ def _client_row_icons(name: str, norm: str, cid: int, active: bool):
     with col_tog:
         if st.button("⟳", key=f"tg_{cid}", help=("Deactivate" if active else "Activate")):
             try:
-                rows = SUPABASE.table("clients").select("active").eq("id", cid).limit(1).execute().data or []
+                SUPABASE = get_supabase()
+                rows = [] if not _sb_ok(SUPABASE) else SUPABASE.table("clients").select("active").eq("id", cid).limit(1).execute().data or []
                 cur = rows[0]["active"] if rows else active
                 toggle_client_active(cid, (not cur))
             except Exception:
@@ -341,7 +332,6 @@ def _client_row_icons(name: str, norm: str, cid: int, active: bool):
         if st.button("⌫", key=f"del_{cid}", help="Delete"):
             st.session_state[f"__del_{cid}"] = True
 
-    # Inline rename editor
     if st.session_state.get(f"__edit_{cid}"):
         st.markdown("<div class='section-rule'></div>", unsafe_allow_html=True)
         new_name = st.text_input("New name", value=name, key=f"rn_val_{cid}")
@@ -355,7 +345,6 @@ def _client_row_icons(name: str, norm: str, cid: int, active: bool):
         if cc2.button("Cancel", key=f"rn_cancel_{cid}"):
             st.session_state[f"__edit_{cid}"] = False
 
-    # Inline delete confirm
     if st.session_state.get(f"__del_{cid}"):
         st.markdown("<div class='section-rule'></div>", unsafe_allow_html=True)
         dc1, dc2 = st.columns([0.25, 0.25])
@@ -369,7 +358,7 @@ def _client_row_icons(name: str, norm: str, cid: int, active: bool):
 
     st.markdown("<div class='section-rule'></div>", unsafe_allow_html=True)
 
-# ============== Report (deduped + date/campaign chips + “Toured” badge) ==============
+
 def _render_client_report_view(client_display_name: str, client_norm: str):
     st.markdown(f"### Report for {escape(client_display_name)}", unsafe_allow_html=True)
 
@@ -401,7 +390,8 @@ def _render_client_report_view(client_display_name: str, client_norm: str):
                          format_func=lambda j: labels[j], index=0, key=f"__camp_{client_norm}")
         sel_camp = keys[i]
     with colF2:
-        q = st.text_input("Search address / MLS / URL", value="", placeholder="e.g. 407 Woodall, 2501234, /homedetails/",
+        q = st.text_input("Search address / MLS / URL", value="",
+                          placeholder="e.g. 407 Woodall, 2501234, /homedetails/",
                           key=f"__q_{client_norm}")
         qn = (q or "").strip().lower()
     with colF3:
@@ -420,12 +410,9 @@ def _render_client_report_view(client_display_name: str, client_norm: str):
     st.caption(f"{len(deduped)} unique listing{'s' if len(deduped)!=1 else ''} (deduped by property)")
 
     def chip(t: Any) -> str:
-        """Return a meta-chip span for non-empty values."""
-        if t is None:
-            return ""
+        if t is None: return ""
         s = str(t).strip()
-        if not s:
-            return ""
+        if not s: return ""
         return f"<span class='meta-chip'>{escape(s)}</span>"
 
     items: List[str] = []
@@ -435,25 +422,22 @@ def _render_client_report_view(client_display_name: str, client_norm: str):
         when = _fmt_ts(r.get("sent_at") or "")
         camp = (r.get("campaign") or "").strip()
 
-        # -------- robust Toured check (normalized on both sides) --------
+        # robust Toured check (normalized both sides)
         norm_pslug = _norm_slug_from_url(url) or _norm_slug_from_text(addr)
         toured = norm_pslug in tour_norm_slugs
 
         meta: List[str] = []
         if when:
             meta.append(chip(when))
-        if camp or camp == "":
-            # show empty campaign as a labeled chip too
-            meta.append(chip(camp if camp else "— no campaign —"))
+        # Always show a campaign chip; label empty as "— no campaign —"
+        meta.append(chip(camp if camp else "— no campaign —"))
         if toured:
             meta.append("<span class='toured-badge'>Toured</span>")
-
-        meta_html = " ".join(meta)
 
         items.append(
             f"""<li class="report-item">
                   <a href="{escape(url)}" target="_blank" rel="noopener">{escape(addr)}</a>
-                  {meta_html}
+                  {' '.join(meta)}
                 </li>"""
         )
 
@@ -476,8 +460,12 @@ def _render_client_report_view(client_display_name: str, client_norm: str):
             use_container_width=False
         )
 
-# ============== Public entry ==============
+
+# ============== Public entry (call this from app.py) ==============
 def render_clients_tab():
+    # Inject CSS only when this tab actually renders
+    _inject_css_once()
+
     st.subheader("Clients")
     st.caption("Use ▦ to open an inline report; ✎ rename; ⟳ toggle active; ⌫ delete.")
 
