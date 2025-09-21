@@ -1,7 +1,9 @@
 # ui/run_tab.py
-# Address Alchemist — Run tab: paste addresses & listing links -> Zillow
-# - Shows "Toured" badge when a sent result matches any toured address for the selected client
+# Address Alchemist — Run tab
+# - Shows "Toured" badge when a result matches any toured address for the selected client
 # - Prevents duplicate logging (case-insensitive canonical) for the selected client
+# - Removed the "NEW" badge per request
+# - If there are no results to render, shows a visible "No results returned." message
 
 import os, csv, io, re, time, json, asyncio
 from datetime import datetime
@@ -138,7 +140,7 @@ def extract_components(row):
     return {"street_raw": street_raw, "city": city, "state": state, "zip": zipc,
             "mls_id": get_first_by_keys(n, MLS_ID_KEYS), "mls_name": get_first_by_keys(n, MLS_NAME_KEYS)}
 
-# ---------- Strong address normalization (shared with Clients/Tours logic) ----------
+# ---------- Strong address normalization ----------
 SUFFIX_MAP = {
     "st":"street","street":"street","rd":"road","road":"road","ave":"avenue","av":"avenue","avenue":"avenue",
     "blvd":"boulevard","boulevard":"boulevard","dr":"drive","drive":"drive","ln":"lane","lane":"lane",
@@ -189,7 +191,7 @@ def _property_key_from_result(r: Dict[str, Any]) -> str:
         addr = _address_from_zillow_url(r.get("preview_url") or r.get("zillow_url") or r.get("display_url") or "")
     return _normalize_address_strong(addr)
 
-# ---------- Search / resolve helpers (trimmed to essentials) ----------
+# ---------- Resolve helpers (minimal) ----------
 def compose_query_address(street, city, state, zipc, defaults):
     parts = [street]
     c  = (city  or defaults.get("city","")).strip()
@@ -215,13 +217,11 @@ def construct_deeplink_from_parts(street, city, state, zipc, defaults):
 
 def resolve_from_source_url(source_url: str, defaults: Dict[str,str]) -> Tuple[str, str]:
     final_url, html, _ = expand_url_and_fetch_html(source_url)
-    # super-lightweight scrape: try to detect address-ish title if no homedetails
     if "/homedetails/" in final_url:
         return final_url, ""
     title = ""
     m = re.search(r"<title>\s*([^<]+?)\s*</title>", html, re.I)
     if m: title = re.sub(r"\s+", " ", m.group(1)).strip()
-    # fall back to deeplink from any text we got
     return construct_deeplink_from_parts(title or "", "", "", "", defaults), title
 
 def process_single_row(row, *, delay=0.45, defaults=None):
@@ -233,7 +233,7 @@ def process_single_row(row, *, delay=0.45, defaults=None):
     time.sleep(min(delay, 0.4))
     return {"input_address": query_address, "mls_id": comp.get("mls_id") or "", "zillow_url": deeplink, "status": "", "csv_photo": get_first_by_keys(row, PHOTO_KEYS)}
 
-# ---------- Images fallback (kept minimal) ----------
+# ---------- Images (minimal) ----------
 def extract_zillow_first_image(html: str) -> Optional[str]:
     if not html: return None
     m = re.search(r"(https://photos\.zillowstatic\.com/fp/\S+-cc_ft_\d+\.(jpg|webp))", html, re.I)
@@ -257,7 +257,7 @@ def picture_for_result_with_log(query_address: str, zurl: str, csv_photo_url: Op
 def get_thumbnail_and_log(query_address: str, zurl: str, csv_photo_url: Optional[str]):
     return picture_for_result_with_log(query_address, zurl, csv_photo_url)
 
-# ---------- Clients registry helpers (cached) ----------
+# ---------- Clients registry ----------
 @st.cache_data(ttl=60, show_spinner=False)
 def fetch_clients(include_inactive: bool = False):
     if not _sb_ok(): return []
@@ -276,7 +276,7 @@ def upsert_client(name: str, active: bool = True, notes: str = None):
         payload = {"name": name.strip(), "name_norm": name_norm, "active": active}
         if notes is not None: payload["notes"] = notes
         SUPABASE.table("clients").upsert(payload, on_conflict="name_norm").execute()
-        try: fetch_clients.clear()  # invalidate cache
+        try: fetch_clients.clear()
         except Exception: pass
         return True, "ok"
     except Exception as e:
@@ -303,7 +303,7 @@ def build_toured_keyset(client_norm: str) -> set:
     addrs = fetch_all_tour_addresses_for_client(client_norm)
     return { _normalize_address_strong(a) for a in addrs if a.strip() }
 
-# ---------- Sent (already logged) lookups ----------
+# ---------- Sent lookups ----------
 @st.cache_data(ttl=300, show_spinner=False)
 def get_already_sent_maps(client_tag: str):
     """
@@ -384,8 +384,7 @@ def log_sent_rows(results: List[Dict[str, Any]], client_tag: str, campaign_tag: 
 
         canon_l = (canon or "").lower()
         if not canon_l or canon_l in seen_lower:
-            # Skip duplicates (prevents 23505)
-            continue
+            continue  # skip duplicates
 
         rows.append({
             "client":     (client_tag or "").strip(),
@@ -408,33 +407,35 @@ def log_sent_rows(results: List[Dict[str, Any]], client_tag: str, campaign_tag: 
     except Exception as e:
         return False, str(e)
 
-# ---------- UI: results list with Copy + badges (NEW: Toured badge) ----------
+# ---------- UI: results list with Copy + badges (Toured + Duplicate only) ----------
 def results_list_with_copy_all(results: List[Dict[str, Any]], client_selected: bool):
+    # Build list items
     li_html = []
     for r in results:
         href = r.get("preview_url") or r.get("zillow_url") or r.get("display_url") or ""
         if not href:
             continue
         safe_href = escape(href)
-        link_txt = href  # keep URL text for clean SMS unfurls
+        link_txt = href  # keep raw URL text for clean SMS unfurls
 
-        badge_html = ""
-        if client_selected:
-            if r.get("already_sent"):
-                tip = f"Duplicate ({escape(r.get('dup_reason','') or '-')}); sent {escape(r.get('dup_sent_at') or '-')}"
-                badge_html = f' <span class="badge dup" title="{tip}">Duplicate</span>'
-            else:
-                badge_html = ' <span class="badge new" title="New for this client">NEW</span>'
+        badge_parts = []
+        if client_selected and r.get("already_sent"):
+            tip = f"Duplicate ({escape(r.get('dup_reason','') or '-')}); sent {escape(r.get('dup_sent_at') or '-')}"
+            badge_parts.append(f'<span class="badge dup" title="{tip}">Duplicate</span>')
 
-        toured_html = ''
         if r.get("was_toured"):
-            toured_html = ' <span class="badge" style="background:#0b7f48;color:#ecfdf5;border:1px solid #16a34a;">Toured</span>'
+            badge_parts.append('<span class="badge" style="background:#0b7f48;color:#ecfdf5;border:1px solid #16a34a;">Toured</span>')
 
-        li_html.append(
-            f'<li style="margin:0.2rem 0;"><a href="{safe_href}" target="_blank" rel="noopener">{escape(link_txt)}</a>{badge_html}{toured_html}</li>'
-        )
+        badges_html = ("".join(badge_parts)) if badge_parts else ""
+        li_html.append(f'<li style="margin:0.2rem 0;"><a href="{safe_href}" target="_blank" rel="noopener">{escape(link_txt)}</a>{badges_html}</li>')
 
-    items_html = "\n".join(li_html) if li_html else "<li>(no results)</li>"
+    # If nothing to render, show a visible message and stop
+    has_any = any(r.get("preview_url") or r.get("zillow_url") or r.get("display_url") for r in results)
+    if not has_any:
+        st.warning("No results returned.")
+        return
+
+    items_html = "\n".join(li_html) if li_html else "<li>(no rows)</li>"
 
     copy_lines = []
     for r in results:
@@ -453,7 +454,6 @@ def results_list_with_copy_all(results: List[Dict[str, Any]], client_selected: b
         .copyall-btn {{ position:absolute; top:0; right:8px; z-index:5; padding:6px 10px; height:26px; border:0; border-radius:10px; color:#fff; font-weight:700; background:#1d4ed8; cursor:pointer; opacity:.95; }}
         .badge {{ display:inline-block; font-size:12px; font-weight:800; padding:2px 8px; border-radius:999px; margin-left:8px; }}
         .badge.dup {{ background:#fee2e2; color:#991b1b; }}
-        .badge.new {{ background: linear-gradient(180deg, #dcfce7 0%, #bbf7d0 100%); color:#065f46; border:1px solid rgba(5,150,105,.35); box-shadow:0 6px 16px rgba(16,185,129,.25), 0 1px 3px rgba(0,0,0,.08); text-transform: uppercase; }}
       </style>
     </head><body>
       <div class="results-wrap">
@@ -480,7 +480,6 @@ def results_list_with_copy_all(results: List[Dict[str, Any]], client_selected: b
 
 # ---------- Main renderer ----------
 def render_run_tab(state: dict):
-    # Remember tab only when an action occurs (set in app.py around reruns)
     st.markdown("### Run")
 
     NO_CLIENT = "➤ No client (show ALL, no logging)"
@@ -510,7 +509,7 @@ def render_run_tab(state: dict):
 
     c1, c2, c3, c4 = st.columns([1,1,1.25,1.45])
     with c1:
-        use_shortlinks = st.checkbox("Use short links (Bitly)", value=False, help="Optional tracking; sharing uses clean Zillow links.")
+        use_shortlinks = st.checkbox("Use short links (Bitly)", value=False)
     with c2:
         enrich_details = st.checkbox("Enrich details", value=False)
     with c3:
@@ -605,7 +604,7 @@ def render_run_tab(state: dict):
                     rows_in.append({"address": item})
 
             if not rows_in:
-                st.error("Please paste at least one address or link and/or upload a CSV.")
+                st.warning("No results returned.")
                 st.stop()
 
             defaults = {"city":"", "state":"", "zip":""}
@@ -645,17 +644,15 @@ def render_run_tab(state: dict):
                 r["display_url"] = base
 
             client_selected = bool(client_tag.strip())
-
             toured_keys = build_toured_keyset(client_tag) if client_selected else set()
 
             if client_selected:
                 canon_set, zpid_set, canon_info, zpid_info, canon_lower_set = get_already_sent_maps(client_tag)
                 results = mark_duplicates(results, canon_set, zpid_set, canon_info, zpid_info, toured_keys)
 
-                # Never attempt to insert duplicates (DB safety)
+                # DB safety: do not attempt to insert dupes
                 results_for_db = [r for r in results if not r.get("already_sent")]
 
-                # UI toggle to hide duplicates in the list
                 if only_show_new:
                     results = results_for_db
 
@@ -663,11 +660,18 @@ def render_run_tab(state: dict):
                     ok_log, info_log = log_sent_rows(results_for_db, client_tag, campaign_tag, canon_lower_set)
                     st.success(info_log) if ok_log else st.warning(f"Supabase log skipped/failed: {info_log}")
                 else:
-                    st.info("Nothing new to log for this client.")
+                    if not results_for_db:
+                        st.info("Nothing new to log for this client.")
             else:
                 for r in results:
                     r["already_sent"] = False
                     r["was_toured"] = False
+
+            # If nothing to show after filtering, clearly say so
+            if not any(r.get("preview_url") or r.get("zillow_url") or r.get("display_url") for r in results):
+                st.warning("No results returned.")
+                st.session_state["__results__"] = {"results": [], "fmt": "txt"}
+                return
 
             st.success(f"Processed {len(results)} item(s)")
 
@@ -681,7 +685,7 @@ def render_run_tab(state: dict):
                 df = pd.DataFrame([{c: r.get(c) for c in cols} for r in results])
                 st.dataframe(df, use_container_width=True, hide_index=True)
 
-            # Persist for post-click view
+            # Persist
             st.session_state["__results__"] = {"results": results, "fmt": "txt"}
 
         except Exception as e:
@@ -694,3 +698,5 @@ def render_run_tab(state: dict):
     if results and not clicked:
         st.markdown("#### Results")
         results_list_with_copy_all(results, client_selected=False)
+    elif not clicked:
+        st.warning("No results returned.")
