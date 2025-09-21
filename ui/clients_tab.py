@@ -165,7 +165,7 @@ def _dedupe_by_property(rows: List[Dict[str,Any]]) -> List[Dict[str,Any]]:
 # ================= Lazy Streamlit bits (run-time only) =================
 def _inject_css_once():
     # bump this when you change styles so Streamlit reinjects CSS
-    CSS_VER = "clients-css-2025-09-21a"
+    CSS_VER = "clients-css-2025-09-21b"
     if st.session_state.get("__clients_css_version__") == CSS_VER:
         return
     st.session_state["__clients_css_version__"] = CSS_VER
@@ -477,12 +477,6 @@ def _render_client_report_view(client_display_name: str, client_norm: str):
     deduped  = _dedupe_by_property(filtered)
     st.caption(f"{len(deduped)} unique listing{'s' if len(deduped)!=1 else ''} (deduped by property)")
 
-    def chip(t: Any) -> str:
-        if t is None: return ""
-        s = str(t).strip()
-        if not s: return ""
-        return f"<span class='meta-chip'>{escape(s)}</span>"
-
     # Build Markdown bullet list with inline HTML chips/badges (avoids raw </li> showing)
     md_lines: List[str] = []
     for r in deduped:
@@ -510,7 +504,6 @@ def _render_client_report_view(client_display_name: str, client_norm: str):
                 f"slug={escape(norm_pslug)}, toured={'yes' if toured else 'no'})</span>"
             )
 
-        # Use Markdown bullet + inline HTML so no literal </li> appears
         line = f"- <a href=\"{escape(url)}\" target=\"_blank\" rel=\"noopener\">{escape(addr)}</a> {' '.join(meta)}{debug_html}"
         md_lines.append(line)
 
