@@ -164,12 +164,9 @@ def _dedupe_by_property(rows: List[Dict[str,Any]]) -> List[Dict[str,Any]]:
 
 # ================= Lazy Streamlit bits (run-time only) =================
 def _inject_css_once():
-    # bump this when you change styles so Streamlit reinjects CSS
-    CSS_VER = "clients-css-2025-09-21a"
-    if st.session_state.get("__clients_css_version__") == CSS_VER:
+    if st.session_state.get("__clients_css_injected__"):
         return
-    st.session_state["__clients_css_version__"] = CSS_VER
-
+    st.session_state["__clients_css_injected__"] = True
     st.markdown("""
     <style>
     :root { --row-border:#e2e8f0; --ink:#0f172a; --muted:#475569; }
