@@ -212,6 +212,7 @@ def _inject_css_once():
       background:#0b1220; color:#7dd3fc; border-color:#164e63;
     }
 
+    /* Red toured badge */
     .toured-badge {
       display:inline-block; font-size:11px; font-weight:800;
       padding:2px 6px; border-radius:999px; margin-left:8px;
@@ -469,7 +470,6 @@ def _render_client_report_view(client_display_name: str, client_norm: str):
             meta.append(f"<span class='date-badge'>{escape(date_tag)}</span>")
         if toured:
             meta.append("<span class='toured-badge'>Toured</span>")
-
 
         debug_html = ""
         if DEBUG_REPORT:
