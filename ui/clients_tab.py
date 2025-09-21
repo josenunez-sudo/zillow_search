@@ -2,7 +2,7 @@
 import os, re
 from datetime import datetime
 from html import escape
-from typing import List, Dict, Any, Optional, Tuple
+from typing import List, Dict, Any, Optional
 
 import streamlit as st
 from supabase import create_client, Client
@@ -36,26 +36,7 @@ def _stay_on_clients():
 def _norm_tag(s: str) -> str:
     return re.sub(r"\s+", " ", (s or "").strip()).lower()
 
-def _slug_addr(addr: str) -> str:
-    a = (addr or "").strip().lower()
-    a = re.sub(r"[^\w\s,-]", "", a).replace(",", " ")
-    a = re.sub(r"\s+", " ", a).strip()
-    return re.sub(r"\s+", "-", a)
-
-# ---------------- Canonicalizers ----------------
-ZPID_RE = re.compile(r'(\d{6,})_zpid', re.I)
-
-def canonicalize_zillow(url: str) -> Tuple[str, Optional[str]]:
-    """Return (canonical_url, zpid) if present."""
-    if not url:
-        return "", None
-    base = re.sub(r'[?#].*$', '', url.strip())
-    m_full = re.search(r'^(https?://[^?#]*/homedetails/[^/]+/\d{6,}_zpid/)', base, re.I)
-    canon = m_full.group(1) if m_full else base
-    m_z = ZPID_RE.search(base)
-    return canon, (m_z.group(1) if m_z else None)
-
-# Strong address normalizer → consistent key across "St/Street", "E/East", etc.
+# ---------------- Address normalization (dedupe key) ----------------
 SUFFIX_MAP = {
     "st": "street", "street": "street",
     "rd": "road", "road": "road",
@@ -76,37 +57,48 @@ DIR_MAP = {
     "north": "north", "south": "south", "east": "east", "west": "west"
 }
 
+def _slug_addr(s: str) -> str:
+    s = (s or "").strip().lower()
+    s = re.sub(r"[^\w\s,/-]", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return re.sub(r"[\s,/]+", "-", s)
+
 def _normalize_address_strong(addr: str) -> str:
     """
-    Normalize an address string to a consistent, dedupe-friendly key.
-    Handles: casing, punctuation, Street/St, Rd/Road, directions E/East, collapsing whitespace.
+    Normalize an address to a single, dedupe-friendly key:
+      - lowercase, remove punctuation noise
+      - expand directions (E->east) and suffixes (st->street)
+      - keep city, state, zip if present
     """
     s = (addr or "").strip().lower()
     if not s:
         return ""
-    # strip punctuation except spaces/commas
-    s = re.sub(r"[^\w\s,]", " ", s)
+    s = re.sub(r"[^\w\s,/-]", " ", s)
     s = re.sub(r"\s+", " ", s).strip()
-
-    tokens = s.split()
+    toks = s.replace(",", " , ").split()
     out = []
-    for t in tokens:
-        base = t.strip(", ")
-        if base in DIR_MAP:
-            out.append(DIR_MAP[base]); continue
-        if base in SUFFIX_MAP:
-            out.append(SUFFIX_MAP[base]); continue
-        out.append(base)
-
+    for t in toks:
+        if t == ",":
+            out.append(",")
+            continue
+        if t in DIR_MAP:
+            out.append(DIR_MAP[t]); continue
+        if t in SUFFIX_MAP:
+            out.append(SUFFIX_MAP[t]); continue
+        out.append(t)
+    # re-join with commas normalized
     s2 = " ".join(out)
     s2 = re.sub(r"\s*,\s*", ", ", s2)
     s2 = re.sub(r"\s+", " ", s2).strip()
     return _slug_addr(s2)
 
 def _address_from_url_fallback(url: str) -> str:
-    if not url:
-        return ""
-    u = re.sub(r"%2C", ",", url, flags=re.I)
+    """
+    If DB 'address' is empty, derive an address-like string from a Zillow URL:
+      - /homedetails/<slug>/<zpid>/
+      - /homes/<slug>_rb/
+    """
+    u = (url or "")
     m = re.search(r"/homedetails/([^/]+)/\d{6,}_zpid/", u, re.I)
     if m:
         return m.group(1).replace("-", " ")
@@ -115,29 +107,16 @@ def _address_from_url_fallback(url: str) -> str:
         return m.group(1).replace("-", " ")
     return ""
 
-def _key_for_sent_row(row: Dict[str, Any]) -> str:
+def _property_key_from_row(row: Dict[str, Any]) -> str:
     """
-    Choose a single key per property:
-    1) zpid if present
-    2) canonical Zillow homedetails URL if present
-    3) strong-normalized address slug
+    NEW: Always dedupe by normalized ADDRESS key (never by raw canonical URL).
+    We still parse from URL if the address field is blank.
+    This collapses /homes/ variations (st vs street, commas, capitalization, etc).
     """
-    url = (row.get("url") or "").strip()
-    address = (row.get("address") or "").strip()
-    canonical = (row.get("canonical") or "").strip()
-    zpid = (row.get("zpid") or "").strip()
-
-    if zpid:
-        return f"zpid:{zpid}"
-
-    can2, z2 = canonicalize_zillow(canonical or url)
-    if z2:
-        return f"zpid:{z2}"
-    if "/homedetails/" in (can2 or ""):
-        return f"canon:{can2.lower()}"
-
-    norm = _normalize_address_strong(address) or _normalize_address_strong(_address_from_url_fallback(url))
-    return f"addr:{norm}"
+    addr = (row.get("address") or "").strip()
+    if not addr:
+        addr = _address_from_url_fallback(row.get("url") or "")
+    return _normalize_address_strong(addr)
 
 # ---------------- Data access ----------------
 @st.cache_data(ttl=60, show_spinner=False)
@@ -169,10 +148,6 @@ def fetch_sent_for_client(client_norm: str, limit: int = 10000) -> List[Dict[str
 
 @st.cache_data(ttl=120, show_spinner=False)
 def fetch_all_tour_addresses_for_client(client_norm: str) -> List[str]:
-    """
-    Pull all tour stop addresses for this client (across all dates)
-    and return raw address strings.
-    """
     if not (SUPABASE and client_norm.strip()):
         return []
     try:
@@ -190,14 +165,8 @@ def fetch_all_tour_addresses_for_client(client_norm: str) -> List[str]:
         return []
 
 def _build_toured_keyset(client_norm: str) -> set:
-    """Return a set of property keys (same scheme as _key_for_sent_row) that were toured."""
     addrs = fetch_all_tour_addresses_for_client(client_norm)
-    ks = set()
-    for a in addrs:
-        k = f"addr:{_normalize_address_strong(a)}"
-        if k and k not in ks:
-            ks.add(k)
-    return ks
+    return { _normalize_address_strong(a) for a in addrs if a.strip() }
 
 # ---------------- Query param helpers (new API only) ----------------
 def _qp_get(name: str, default=None):
@@ -207,7 +176,6 @@ def _qp_get(name: str, default=None):
             return val[0]
         return val
     except Exception:
-        # Fallback to session_state (best-effort)
         return st.session_state.get(f"__qp_{name}", default)
 
 def _qp_set(**kwargs):
@@ -215,16 +183,13 @@ def _qp_set(**kwargs):
         if kwargs:
             st.query_params.update(kwargs)
         else:
-            # clear all query params if supported
             try:
                 st.query_params.clear()
             except Exception:
-                # fallback: remove only the keys we set earlier
                 for k in list(st.session_state.keys()):
                     if k.startswith("__qp_"):
                         del st.session_state[k]
     except Exception:
-        # fallback to session_state mirror
         for k, v in kwargs.items():
             st.session_state[f"__qp_{k}"] = v
 
@@ -237,12 +202,14 @@ def _campaign_chip(text: str):
         return ""
     return f"<span style='font-size:11px;font-weight:700;padding:2px 6px;border-radius:999px;background:#e2e8f0;margin-left:6px;'>{escape(text)}</span>"
 
-# ---------------- Report builder (deduped) ----------------
+# ---------------- Report builder (hard dedupe by property) ----------------
 def _dedupe_and_tag_rows(rows: List[Dict[str, Any]], toured_keys: set,
                          sel_campaign: Optional[str], q_norm: str) -> List[Dict[str, Any]]:
     """
-    Filter (campaign/search), then group by property key and keep the MOST RECENT sent_at.
-    Tag row['is_toured'] if key is in toured_keys (address-normalized).
+    1) Filter by campaign and search.
+    2) Group rows by strong address key ONLY.
+    3) Keep the most recent sent_at per property.
+    4) Tag 'is_toured' if address key is in toured_keys.
     """
     def _match(row: Dict[str, Any]) -> bool:
         if sel_campaign is not None:
@@ -262,20 +229,23 @@ def _dedupe_and_tag_rows(rows: List[Dict[str, Any]], toured_keys: set,
 
     groups: Dict[str, Dict[str, Any]] = {}
     for r in filt:
-        key = _key_for_sent_row(r) or f"row:{id(r)}"
-        addr_key = f"addr:{_normalize_address_strong(r.get('address') or _address_from_url_fallback(r.get('url') or ''))}"
-        r["_key"] = key
-        r["is_toured"] = addr_key in toured_keys
+        key = _property_key_from_row(r)
+        if not key:
+            # If we truly can't make a key, skip row (prevents weird dupes)
+            continue
 
-        sa = r.get("sent_at") or ""
+        # parse sent_at
+        sa = (r.get("sent_at") or "").strip()
         try:
             when = datetime.fromisoformat(sa.replace("Z", "+00:00"))
         except Exception:
             when = datetime.min
 
         prev = groups.get(key)
-        if (prev is None) or (when > prev["_when"]):
+        if prev is None or when > prev["_when"]:
             r["_when"] = when
+            r["_key"] = key
+            r["is_toured"] = (key in toured_keys)
             groups[key] = r
 
     out = sorted(groups.values(), key=lambda x: x.get("_when", datetime.min), reverse=True)
@@ -332,7 +302,6 @@ def _render_client_report_view(client_display_name: str, client_norm: str):
         st.caption(f"{total} total logged")
 
     toured_keys = _build_toured_keyset(client_norm)
-
     rows_u = _dedupe_and_tag_rows(rows, toured_keys, sel_campaign, q_norm)
     count = len(rows_u)
 
@@ -349,8 +318,8 @@ def _render_client_report_view(client_display_name: str, client_norm: str):
         sent_at_h = _format_sent_at(r.get("sent_at") or "")
         camp = (r.get("campaign") or "").strip()
 
-        chip = "" if sel_campaign is not None else (f"<span style='font-size:11px;font-weight:700;padding:2px 6px;border-radius:999px;background:#e2e8f0;margin-left:6px;'>{escape(camp)}</span>" if camp else "")
-        toured = "<span style='font-size:11px;font-weight:800;padding:2px 8px;border-radius:999px;background:#0b7f48;color:#ecfdf5;border:1px solid #16a34a;margin-left:6px;'>Toured</span>" if r.get("is_toured") else ""
+        chip = "" if sel_campaign is not None else (_campaign_chip(camp) if camp else "")
+        toured = _toured_badge() if r.get("is_toured") else ""
 
         items_html.append(
             f"""<li style="margin:0.25rem 0;">
@@ -434,7 +403,6 @@ def render_clients_tab():
         st.markdown("---")
         _render_client_report_view(display_name, report_norm_qp)
         if want_scroll:
-            # Smooth scroll once, then keep only ?report=... param (no experimental API used)
             st.components.v1.html(
                 """
                 <script>
