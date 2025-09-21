@@ -55,13 +55,18 @@ html[data-theme="dark"] .meta-chip {
   background:#111827; color:#bfdbfe; border-color:#1f2937;
 }
 
+/* ---- RED toured badge ---- */
 .toured-badge {
   display:inline-block; font-size:11px; font-weight:800;
   padding:2px 6px; border-radius:999px; margin-left:8px;
-  background:#e0f2fe; color:#075985; border:1px solid #7dd3fc;
+  background:#fee2e2;         /* light red bg */
+  color:#991b1b;               /* deep red text */
+  border:1px solid #fecaca;    /* red-ish border */
 }
 html[data-theme="dark"] .toured-badge {
-  background:#0b1220; color:#7dd3fc; border-color:#164e63;
+  background:#7f1d1d;          /* dark red bg */
+  color:#fecaca;               /* pale red text */
+  border-color:#ef4444;        /* red border */
 }
 </style>
 """, unsafe_allow_html=True)
@@ -122,7 +127,7 @@ def _norm_slug_from_text(text: str) -> str:
     s = s.replace("&", " and ")
     toks = re.split(r"[^a-z0-9]+", s)
     norm = [t for t in (_token_norm(t) for t in toks) if t]
-    return "-".join(norm)
+    return "-join".replace("-join", "-").join(norm)  # (keep hyphen join)
 
 _RE_HD = re.compile(r"/homedetails/([^/]+)/\d{6,}_zpid/?", re.I)
 _RE_HM = re.compile(r"/homes/([^/_]+)_rb/?", re.I)
@@ -421,9 +426,13 @@ def _render_client_report_view(client_display_name: str, client_norm: str):
         toured = norm_pslug in tour_norm_slugs
 
         meta = []
-        if when: meta.append(chip(when))
-        if camp: meta.append(chip(camp))
-        if toured: meta.append("<span class='toured-badge'>Toured</span>")
+        if when:
+            meta.append(chip(when))
+        if camp:
+            meta.append(chip(camp))
+        # Add Toured exactly once
+        if toured:
+            meta.append("<span class='toured-badge'>Toured</span>")
 
         items.append(
             f"""<li class="report-item">
