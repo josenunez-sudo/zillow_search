@@ -164,9 +164,12 @@ def _dedupe_by_property(rows: List[Dict[str,Any]]) -> List[Dict[str,Any]]:
 
 # ================= Lazy Streamlit bits (run-time only) =================
 def _inject_css_once():
-    if st.session_state.get("__clients_css_injected__"):
+    # bump this when you change styles so Streamlit reinjects CSS
+    CSS_VER = "clients-css-2025-09-21a"
+    if st.session_state.get("__clients_css_version__") == CSS_VER:
         return
-    st.session_state["__clients_css_injected__"] = True
+    st.session_state["__clients_css_version__"] = CSS_VER
+
     st.markdown("""
     <style>
     :root { --row-border:#e2e8f0; --ink:#0f172a; --muted:#475569; }
@@ -330,7 +333,7 @@ def fetch_tour_norm_slugs_for_client(client_norm: str) -> set:
     except Exception:
         return set()
 
-# ---- NEW: Sent-delete helpers ----
+# ---- Sent-delete helpers ----
 def _invalidate_sent_cache():
     try: fetch_sent_for_client.clear()  # type: ignore[attr-defined]
     except Exception: pass
