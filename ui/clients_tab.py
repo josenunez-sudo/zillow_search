@@ -13,7 +13,7 @@ except Exception:
     create_client = None
     Client = Any  # type: ignore
 
-# =============== Styling (clear chips + visible badges) ===============
+# =============== Styling (visible pills, meta chips, red toured badge) ===============
 st.markdown("""
 <style>
 :root { --row-border:#e2e8f0; --ink:#0f172a; --muted:#475569; }
@@ -25,7 +25,14 @@ html[data-theme="dark"], .stApp [data-theme="dark"] {
 .client-left { display:flex; align-items:center; gap:8px; min-width:0; }
 .client-name { font-weight:700; color:var(--ink); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
 
-.pill { font-size:11px; font-weight:800; padding:2px 10px; border-radius:999px; }
+/* Pill base is now always visible */
+.pill {
+  font-size:11px; font-weight:800; padding:2px 10px; border-radius:999px;
+  background:#f1f5f9; color:#0f172a; border:1px solid #cbd5e1; display:inline-block;
+}
+html[data-theme="dark"] .pill {
+  background:#111827; color:#e5e7eb; border-color:#374151;
+}
 .pill.active {
   background: linear-gradient(180deg, #dcfce7 0%, #bbf7d0 100%);
   color:#166534; border:1px solid rgba(5,150,105,.35);
@@ -34,6 +41,8 @@ html[data-theme="dark"] .pill.active {
   background: linear-gradient(180deg, #064e3b 0%, #065f46 100%);
   color:#a7f3d0; border-color:rgba(167,243,208,.35);
 }
+/* explicit inactive variant */
+.pill.inactive { opacity: 0.95; }
 
 .iconbar { display:flex; align-items:center; gap:8px; }
 .iconbar .stButton > button {
@@ -52,27 +61,24 @@ html[data-theme="dark"] .iconbar .stButton > button {
 .section-rule { border-bottom:1px solid var(--row-border); margin:8px 0 6px 0; }
 .report-item { margin:0.30rem 0; line-height:1.35; }
 
+/* Meta chip: stronger contrast */
 .meta-chip {
   display:inline-block; font-size:11px; font-weight:800;
   padding:2px 6px; border-radius:999px; margin-left:8px;
   background:#eef2ff; color:#1e3a8a; border:1px solid #c7d2fe;
 }
 html[data-theme="dark"] .meta-chip {
-  background:#111827; color:#bfdbfe; border-color:#1f2937;
+  background:#1f2937; color:#bfdbfe; border-color:#374151;
 }
 
 /* ---- RED toured badge ---- */
 .toured-badge {
   display:inline-block; font-size:11px; font-weight:800;
   padding:2px 6px; border-radius:999px; margin-left:8px;
-  background:#fee2e2;         /* light red bg */
-  color:#991b1b;               /* deep red text */
-  border:1px solid #fecaca;    /* red-ish border */
+  background:#fee2e2; color:#991b1b; border:1px solid #fecaca;
 }
 html[data-theme="dark"] .toured-badge {
-  background:#7f1d1d;          /* dark red bg */
-  color:#fecaca;               /* pale red text */
-  border-color:#ef4444;        /* red border */
+  background:#7f1d1d; color:#fecaca; border-color:#ef4444;
 }
 </style>
 """, unsafe_allow_html=True)
@@ -95,7 +101,6 @@ def _fmt_ts(ts: str) -> str:
         return ts
 
 # ------------- Property slug normalization (strong & symmetric) -------------
-# We normalize *both* sent rows and tour stops the same way, so "Street"== "St", "East"=="E".
 _STTYPE = {
     "street":"st","st":"st","st.":"st",
     "avenue":"ave","ave":"ave","ave.":"ave","av":"ave",
@@ -111,13 +116,7 @@ _STTYPE = {
     "circle":"cir","cir":"cir",
     "square":"sq","sq":"sq",
 }
-_DIR = {
-    "north":"n","n":"n",
-    "south":"s","s":"s",
-    "east":"e","e":"e",
-    "west":"w","w":"w",
-    "n.":"n","s.":"s","e.":"e","w.":"w"
-}
+_DIR = {"north":"n","n":"n","south":"s","s":"s","east":"e","e":"e","west":"w","w":"w","n.":"n","s.":"s","e.":"e","w.":"w"}
 
 def _token_norm(tok: str) -> str:
     t = tok.lower().strip(" .,#")
@@ -156,21 +155,15 @@ def _address_text_from_url(url: str) -> str:
 
 # ------------- Strong “same-property” key -------------
 def _property_key(row: Dict[str, Any]) -> str:
-    # Prefer normalized property slug (works across /homes and /homedetails and address text)
     url = (row.get("url") or "").strip()
     addr = (row.get("address") or "").strip() or _address_text_from_url(url)
-
     norm_pslug = _norm_slug_from_url(url) or _norm_slug_from_text(addr)
     if norm_pslug:
         return "normslug::" + norm_pslug
-
-    # fallback chain
     canon = (row.get("canonical") or "").strip().lower()
     if canon: return "canon::" + canon
-
     zpid = (row.get("zpid") or "").strip()
     if zpid: return "zpid::" + zpid
-
     return "url::" + (url.lower())
 
 # ============== Query params (use one API only) ==============
@@ -196,7 +189,6 @@ def _qp_set(**kwargs):
 # ============== Supabase ==============
 @st.cache_resource
 def get_supabase() -> Optional["Client"]:
-    # If supabase package isn't available, gracefully degrade
     if create_client is None:
         return None
     try:
@@ -297,7 +289,7 @@ def fetch_tour_norm_slugs_for_client(client_norm: str) -> set:
 
 # ---- Display de-dupe (keep newest per property) ----
 def _dedupe_by_property(rows: List[Dict[str,Any]]) -> List[Dict[str,Any]]:
-    def ts(row): 
+    def ts(row):
         try: return datetime.fromisoformat((row.get("sent_at") or "").replace("Z","+00:00"))
         except Exception: return datetime.min
     best: Dict[str, Dict[str,Any]] = {}
@@ -312,9 +304,11 @@ def _client_row_icons(name: str, norm: str, cid: int, active: bool):
     col_name, col_rep, col_ren, col_tog, col_del, col_sp = st.columns([8, 1, 1, 1, 1, 2])
 
     with col_name:
+        status_class = "active" if active else "inactive"
+        status_text  = "active" if active else "inactive"
         st.markdown(
             f"<span class='client-name'>{escape(name)}</span> "
-            f"<span class='pill {'active' if active else ''}'>{'active' if active else 'inactive'}</span>",
+            f"<span class='pill {status_class}'>{status_text}</span>",
             unsafe_allow_html=True
         )
 
@@ -510,3 +504,4 @@ def render_clients_tab():
                 """, height=0
             )
             _qp_set(report=report_norm_qp)
+
