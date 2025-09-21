@@ -441,7 +441,8 @@ def _render_client_report_view(client_display_name: str, client_norm: str):
         if not s: return ""
         return f"<span class='meta-chip'>{escape(s)}</span>"
 
-    items: List[str] = []
+    # Build Markdown bullet list with inline HTML chips/badges (avoids raw </li> showing)
+    md_lines: List[str] = []
     for r in deduped:
         url  = (r.get("url") or "").strip()
         addr = (r.get("address") or "").strip() or _address_text_from_url(url) or "Listing"
@@ -462,25 +463,20 @@ def _render_client_report_view(client_display_name: str, client_norm: str):
         debug_html = ""
         if DEBUG_REPORT:
             debug_html = (
-                "<div style='font-size:10px;opacity:.7;margin-left:8px'>"
-                f"[dbg] date_tag={escape(date_tag or '-')}, camp={(r.get('campaign') or '')}, "
-                f"slug={escape(norm_pslug)}, toured={'yes' if toured else 'no'}"
-                "</div>"
+                " <span style='font-size:10px;opacity:.7'>(dbg "
+                f"date_tag={escape(date_tag or '-')}, camp={(r.get('campaign') or '')}, "
+                f"slug={escape(norm_pslug)}, toured={'yes' if toured else 'no'})</span>"
             )
 
-        items.append(
-            f"""<li class="report-item">
-                  <a href="{escape(url)}" target="_blank" rel="noopener">{escape(addr)}</a>
-                  {' '.join(meta)}
-                  {debug_html}
-                </li>"""
-        )
+        # Use Markdown bullet + inline HTML so no literal </li> appears
+        line = f"- <a href=\"{escape(url)}\" target=\"_blank\" rel=\"noopener\">{escape(addr)}</a> {' '.join(meta)}{debug_html}"
+        md_lines.append(line)
 
-    if not items:
+    if not md_lines:
         st.warning("No results returned.")
         return
 
-    st.markdown("<ul class='link-list'>" + "\n".join(items) + "</ul>", unsafe_allow_html=True)
+    st.markdown("\n".join(md_lines), unsafe_allow_html=True)
 
     # Export (deduped)
     with st.expander("Export filtered (deduped)"):
