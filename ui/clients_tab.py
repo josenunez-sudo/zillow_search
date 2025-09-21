@@ -94,11 +94,15 @@ def _norm_tag(s: str) -> str:
     return re.sub(r"\s+", " ", (s or "").strip()).lower()
 
 def _fmt_ts(ts: str) -> str:
+    """Return a nice timestamp chip value; fall back to raw if parse fails."""
+    if not ts:
+        return ""
     try:
         d = datetime.fromisoformat(ts.replace("Z","+00:00"))
         return d.strftime("%b %d, %Y • %I:%M %p")
     except Exception:
-        return ts
+        # show the raw value so the chip is still visible
+        return str(ts)
 
 # ------------- Property slug normalization (strong & symmetric) -------------
 _STTYPE = {
@@ -276,8 +280,8 @@ def fetch_tour_norm_slugs_for_client(client_norm: str) -> set:
         ids = [t["id"] for t in (tq.data or [])]
         if not ids: return set()
         sq = SUPABASE.table("tour_stops").select("address,address_slug").in_("tour_id", ids).limit(50000).execute()
-        stops = sq.data or []
-        out = set()
+        stops = (sq.data or [])
+        out: set = set()
         for s in stops:
             if s.get("address_slug"):
                 out.add(_norm_slug_from_text(s["address_slug"]))
@@ -365,7 +369,7 @@ def _client_row_icons(name: str, norm: str, cid: int, active: bool):
 
     st.markdown("<div class='section-rule'></div>", unsafe_allow_html=True)
 
-# ============== Report (deduped + “Toured” badge) ==============
+# ============== Report (deduped + date/campaign chips + “Toured” badge) ==============
 def _render_client_report_view(client_display_name: str, client_norm: str):
     st.markdown(f"### Report for {escape(client_display_name)}", unsafe_allow_html=True)
 
@@ -384,7 +388,7 @@ def _render_client_report_view(client_display_name: str, client_norm: str):
     tour_norm_slugs = fetch_tour_norm_slugs_for_client(client_norm)
 
     # Filters
-    seen_camps = []
+    seen_camps: List[str] = []
     for r in sent_rows:
         c = (r.get("campaign") or "").strip()
         if c not in seen_camps: seen_camps.append(c)
@@ -415,10 +419,16 @@ def _render_client_report_view(client_display_name: str, client_norm: str):
     deduped  = _dedupe_by_property(filtered)
     st.caption(f"{len(deduped)} unique listing{'s' if len(deduped)!=1 else ''} (deduped by property)")
 
-    def chip(t: str) -> str:
-        return f"<span class='meta-chip'>{escape(t)}</span>"
+    def chip(t: Any) -> str:
+        """Return a meta-chip span for non-empty values."""
+        if t is None:
+            return ""
+        s = str(t).strip()
+        if not s:
+            return ""
+        return f"<span class='meta-chip'>{escape(s)}</span>"
 
-    items = []
+    items: List[str] = []
     for r in deduped:
         url  = (r.get("url") or "").strip()
         addr = (r.get("address") or "").strip() or _address_text_from_url(url) or "Listing"
@@ -429,19 +439,21 @@ def _render_client_report_view(client_display_name: str, client_norm: str):
         norm_pslug = _norm_slug_from_url(url) or _norm_slug_from_text(addr)
         toured = norm_pslug in tour_norm_slugs
 
-        meta = []
+        meta: List[str] = []
         if when:
             meta.append(chip(when))
-        if camp:
-            meta.append(chip(camp))
-        # Add Toured exactly once
+        if camp or camp == "":
+            # show empty campaign as a labeled chip too
+            meta.append(chip(camp if camp else "— no campaign —"))
         if toured:
             meta.append("<span class='toured-badge'>Toured</span>")
+
+        meta_html = " ".join(meta)
 
         items.append(
             f"""<li class="report-item">
                   <a href="{escape(url)}" target="_blank" rel="noopener">{escape(addr)}</a>
-                  {' '.join(meta)}
+                  {meta_html}
                 </li>"""
         )
 
@@ -504,4 +516,3 @@ def render_clients_tab():
                 """, height=0
             )
             _qp_set(report=report_norm_qp)
-
