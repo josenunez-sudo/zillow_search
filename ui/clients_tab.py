@@ -202,6 +202,16 @@ def _inject_css_once():
     }
     html[data-theme="dark"] .meta-chip { background:#1f2937; color:#bfdbfe; border-color:#374151; }
 
+    /* Light blue date badge */
+    .date-badge {
+      display:inline-block; font-size:11px; font-weight:800;
+      padding:2px 6px; border-radius:999px; margin-left:8px;
+      background:#e0f2fe; color:#075985; border:1px solid #7dd3fc;
+    }
+    html[data-theme="dark"] .date-badge {
+      background:#0b1220; color:#7dd3fc; border-color:#164e63;
+    }
+
     .toured-badge {
       display:inline-block; font-size:11px; font-weight:800;
       padding:2px 6px; border-radius:999px; margin-left:8px;
@@ -456,9 +466,9 @@ def _render_client_report_view(client_display_name: str, client_norm: str):
 
         meta: List[str] = []
         if date_tag:
-            meta.append(chip(f"date: {date_tag}"))
+            meta.append(f"<span class='date-badge'>{escape(date_tag)}</span>")
         if toured:
-            meta.append("<span class='toured-badge'>tag: Toured</span>")
+            meta.append("<span class='toured-badge'>Toured</span>")
 
 
         debug_html = ""
