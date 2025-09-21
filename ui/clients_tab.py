@@ -1,5 +1,5 @@
 # ui/clients_tab.py
-import os, re, json
+import os, re
 from datetime import datetime
 from html import escape
 from typing import List, Dict, Any, Optional, Tuple
@@ -88,28 +88,32 @@ def _normalize_address_strong(addr: str) -> str:
     s = re.sub(r"[^\w\s,]", " ", s)
     s = re.sub(r"\s+", " ", s).strip()
 
-    # split into tokens, normalize common patterns:
     tokens = s.split()
     out = []
     for t in tokens:
         base = t.strip(", ")
-        # Expand directional tokens
         if base in DIR_MAP:
             out.append(DIR_MAP[base]); continue
-        # Expand suffix tokens
         if base in SUFFIX_MAP:
             out.append(SUFFIX_MAP[base]); continue
         out.append(base)
 
-    # example unify "e" before street names like "e woodall" already handled by DIR_MAP above
     s2 = " ".join(out)
-
-    # collapse multiple commas/spaces
     s2 = re.sub(r"\s*,\s*", ", ", s2)
     s2 = re.sub(r"\s+", " ", s2).strip()
-
-    # create a stable slug (keeps numbers and words)
     return _slug_addr(s2)
+
+def _address_from_url_fallback(url: str) -> str:
+    if not url:
+        return ""
+    u = re.sub(r"%2C", ",", url, flags=re.I)
+    m = re.search(r"/homedetails/([^/]+)/\d{6,}_zpid/", u, re.I)
+    if m:
+        return m.group(1).replace("-", " ")
+    m = re.search(r"/homes/([^/_]+)_rb/?", u, re.I)
+    if m:
+        return m.group(1).replace("-", " ")
+    return ""
 
 def _key_for_sent_row(row: Dict[str, Any]) -> str:
     """
@@ -126,28 +130,14 @@ def _key_for_sent_row(row: Dict[str, Any]) -> str:
     if zpid:
         return f"zpid:{zpid}"
 
-    # If we have a proper homedetails canonical, prefer that
     can2, z2 = canonicalize_zillow(canonical or url)
     if z2:
         return f"zpid:{z2}"
     if "/homedetails/" in (can2 or ""):
         return f"canon:{can2.lower()}"
 
-    # else normalized address slug
     norm = _normalize_address_strong(address) or _normalize_address_strong(_address_from_url_fallback(url))
     return f"addr:{norm}"
-
-def _address_from_url_fallback(url: str) -> str:
-    if not url:
-        return ""
-    u = re.sub(r"%2C", ",", url, flags=re.I)
-    m = re.search(r"/homedetails/([^/]+)/\d{6,}_zpid/", u, re.I)
-    if m:
-        return m.group(1).replace("-", " ")
-    m = re.search(r"/homes/([^/_]+)_rb/?", u, re.I)
-    if m:
-        return m.group(1).replace("-", " ")
-    return ""
 
 # ---------------- Data access ----------------
 @st.cache_data(ttl=60, show_spinner=False)
@@ -209,31 +199,36 @@ def _build_toured_keyset(client_norm: str) -> set:
             ks.add(k)
     return ks
 
-# ---------------- UI helpers ----------------
-def _qp_get(name, default=None):
+# ---------------- Query param helpers (new API only) ----------------
+def _qp_get(name: str, default=None):
     try:
-        qp = st.query_params
-        val = qp.get(name, default)
+        val = st.query_params.get(name, default)
         if isinstance(val, list) and val:
             return val[0]
         return val
     except Exception:
-        qp = st.experimental_get_query_params()
-        return (qp.get(name, [default]) or [default])[0]
+        # Fallback to session_state (best-effort)
+        return st.session_state.get(f"__qp_{name}", default)
 
 def _qp_set(**kwargs):
     try:
         if kwargs:
             st.query_params.update(kwargs)
         else:
-            st.query_params.clear()
+            # clear all query params if supported
+            try:
+                st.query_params.clear()
+            except Exception:
+                # fallback: remove only the keys we set earlier
+                for k in list(st.session_state.keys()):
+                    if k.startswith("__qp_"):
+                        del st.session_state[k]
     except Exception:
-        if kwargs:
-            st.experimental_set_query_params(**kwargs)
-        else:
-            st.experimental_set_query_params()
+        # fallback to session_state mirror
+        for k, v in kwargs.items():
+            st.session_state[f"__qp_{k}"] = v
 
-# Badge
+# ---------------- UI bits ----------------
 def _toured_badge():
     return "<span style='font-size:11px;font-weight:800;padding:2px 8px;border-radius:999px;background:#0b7f48;color:#ecfdf5;border:1px solid #16a34a;margin-left:6px;'>Toured</span>"
 
@@ -249,7 +244,6 @@ def _dedupe_and_tag_rows(rows: List[Dict[str, Any]], toured_keys: set,
     Filter (campaign/search), then group by property key and keep the MOST RECENT sent_at.
     Tag row['is_toured'] if key is in toured_keys (address-normalized).
     """
-    # Filter by campaign + search first
     def _match(row: Dict[str, Any]) -> bool:
         if sel_campaign is not None:
             if (row.get("campaign") or "").strip() != sel_campaign:
@@ -266,25 +260,15 @@ def _dedupe_and_tag_rows(rows: List[Dict[str, Any]], toured_keys: set,
     if not filt:
         return []
 
-    # Group by property key; keep the most recent sent_at
     groups: Dict[str, Dict[str, Any]] = {}
     for r in filt:
-        key = _key_for_sent_row(r)
-        if not key:
-            # fallback to row index-based unique key to avoid crash (won't dedupe)
-            key = f"row:{id(r)}"
-        # compute "is_toured" using addr-key form
-        addr_key = key
-        if key.startswith("zpid:") or key.startswith("canon:"):
-            # Build addr-based key too if we can
-            addr_key = f"addr:{_normalize_address_strong(r.get('address') or _address_from_url_fallback(r.get('url') or ''))}"
+        key = _key_for_sent_row(r) or f"row:{id(r)}"
+        addr_key = f"addr:{_normalize_address_strong(r.get('address') or _address_from_url_fallback(r.get('url') or ''))}"
         r["_key"] = key
         r["is_toured"] = addr_key in toured_keys
 
-        # parse sent_at for recency compare (default to very old if parsing fails)
         sa = r.get("sent_at") or ""
         try:
-            # Supabase returns ISO with timezone; datetime.fromisoformat handles offset in Py3.11
             when = datetime.fromisoformat(sa.replace("Z", "+00:00"))
         except Exception:
             when = datetime.min
@@ -294,7 +278,6 @@ def _dedupe_and_tag_rows(rows: List[Dict[str, Any]], toured_keys: set,
             r["_when"] = when
             groups[key] = r
 
-    # Emit one row per property (sorted newest first)
     out = sorted(groups.values(), key=lambda x: x.get("_when", datetime.min), reverse=True)
     for r in out:
         r.pop("_when", None)
@@ -305,13 +288,11 @@ def _address_text(row: Dict[str, Any]) -> str:
     addr = (row.get("address") or "").strip()
     if addr:
         return addr
-    # fallback from url slug
     u = (row.get("url") or "").strip()
     a2 = _address_from_url_fallback(u).replace("-", " ").strip().title()
     return a2 or "Listing"
 
 def _format_sent_at(ts: str) -> str:
-    # show like "Sep 20, 2025 • 06:48 PM"
     try:
         dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
         return dt.strftime("%b %d, %Y • %I:%M %p")
@@ -321,7 +302,6 @@ def _format_sent_at(ts: str) -> str:
 def _render_client_report_view(client_display_name: str, client_norm: str):
     st.markdown(f"### Report for {escape(client_display_name)}", unsafe_allow_html=True)
 
-    # Close button
     colX, _ = st.columns([1,3])
     with colX:
         if st.button("Close report", key=f"__close_report_{client_norm}"):
@@ -332,7 +312,6 @@ def _render_client_report_view(client_display_name: str, client_norm: str):
     rows = fetch_sent_for_client(client_norm)
     total = len(rows)
 
-    # Campaign select options
     seen_campaigns = []
     for r in rows:
         c = (r.get("campaign") or "").strip()
@@ -352,10 +331,8 @@ def _render_client_report_view(client_display_name: str, client_norm: str):
     with colF3:
         st.caption(f"{total} total logged")
 
-    # Build toured keyset (addr-based)
     toured_keys = _build_toured_keyset(client_norm)
 
-    # Dedupe & tag
     rows_u = _dedupe_and_tag_rows(rows, toured_keys, sel_campaign, q_norm)
     count = len(rows_u)
 
@@ -365,7 +342,6 @@ def _render_client_report_view(client_display_name: str, client_norm: str):
         st.info("No results match the current filters.")
         return
 
-    # Render list
     items_html = []
     for r in rows_u:
         url = (r.get("url") or "").strip()
@@ -373,8 +349,8 @@ def _render_client_report_view(client_display_name: str, client_norm: str):
         sent_at_h = _format_sent_at(r.get("sent_at") or "")
         camp = (r.get("campaign") or "").strip()
 
-        chip = "" if sel_campaign is not None else _campaign_chip(camp)
-        toured = _toured_badge() if r.get("is_toured") else ""
+        chip = "" if sel_campaign is not None else (f"<span style='font-size:11px;font-weight:700;padding:2px 6px;border-radius:999px;background:#e2e8f0;margin-left:6px;'>{escape(camp)}</span>" if camp else "")
+        toured = "<span style='font-size:11px;font-weight:800;padding:2px 8px;border-radius:999px;background:#0b7f48;color:#ecfdf5;border:1px solid #16a34a;margin-left:6px;'>Toured</span>" if r.get("is_toured") else ""
 
         items_html.append(
             f"""<li style="margin:0.25rem 0;">
@@ -402,12 +378,10 @@ def _render_client_report_view(client_display_name: str, client_norm: str):
 
 # ---------------- Row widget for clients ----------------
 def _client_row(name: str, norm: str, cid: int, active: bool):
-    # Inline row with "report" icon; ensure we stay on Clients tab before rerun
     col_name, col_rep = st.columns([10, 1])
 
     with col_name:
-        status = "active" if active else "inactive"
-        pill = f"<span class='pill active'>active</span>" if active else "<span class='pill'>inactive</span>"
+        pill = "<span class='pill active'>active</span>" if active else "<span class='pill'>inactive</span>"
         st.markdown(f"<span class='client-name'>{escape(name)}</span> {pill}", unsafe_allow_html=True)
 
     with col_rep:
@@ -416,7 +390,6 @@ def _client_row(name: str, norm: str, cid: int, active: bool):
             _qp_set(report=norm, scroll="1")
             _safe_rerun()
 
-    # subtle divider
     st.markdown("<div style='border-bottom:1px solid rgba(148,163,184,.25); margin:4px 0 2px 0;'></div>", unsafe_allow_html=True)
 
 # ---------------- Main entry ----------------
@@ -455,13 +428,13 @@ def render_clients_tab():
             for c in inactive:
                 _client_row(c["name"], c.get("name_norm",""), c["id"], active=False)
 
-    # ---- REPORT SECTION BELOW THE TABLES ----
     st.markdown('<div id="report_anchor"></div>', unsafe_allow_html=True)
     if report_norm_qp:
         display_name = next((c["name"] for c in all_clients if c.get("name_norm")==report_norm_qp), report_norm_qp)
         st.markdown("---")
         _render_client_report_view(display_name, report_norm_qp)
         if want_scroll:
+            # Smooth scroll once, then keep only ?report=... param (no experimental API used)
             st.components.v1.html(
                 """
                 <script>
@@ -470,6 +443,8 @@ def render_clients_tab():
                 </script>
                 """, height=0
             )
-            # Keep report param but drop scroll so we don't auto-scroll every rerun
-            _stay_on_clients()
-            st.experimental_set_query_params(**{"report": report_norm_qp})
+            # keep report param, drop scroll
+            try:
+                st.query_params.update({"report": report_norm_qp})
+            except Exception:
+                st.session_state["__qp_report"] = report_norm_qp
