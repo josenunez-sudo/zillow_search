@@ -8,17 +8,19 @@ import streamlit as st
 from supabase import create_client, Client
 
 # =====================
-# Minimal styles (keep your look; avoid clobbering tags)
+# Styles: higher-contrast meta chips + toured badge
 # =====================
 st.markdown("""
 <style>
-:root { --row-border:#e2e8f0; --muted:#64748b; }
-html[data-theme="dark"], .stApp [data-theme="dark"] { --row-border:#0b1220; --muted:#cbd5e1; }
+:root { --row-border:#e2e8f0; --muted:#475569; --ink:#0f172a; }
+html[data-theme="dark"], .stApp [data-theme="dark"] {
+  --row-border:#0b1220; --muted:#cbd5e1; --ink:#f8fafc;
+}
 
 .client-row { display:flex; align-items:center; justify-content:space-between; padding:10px 8px; border-bottom:1px solid var(--row-border); }
 .client-left { display:flex; align-items:center; gap:8px; min-width:0; }
-.client-name { font-weight:700; color:#111827; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
-html[data-theme="dark"] .client-name { color:#fff; }
+.client-name { font-weight:700; color:var(--ink); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+
 .pill { font-size:11px; font-weight:800; padding:2px 10px; border-radius:999px; }
 .pill.active {
   background: linear-gradient(180deg, #dcfce7 0%, #bbf7d0 100%);
@@ -34,7 +36,7 @@ html[data-theme="dark"] .pill.active {
   min-width: 28px; height: 28px; padding:0 8px;
   border-radius: 8px; border:1px solid rgba(0,0,0,.08);
   font-weight:700; line-height:1; cursor:pointer;
-  background:#f8fafc; color:#64748b;
+  background:#f8fafc; color:#475569;
   transition: transform .08s ease, box-shadow .12s ease, filter .08s ease;
 }
 html[data-theme="dark"] .iconbar .stButton > button {
@@ -44,8 +46,25 @@ html[data-theme="dark"] .iconbar .stButton > button {
 .iconbar .stButton > button:active { transform: translateY(0) scale(.98); }
 
 .section-rule { border-bottom:1px solid var(--row-border); margin:8px 0 6px 0; }
-.report-item { margin:0.25rem 0; }
-.report-meta { color:var(--muted); font-size:12px; margin-left:8px; }
+.report-item { margin:0.30rem 0; line-height:1.35; }
+
+.meta-chip {
+  display:inline-block; font-size:11px; font-weight:700;
+  padding:2px 6px; border-radius:999px; margin-left:8px;
+  background:#eef2ff; color:#1e3a8a; border:1px solid #c7d2fe;
+}
+html[data-theme="dark"] .meta-chip {
+  background:#1f2937; color:#bfdbfe; border-color:#374151;
+}
+
+.toured-badge {
+  display:inline-block; font-size:11px; font-weight:800;
+  padding:2px 6px; border-radius:999px; margin-left:8px;
+  background:#e0f2fe; color:#075985; border:1px solid #7dd3fc;
+}
+html[data-theme="dark"] .toured-badge {
+  background:#0b1220; color:#7dd3fc; border-color:#164e63;
+}
 </style>
 """, unsafe_allow_html=True)
 
@@ -70,12 +89,86 @@ def _slug_addr(addr: str) -> str:
     return re.sub(r"\s+", "-", a).strip("-")
 
 def _fmt_ts(ts: str) -> str:
-    # Expecting ISO (possibly with Z). Fall back to raw.
     try:
         d = datetime.fromisoformat(ts.replace("Z", "+00:00"))
         return d.strftime("%b %d, %Y • %I:%M %p")
     except Exception:
         return ts
+
+# Stronger normalization for address → property-key equivalence
+_ABBR = {
+    r"\bstreet\b": "st", r"\bst\b": "st",
+    r"\bavenue\b": "ave", r"\bav\b": "ave", r"\bave\b": "ave",
+    r"\broad\b": "rd", r"\brd\b": "rd",
+    r"\bdrive\b": "dr", r"\bdr\b": "dr",
+    r"\blane\b": "ln", r"\bln\b": "ln",
+    r"\bboulevard\b": "blvd", r"\bblvd\b": "blvd",
+    r"\bcourt\b": "ct", r"\bct\b": "ct",
+    r"\bplace\b": "pl", r"\bpl\b": "pl",
+    r"\bterrace\b": "ter", r"\bter\b": "ter",
+    r"\bparkway\b": "pkwy", r"\bpkwy\b": "pkwy",
+    r"\bhighway\b": "hwy", r"\bhwy\b": "hwy",
+    r"\bsouth\b": "s", r"\bnorth\b": "n", r"\beast\b": "e", r"\bwest\b": "w",
+}
+def _normalize_address_key(addr: str) -> str:
+    s = (addr or "").lower()
+    s = re.sub(r"[^a-z0-9\s,/-]", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    for pat, rep in _ABBR.items():
+        s = re.sub(pat, rep, s)
+    s = re.sub(r"[,\s]+", "-", s)
+    return s.strip("-")
+
+# Extract a property slug from URL (/homedetails/<slug>/<zpid> or /homes/<slug>_rb)
+_RE_HD = re.compile(r"/homedetails/([^/]+)/\d{6,}_zpid/?", re.I)
+_RE_HM = re.compile(r"/homes/([^/_]+)_rb/?", re.I)
+def _property_slug_from_url(url: str) -> str:
+    u = (url or "").strip()
+    m = _RE_HD.search(u)
+    if m: return m.group(1).lower()
+    m = _RE_HM.search(u)
+    if m: return m.group(1).lower()
+    return ""
+
+def address_text_from_url(url: str) -> str:
+    if not url: return ""
+    m = _RE_HD.search(url)
+    if m:
+        return re.sub(r"[-+]", " ", m.group(1)).strip().title()
+    m = _RE_HM.search(url)
+    if m:
+        return re.sub(r"[-+]", " ", m.group(1)).strip().title()
+    return ""
+
+def _strong_property_key(row: Dict[str, Any]) -> str:
+    """
+    Build a robust key to represent 'the same property' across variants.
+    Priority:
+      1) canonical (lower)
+      2) zpid
+      3) URL property slug (homedetails/homes)
+      4) normalized address key
+    """
+    canon = (row.get("canonical") or "").strip().lower()
+    if canon:
+        return f"canon::{canon}"
+
+    zpid = (row.get("zpid") or "").strip()
+    if zpid:
+        return f"zpid::{zpid}"
+
+    url = (row.get("url") or "").strip()
+    if url:
+        ps = _property_slug_from_url(url)
+        if ps:
+            return f"pslug::{ps}"
+
+    addr = (row.get("address") or "").strip() or address_text_from_url(url)
+    if addr:
+        return f"addr::{_normalize_address_key(addr)}"
+
+    # worst-case: entire URL
+    return f"url::{url.lower()}"
 
 # ==============
 # Query params
@@ -92,7 +185,7 @@ def _qp_get(name, default=None):
         return (qp.get(name, [default]) or [default])[0]
 
 def _qp_set(**kwargs):
-    """Use ONLY one API per run to avoid Streamlit's 'single query API' error."""
+    # Use ONE API per run to avoid “single query API” error
     try:
         if kwargs:
             st.query_params.update(kwargs)
@@ -194,18 +287,6 @@ def fetch_sent_for_client(client_norm: str, limit: int = 5000):
     except Exception:
         return []
 
-def address_text_from_url(url: str) -> str:
-    if not url: return ""
-    from urllib.parse import unquote
-    u = unquote(url)
-    m = re.search(r"/homedetails/([^/]+)/\d{6,}_zpid/", u, re.I)
-    if m:
-        return re.sub(r"[-+]", " ", m.group(1)).strip().title()
-    m = re.search(r"/homes/([^/_]+)_rb/?", u, re.I)
-    if m:
-        return re.sub(r"[-+]", " ", m.group(1)).strip().title()
-    return ""
-
 @st.cache_data(ttl=120, show_spinner=False)
 def fetch_tour_slugs_for_client(client_norm: str):
     """Return a set of address slugs that appear in any tour for this client."""
@@ -227,7 +308,7 @@ def fetch_tour_slugs_for_client(client_norm: str):
 def _dedupe_by_property(rows: List[Dict[str,Any]]) -> List[Dict[str,Any]]:
     """
     Keep ONLY the most-recent entry per property for the report.
-    Key = lower(canonical) if present, else slug(address/url).
+    Robust key: canonical/zpid/url-slug/normalized-address.
     """
     def parse_ts(ts: str):
         try:
@@ -237,10 +318,7 @@ def _dedupe_by_property(rows: List[Dict[str,Any]]) -> List[Dict[str,Any]]:
 
     buckets: Dict[str, Dict[str,Any]] = {}
     for r in rows:
-        key = (r.get("canonical") or "").strip().lower()
-        if not key:
-            addr = (r.get("address") or "").strip() or address_text_from_url(r.get("url",""))
-            key = _slug_addr(addr)
+        key = _strong_property_key(r)
         cur = buckets.get(key)
         if not cur or parse_ts(r.get("sent_at") or "") > parse_ts(cur.get("sent_at") or ""):
             buckets[key] = r
@@ -373,18 +451,13 @@ def _render_client_report_view(client_display_name: str, client_norm: str):
 
     filtered = [r for r in sent_rows if _match(r)]
 
-    # STRICT de-dupe for display (by property)
+    # STRICT de-dupe for display (by robust property key)
     deduped = _dedupe_by_property(filtered)
     st.caption(f"{len(deduped)} unique listing{'s' if len(deduped)!=1 else ''} (deduped by property)")
 
-    # Render list with INLINE styles for tags to avoid CSS conflicts
+    # Render list with visible meta chips + Toured badge
     def _chip(text: str) -> str:
-        # neutral chip for campaign
-        return f"<span style='font-size:11px;font-weight:700;padding:2px 6px;border-radius:999px;background:#e2e8f0;margin-left:8px;'>{escape(text)}</span>"
-
-    def _badge_toured() -> str:
-        # blue-ish "Toured" badge
-        return "<span style='font-size:11px;font-weight:800;padding:2px 6px;border-radius:999px;background:#e0f2fe;color:#075985;border:1px solid #7dd3fc;margin-left:8px;'>Toured</span>"
+        return f"<span class='meta-chip'>{escape(text)}</span>"
 
     items_html = []
     for r in deduped:
@@ -393,18 +466,19 @@ def _render_client_report_view(client_display_name: str, client_norm: str):
         sent_at = _fmt_ts(r.get("sent_at") or "")
         camp = (r.get("campaign") or "").strip()
 
-        # Toured badge via slug intersection
-        slug = _slug_addr(addr or address_text_from_url(url))
-        toured = slug in tour_slugs
+        # compute a tour-comparable slug from URL or address
+        pslug = _property_slug_from_url(url)
+        if not pslug:
+            pslug = _normalize_address_key(addr)
+        toured = pslug in tour_slugs or _slug_addr(addr) in tour_slugs
 
-        # Meta line: date • time  |  campaign  |  Toured
         meta_bits = []
         if sent_at:
-            meta_bits.append(f"<span class='report-meta'>{escape(sent_at)}</span>")
+            meta_bits.append(_chip(sent_at))
         if camp:
             meta_bits.append(_chip(camp))
         if toured:
-            meta_bits.append(_badge_toured())
+            meta_bits.append("<span class='toured-badge'>Toured</span>")
 
         items_html.append(
             f"""<li class="report-item">
@@ -419,7 +493,7 @@ def _render_client_report_view(client_display_name: str, client_norm: str):
 
     st.markdown("<ul class='link-list'>" + "\n".join(items_html) + "</ul>", unsafe_allow_html=True)
 
-    # Export
+    # Export (deduped)
     with st.expander("Export filtered (deduped)"):
         import pandas as pd
         buf = io.StringIO()
@@ -471,7 +545,6 @@ def render_clients_tab():
         st.markdown("---")
         _render_client_report_view(display_name, report_norm_qp)
 
-        # Smooth scroll without switching tabs
         if want_scroll:
             st.components.v1.html(
                 """
@@ -481,5 +554,4 @@ def render_clients_tab():
                 </script>
                 """, height=0
             )
-            # keep `report` but clear `scroll` so it doesn't keep jumping on every rerun
-            _qp_set(report=report_norm_qp)
+            _qp_set(report=report_norm_qp)  # keep report, clear scroll
