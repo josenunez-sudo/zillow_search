@@ -826,6 +826,11 @@ def build_output(rows: List[Dict[str, Any]], fmt: str, use_display: bool = True,
     payload = "\n".join(lines) + ("\n" if lines else "")
     return payload, ("text/markdown" if fmt == "md" else "text/plain")
 
+# --- Small helper for visible YYYYMMDD chip ---
+def _yyyymmdd(d: str) -> str:
+    d = (d or "").strip()
+    return d.replace("-", "") if re.fullmatch(r"\d{4}-\d{2}-\d{2}", d) else d
+
 # ---------- Main renderer ----------
 def render_run_tab(state: dict):
     NO_CLIENT = "➤ No client (show ALL, no logging)"
@@ -942,7 +947,7 @@ def render_run_tab(state: dict):
             safe_href = escape(href)
             link_txt = href  # keep URL text for best SMS unfurls
 
-            # Badges: duplicate/new + toured
+            # Badges: duplicate/new + toured (with visible date chip)
             badge_html = ""
             if client_selected:
                 if r.get("already_sent"):
@@ -954,9 +959,16 @@ def render_run_tab(state: dict):
                     dt = str(r.get("toured_date") or "")
                     tm = str(r.get("toured_start") or "")
                     title = ("Toured " + (dt + (" " + tm if tm else ""))).strip()
+                    if dt:
+                        badge_html += (
+                            f' <span class="badge date" '
+                            f'style="background:#e0f2fe;color:#075985;border:1px solid rgba(7,89,133,.35);'
+                            f'font-weight:700;padding:2px 6px;border-radius:999px;">{escape(_yyyymmdd(dt))}</span>'
+                        )
                     badge_html += (
                         ' <span class="badge tour" '
-                        'style="background:#e0f2fe;color:#075985;border:1px solid rgba(7,89,133,.35);" '
+                        'style="background:#fee2e2;color:#991b1b;border:1px solid rgba(153,27,27,.35);'
+                        'font-weight:700;padding:2px 6px;border-radius:999px;" '
                         f'title="{escape(title)}">TOURED</span>'
                     )
 
@@ -1032,7 +1044,7 @@ def render_run_tab(state: dict):
         for r in results:
             img = r.get("image_url")
             if not img:
-                img, _ = get_thumbnail_and_log(r.get("input_address",""), r.get("preview_url") or r.get("zillow_url") or "", r.get("csv_photo"))
+                img, _log = get_thumbnail_and_log(r.get("input_address",""), r.get("preview_url") or r.get("zillow_url") or "", r.get("csv_photo"))
             if img: thumbs.append((r,img))
         if thumbs:
             st.markdown("#### Images")
@@ -1049,9 +1061,15 @@ def render_run_tab(state: dict):
                         dt = str(r.get("toured_date") or "")
                         tm = str(r.get("toured_start") or "")
                         title = ("Toured " + (dt + (" " + tm if tm else ""))).strip()
+                        ymd = _yyyymmdd(dt) if dt else ""
                         toured_badge = (
+                            (f'<span class="badge date" '
+                             f'style="background:#e0f2fe;color:#075985;border:1px solid rgba(7,89,133,.35);'
+                             f'font-weight:700;padding:2px 6px;border-radius:999px;margin-right:6px;">{escape(ymd)}</span>' if ymd else "")
+                            +
                             f'<span class="badge tour" '
-                            f'style="background:#e0f2fe;color:#075985;border:1px solid rgba(7,89,133,.35);" '
+                            f'style="background:#fee2e2;color:#991b1b;border:1px solid rgba(153,27,27,.35);'
+                            f'font-weight:700;padding:2px 6px;border-radius:999px;" '
                             f'title="{escape(title)}">TOURED</span>'
                         )
 
@@ -1171,7 +1189,6 @@ def render_run_tab(state: dict):
     data = st.session_state.get("__results__") or {}
     results = data.get("results") or []
     if results and not clicked:
-        client_selected = bool(_norm_tag(st.session_state.get("client_tag","") or "").strip())  # best-effort
         _render_results_and_downloads(results, client_tag, campaign_tag, include_notes=False, client_selected=bool(client_tag.strip()))
     else:
         if not clicked:
