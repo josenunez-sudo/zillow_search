@@ -351,22 +351,33 @@ def _st_tour_canonical(tour_url: Optional[str], tour_date: date) -> str:
             return f"st-tour-{m.group(1)}"
     return f"st-tour-{tour_date.strftime('%Y%m%d')}"
 
-def _backfill_empty_tour_canonicals(client_norm: str):
+# NEW: Backfill helper sets BOTH canonical and zpid when blank, plus clears status to NULL.
+def _backfill_tour_identities(client_norm: str):
     if not SUPABASE or not client_norm: return
     try:
         rows = SUPABASE.table("tours")\
-            .select("id,url,tour_date,canonical")\
+            .select("id,url,tour_date,canonical,zpid,status")\
             .eq("client", client_norm)\
             .limit(2000).execute().data or []
-        to_fix = [r for r in rows if not (r.get("canonical") or "").strip()]
         updates = []
-        for r in to_fix:
+        for r in rows:
+            td = r.get("tour_date")
             try:
-                td = datetime.fromisoformat((r.get("tour_date") or date.today().isoformat())).date()
+                d = datetime.fromisoformat(td).date() if td else date.today()
             except Exception:
-                td = date.today()
-            canon = _st_tour_canonical(r.get("url") or "", td)
-            updates.append({"id": r["id"], "canonical": canon, "status": None})
+                d = date.today()
+            canon = (r.get("canonical") or "").strip() or _st_tour_canonical(r.get("url") or "", d)
+            zpid  = (r.get("zpid") or "").strip() or canon  # <-- ensure non-empty zpid
+            patch = {"id": r["id"]}
+            do = False
+            if (r.get("canonical") or "").strip() != canon:
+                patch["canonical"] = canon; do = True
+            if (r.get("zpid") or "").strip() != zpid:
+                patch["zpid"] = zpid; do = True
+            if r.get("status") not in (None, ""):
+                patch["status"] = None; do = True
+            if do:
+                updates.append(patch)
         if updates:
             SUPABASE.table("tours").upsert(updates).execute()
     except Exception:
@@ -375,28 +386,33 @@ def _backfill_empty_tour_canonicals(client_norm: str):
 # ---------- DB helpers ----------
 def _create_or_get_tour(client_norm: str, client_display: str, tour_url: Optional[str], tour_date: date) -> int:
     """
-    Key points:
-    - Always set a non-empty 'canonical' to satisfy UNIQUE (client, COALESCE(canonical,'')).
-    - **Explicitly set 'status' to None** to avoid DB default (e.g. 'requested') that violates tours_status_check.
+    Guarantees:
+    - unique 'canonical' per tour,
+    - non-empty 'zpid' (uses the same value as 'canonical'),
+    - 'status' = NULL (bypass tours_status_check).
     """
     if not SUPABASE: raise RuntimeError("Supabase not configured.")
 
-    # 1) Existing (client, tour_date)?
+    # Prevent legacy blanks from blocking new inserts
+    _backfill_tour_identities(client_norm)
+
+    canon = _st_tour_canonical(tour_url or "", tour_date)
+    zpid  = canon  # <-- CRITICAL: ensure non-empty zpid to satisfy unique (client, COALESCE(zpid,''))
+
+    # 1) Existing row for (client, tour_date)?
     q = SUPABASE.table("tours")\
-        .select("id,url,canonical,status")\
+        .select("id,url,canonical,zpid,status")\
         .eq("client", client_norm)\
         .eq("tour_date", tour_date.isoformat())\
         .limit(1).execute()
     rows = q.data or []
-    canon = _st_tour_canonical(tour_url or "", tour_date)
-
     if rows:
         tid = rows[0]["id"]
-        # Backfill canonical / clear status if needed
         updates = {}
         if not (rows[0].get("canonical") or "").strip():
             updates["canonical"] = canon
-        # If DB default filled a non-allowed status, null it out safely
+        if not (rows[0].get("zpid") or "").strip():
+            updates["zpid"] = zpid
         if rows[0].get("status") not in (None, ""):
             updates["status"] = None
         if tour_url and not (rows[0].get("url") or "").strip():
@@ -408,17 +424,15 @@ def _create_or_get_tour(client_norm: str, client_display: str, tour_url: Optiona
                 pass
         return tid
 
-    # 2) Prevent legacy blanks from blocking
-    _backfill_empty_tour_canonicals(client_norm)
-
-    # 3) Insert fresh tour (force status=None)
+    # 2) Insert fresh tour (status NULL + non-empty zpid)
     payload = {
         "client":         client_norm,
         "client_display": client_display,
         "url":            (tour_url or None),
         "canonical":      canon,
+        "zpid":           zpid,    # <-- unique per tour/client
         "tour_date":      tour_date.isoformat(),
-        "status":         None,          # <<<<< CRUCIAL FIX
+        "status":         None,    # <-- NULL to satisfy tours_status_check
     }
     ins = SUPABASE.table("tours").insert(payload).execute()
     if not ins.data:
@@ -678,3 +692,4 @@ def _render_client_tours_report(client_display: str, client_norm: str):
                 + "</li>"
             )
         st.markdown("<ul style='margin:.25rem 0 .5rem 0;padding:0;list-style:none;'>" + "\n".join(items) + "</ul>", unsafe_allow_html=True)
+
