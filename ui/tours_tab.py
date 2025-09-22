@@ -14,7 +14,7 @@ try:
 except Exception:
     PyPDF2 = None
 
-# ---------- Mac-style blue buttons + light separators ----------
+# ---------- Styling ----------
 st.markdown("""
 <style>
 .blue-btn-zone .stButton > button {
@@ -60,7 +60,6 @@ def _safe_rerun():
         try: st.experimental_rerun()
         except Exception: pass
 
-# >>> Keep app on the Tours tab after actions that trigger a rerun
 def _stay_on_tours():
     st.session_state["__active_tab__"] = "Tours"
 
@@ -90,7 +89,6 @@ def fetch_clients():
     if not SUPABASE: return []
     try:
         rows = SUPABASE.table("clients").select("id,name,name_norm,active").order("name", desc=False).execute().data or []
-        # hide "test test"
         return [r for r in rows if r.get("name_norm") != _norm_tag("test test")]
     except Exception:
         return []
@@ -121,7 +119,6 @@ def _month_to_num(m: str) -> int:
     except Exception: return datetime.strptime(m, "%B").month
 
 def _fix_pdf_spacing(s: str) -> str:
-    # Join accidental single-letter splits inside words: "V arina" -> "Varina"
     return re.sub(r'([A-Za-z])\s([a-z])', r'\1\2', s)
 
 def _extract_text_from_pdf(file) -> str:
@@ -154,21 +151,19 @@ def _fetch_html(url: str) -> str:
         return ""
 
 # ---------- Status normalization for STOPS (not tours) ----------
-ALLOWED_STATUSES = {"scheduled", "confirmed", "canceled"}
+ALLOWED_STOP_STATUSES = {"scheduled", "confirmed", "canceled"}
 
-def _normalize_status(s: str) -> str:
+def _normalize_stop_status(s: str) -> str:
     s = (s or "").strip().lower()
-    if s == "cancelled":
-        s = "canceled"
-    if s not in ALLOWED_STATUSES:
-        s = "scheduled"
-    return s
+    if s == "cancelled": s = "canceled"
+    return s if s in ALLOWED_STOP_STATUSES else "scheduled"
 
 def _status_in_window(txt: str) -> str:
     u = (txt or "").upper()
     if "CANCELLED" in u or "CANCELED" in u: return "canceled"
     if "CONFIRMED" in u: return "confirmed"
-    return ""  # will be normalized later if empty
+    if "SCHEDULED" in u: return "scheduled"
+    return ""  # caller will normalize
 
 # ---------- Parse core ----------
 def _parse_tour_text(txt: str) -> Dict[str, Any]:
@@ -186,7 +181,6 @@ def _parse_tour_text(txt: str) -> Dict[str, Any]:
 
     stops: List[Dict[str, Any]] = []
     for am in ADDR_RE.finditer(txt):
-        # Clean address-only text
         num   = am.group("num").strip()
         name  = re.sub(r'\s+', ' ', am.group("name").strip())
         stype = am.group("stype").strip()
@@ -216,7 +210,7 @@ def _parse_tour_text(txt: str) -> Dict[str, Any]:
             "start": t1.replace("AM"," AM").replace("PM"," PM").strip(),
             "end":   t2.replace("AM"," AM").replace("PM"," PM").strip(),
             "deeplink": _address_to_deeplink(addr_clean),
-            "status": stat  # may be "", normalize later
+            "status": stat  # may be "", we'll normalize later
         })
 
     return {"tour_date": (tdate.isoformat() if tdate else None), "stops": stops}
@@ -276,7 +270,7 @@ def _build_repeat_map(client_norm: str) -> Dict[tuple, int]:
     ids = [t["id"] for t in tours]
     if not ids: return {}
     sq = SUPABASE.table("tour_stops").select("tour_id,address_slug").in_("tour_id", ids).limit(50000).execute()
-    stops = sq.data or []  # ensure list
+    stops = sq.data or []
     t2s: Dict[int, List[str]] = {}
     for s in stops:
         t2s.setdefault(s["tour_id"], []).append(s["address_slug"])
@@ -321,7 +315,6 @@ def _repeat_tag_html(n: int) -> str:
     return ""
 
 def _sent_tag_html() -> str:
-    # gray/indigo style "Sent" tag; placed left of Scheduled/Confirmed/Canceled
     return "<span style='padding:2px 8px;border-radius:9999px;font-size:11px;font-weight:800;background:#1e293b;color:#e2e8f0;border:1px solid #334155;white-space:nowrap;margin-right:8px;'>Sent</span>"
 
 # ---------- SENT cross-check for a client ----------
@@ -332,10 +325,8 @@ def _fetch_sent_norm_slugs_for_client(client_norm: str) -> set:
         rows = SUPABASE.table("sent").select("address,canonical,url").eq("client", client_norm.strip()).limit(50000).execute().data or []
         out: set = set()
         for r in rows:
-            # Prefer canonical Zillow URL slug if present, else address slug
             can = (r.get("canonical") or "").strip()
             if can and "/homedetails/" in can:
-                # derive something close to address slug from the URL text
                 m = re.search(r"/homedetails/([^/]+)/\d{6,}_zpid/", can, re.I)
                 if m:
                     out.add(_slug_addr(re.sub(r"[-+]", " ", m.group(1))))
@@ -347,18 +338,10 @@ def _fetch_sent_norm_slugs_for_client(client_norm: str) -> set:
         return set()
     return out
 
-# ---------- Tours canonicalization (to satisfy unique index without DB perms) ----------
+# ---------- Tours canonicalization ----------
 _ST_TOUR_ID_RE = re.compile(r'/Tour/Print/(\d+)', re.I)
 
 def _st_tour_canonical(tour_url: Optional[str], tour_date: date) -> str:
-    """
-    Produce a stable, non-empty 'canonical' string per tour to satisfy the
-    UNIQUE (client, COALESCE(canonical,'')) index in the DB.
-
-    Priority:
-    - If the ShowingTime Print URL contains an ID like /Tour/Print/30235965 -> st-tour-30235965
-    - Else, fall back to the date token (unique per day per client) -> st-tour-YYYYMMDD
-    """
     u = (tour_url or "").strip()
     if u:
         u2 = re.sub(r'\(S\([^)]+\)\)', '', u)   # strip session tokens
@@ -369,10 +352,6 @@ def _st_tour_canonical(tour_url: Optional[str], tour_date: date) -> str:
     return f"st-tour-{tour_date.strftime('%Y%m%d')}"
 
 def _backfill_empty_tour_canonicals(client_norm: str):
-    """
-    Optional safety: fix legacy rows for this client with blank canonical so
-    future inserts won't collide on ''.
-    """
     if not SUPABASE or not client_norm: return
     try:
         rows = SUPABASE.table("tours")\
@@ -387,7 +366,7 @@ def _backfill_empty_tour_canonicals(client_norm: str):
             except Exception:
                 td = date.today()
             canon = _st_tour_canonical(r.get("url") or "", td)
-            updates.append({"id": r["id"], "canonical": canon})
+            updates.append({"id": r["id"], "canonical": canon, "status": None})
         if updates:
             SUPABASE.table("tours").upsert(updates).execute()
     except Exception:
@@ -396,14 +375,15 @@ def _backfill_empty_tour_canonicals(client_norm: str):
 # ---------- DB helpers ----------
 def _create_or_get_tour(client_norm: str, client_display: str, tour_url: Optional[str], tour_date: date) -> int:
     """
-    Always set a non-empty 'canonical' to satisfy UNIQUE (client, COALESCE(canonical,'')).
-    Do NOT set 'status' at insert time to avoid the tours_status_check surprises.
+    Key points:
+    - Always set a non-empty 'canonical' to satisfy UNIQUE (client, COALESCE(canonical,'')).
+    - **Explicitly set 'status' to None** to avoid DB default (e.g. 'requested') that violates tours_status_check.
     """
     if not SUPABASE: raise RuntimeError("Supabase not configured.")
 
-    # 1) Is there already a tour for this client/date?
+    # 1) Existing (client, tour_date)?
     q = SUPABASE.table("tours")\
-        .select("id,url,canonical")\
+        .select("id,url,canonical,status")\
         .eq("client", client_norm)\
         .eq("tour_date", tour_date.isoformat())\
         .limit(1).execute()
@@ -412,33 +392,33 @@ def _create_or_get_tour(client_norm: str, client_display: str, tour_url: Optiona
 
     if rows:
         tid = rows[0]["id"]
-        # Backfill canonical if missing
-        old_can = (rows[0].get("canonical") or "").strip()
-        if not old_can:
+        # Backfill canonical / clear status if needed
+        updates = {}
+        if not (rows[0].get("canonical") or "").strip():
+            updates["canonical"] = canon
+        # If DB default filled a non-allowed status, null it out safely
+        if rows[0].get("status") not in (None, ""):
+            updates["status"] = None
+        if tour_url and not (rows[0].get("url") or "").strip():
+            updates["url"] = tour_url
+        if updates:
             try:
-                SUPABASE.table("tours").update({"canonical": canon}).eq("id", tid).execute()
-            except Exception:
-                pass
-        # Fill URL if empty
-        old_url = (rows[0].get("url") or "").strip()
-        if tour_url and not old_url:
-            try:
-                SUPABASE.table("tours").update({"url": tour_url}).eq("id", tid).execute()
+                SUPABASE.table("tours").update(updates).eq("id", tid).execute()
             except Exception:
                 pass
         return tid
 
-    # 2) Make sure legacy blank canonicals won't block us
+    # 2) Prevent legacy blanks from blocking
     _backfill_empty_tour_canonicals(client_norm)
 
-    # 3) Insert fresh tour with canonical; omit 'status'
+    # 3) Insert fresh tour (force status=None)
     payload = {
         "client":         client_norm,
         "client_display": client_display,
         "url":            (tour_url or None),
-        "canonical":      canon,                    # <<— key fix
+        "canonical":      canon,
         "tour_date":      tour_date.isoformat(),
-        # no 'status' field -> avoid CHECK constraint surprises
+        "status":         None,          # <<<<< CRUCIAL FIX
     }
     ins = SUPABASE.table("tours").insert(payload).execute()
     if not ins.data:
@@ -455,13 +435,7 @@ def _create_or_get_tour(client_norm: str, client_display: str, tour_url: Optiona
     return ins.data[0]["id"]
 
 def _insert_stops(tour_id: int, stops: List[Dict[str, Any]]) -> int:
-    """
-    Insert stops for a tour.
-    NOTE: Do NOT insert 'address_slug' if your table defines it as a GENERATED column.
-    We compute a slug in-memory for dedupe only.
-    """
     if not SUPABASE: return 0
-    # Fetch existing slugs to dedupe
     existing = SUPABASE.table("tour_stops").select("address_slug").eq("tour_id", tour_id).limit(50000).execute().data or []
     seen = {e["address_slug"] for e in existing if e.get("address_slug")}
     rows = []
@@ -469,18 +443,15 @@ def _insert_stops(tour_id: int, stops: List[Dict[str, Any]]) -> int:
         addr = (s.get("address") or "").strip()
         if not addr: continue
         slug = _slug_addr(addr)
-        if slug in seen:
-            continue
-        # Normalize status (tour_stops has its own CHECK)
-        raw_status = _normalize_status(s.get("status"))
+        if slug in seen: continue
         rows.append({
             "tour_id": tour_id,
             "address": addr,
-            # no address_slug (generated by DB)
+            # address_slug is generated by DB (if defined that way)
             "start": (s.get("start") or None),
             "end":   (s.get("end") or None),
             "deeplink": (s.get("deeplink") or _address_to_deeplink(addr)),
-            "status": raw_status,
+            "status": _normalize_stop_status(s.get("status")),
         })
         seen.add(slug)
     if not rows: return 0
@@ -539,7 +510,6 @@ def render_tours_tab(state: dict):
                 st.markdown(f"<div style='text-align:right;'>{_date_badge_html(tdate)}</div>", unsafe_allow_html=True)
 
         if stops:
-            # If a client is chosen later for logging, we'll also show 'Sent' badges in the report view.
             lis = []
             for s in stops:
                 addr = (s.get("address","").strip())
@@ -547,10 +517,9 @@ def render_tours_tab(state: dict):
                 start = (s.get("start") or "").strip()
                 end   = (s.get("end") or "").strip()
                 when  = f"{start}–{end}" if (start and end) else (start or end or "")
-                stat  = _normalize_status(s.get("status"))
+                stat  = _normalize_stop_status(s.get("status"))
 
                 right_badges = []
-                # order: (Sent goes on left, handled in report rendering where client context is known)
                 if stat:
                     right_badges.append(_status_tag_html(stat))
                 if when:
@@ -577,7 +546,6 @@ def render_tours_tab(state: dict):
         client_names = [c["name"] for c in clients]
         client_norms = [c["name_norm"] for c in clients]
 
-        # Display client (real client list only)
         if client_names:
             idx_disp = st.selectbox(
                 "Client display name (for the tour record)",
@@ -592,7 +560,6 @@ def render_tours_tab(state: dict):
             client_display = ""
             client_display_norm = ""
 
-        # Add all stops to client (first option is No logging)
         NO_CLIENT = "➤ No client (show ALL, no logging)"
         add_names = [NO_CLIENT] + client_names
         add_norms = [""         ] + client_norms
@@ -600,7 +567,7 @@ def render_tours_tab(state: dict):
             "Add all stops to client (optional)",
             list(range(len(add_names))),
             format_func=lambda i: add_names[i],
-            index=0,  # default "No logging"
+            index=0,
             key="__tour_add_to_client__"
         )
         chosen_norm = add_norms[idx_add]
@@ -649,10 +616,8 @@ def render_tours_tab(state: dict):
                                 format_func=lambda i: names2[i], index=0, key="__tour_client_pick__")
         with colBtn:
             st.markdown("<div class='blue-btn-zone'>", unsafe_allow_html=True)
-            # The ONLY View report button in the entire tab:
             st.button("View report", use_container_width=True, key="__view_report_here__")
             st.markdown("</div>", unsafe_allow_html=True)
-            # (Button is primarily visual here; the section already shows the report for the selected client.)
 
         _render_client_tours_report(names2[irep], norms2[irep])
     else:
@@ -668,9 +633,7 @@ def _render_client_tours_report(client_display: str, client_norm: str):
         st.info("No tours logged for this client yet.")
         return
 
-    # For "Sent" tag next to each stop (match by slug against sent rows)
     sent_slugs = _fetch_sent_norm_slugs_for_client(client_norm)
-
     repeat_map = _build_repeat_map(client_norm)
 
     for t in tours:
@@ -691,18 +654,15 @@ def _render_client_tours_report(client_display: str, client_norm: str):
             end   = (s.get("end") or "").strip()
             when  = f"{start}–{end}" if (start and end) else (start or end or "")
             visit = repeat_map.get((slug, td), 1)
-            stat  = _normalize_status(s.get("status"))
+            stat  = _normalize_stop_status(s.get("status"))
 
-            # Right badges (time/status); ensure Sent appears to the LEFT
             right_badges = []
             if stat:
                 right_badges.append(_status_tag_html(stat))
             if when:
                 right_badges.append(_time_badge_html(when))
 
-            # Sent chip (on the left side of badges area)
             sent_html = _sent_tag_html() if slug in sent_slugs else ""
-
             rep_tag = _repeat_tag_html(visit)
 
             items.append(
