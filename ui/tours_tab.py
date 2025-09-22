@@ -154,7 +154,7 @@ def _fetch_html(url: str) -> str:
         return ""
 
 # ---------- Status normalization ----------
-ALLOWED_STATUSES = {"scheduled", "confirmed", "canceled"}  # for tour_stops rows
+ALLOWED_STATUSES = {"scheduled", "confirmed", "canceled"}
 
 def _normalize_status(s: str) -> str:
     s = (s or "").strip().lower()
@@ -242,9 +242,8 @@ def parse_showingtime_input(url: str, uploaded_pdf) -> Dict[str, Any]:
 # ---------- DB helpers ----------
 def _create_or_get_tour(client_norm: str, client_display: str, tour_url: Optional[str], tour_date: date) -> int:
     """
-    Create the tour row if it doesn't exist.
-    IMPORTANT: insert with a status that satisfies the DB check constraint.
-    We use 'scheduled' (instead of the old 'imported').
+    IMPORTANT: we do NOT set tours.status here to avoid CHECK constraint mismatches.
+    Leaving it NULL is safe and passes the CHECK; per-stop status is what the UI uses.
     """
     if not SUPABASE: raise RuntimeError("Supabase not configured.")
     q = SUPABASE.table("tours").select("id,url").eq("client", client_norm).eq("tour_date", tour_date.isoformat()).limit(1).execute()
@@ -255,15 +254,13 @@ def _create_or_get_tour(client_norm: str, client_display: str, tour_url: Optiona
         if tour_url and not old_url:
             SUPABASE.table("tours").update({"url": tour_url}).eq("id", tid).execute()
         return tid
-
-    payload = {
+    ins = SUPABASE.table("tours").insert({
         "client": client_norm,
         "client_display": client_display,
         "url": (tour_url or None),
         "tour_date": tour_date.isoformat(),
-        "status": "scheduled",  # <-- key change: keep within check constraint
-    }
-    ins = SUPABASE.table("tours").insert(payload).execute()
+        # no 'status' field on purpose
+    }).execute()
     if not ins.data: raise RuntimeError("Create tour failed.")
     return ins.data[0]["id"]
 
@@ -348,35 +345,6 @@ def _build_repeat_map(client_norm: str) -> Dict[tuple, int]:
             rep[(slug, td)] = seen_count[slug]
     return rep
 
-# --- Sent normalization for tagging ---
-_RE_HD = re.compile(r"/homedetails/([^/]+)/\d{6,}_zpid/?", re.I)
-_RE_HM = re.compile(r"/homes/([^/_]+)_rb/?", re.I)
-
-def _norm_slug_from_text(text: str) -> str:
-    s = (text or "").lower().replace("&", " and ")
-    toks = re.split(r"[^a-z0-9]+", s)
-    norm = [t for t in toks if t]
-    return "-".join(norm)
-
-@st.cache_data(ttl=120, show_spinner=False)
-def _fetch_sent_norm_slugs_for_client(client_norm: str) -> set:
-    if not SUPABASE or not client_norm.strip(): return set()
-    try:
-        rows = SUPABASE.table("sent").select("url,address,canonical").eq("client", client_norm.strip()).limit(20000).execute().data or []
-        out: set = set()
-        for r in rows:
-            addr = (r.get("address") or "").strip()
-            url  = (r.get("canonical") or r.get("url") or "").strip()
-            if addr:
-                out.add(_norm_slug_from_text(addr))
-            if url:
-                m = _RE_HD.search(url) or _RE_HM.search(url)
-                if m:
-                    out.add(_norm_slug_from_text(m.group(1)))
-        return out
-    except Exception:
-        return set()
-
 # ---------- Session: parsed payload ----------
 def _get_parsed() -> Dict[str, Any]:
     return st.session_state.get("__parsed_tour__") or {}
@@ -398,10 +366,6 @@ def _status_tag_html(stat: str) -> str:
     if u == "scheduled":
         return "<span style='padding:2px 8px;border-radius:9999px;font-size:11px;font-weight:800;background:#334155;color:#e2e8f0;border:1px solid #475569;white-space:nowrap;'>Scheduled</span>"
     return ""
-
-def _sent_tag_html() -> str:
-    # Purple-blue "Sent" pill; placed to the LEFT of the status/time badges
-    return "<span style='padding:2px 8px;border-radius:9999px;font-size:11px;font-weight:800;background:#312e81;color:#e0e7ff;border:1px solid #6366f1;white-space:nowrap;'>Sent</span>"
 
 def _time_badge_html(when: str) -> str:
     if not when: return ""
@@ -592,7 +556,6 @@ def _render_client_tours_report(client_display: str, client_norm: str):
         return
 
     repeat_map = _build_repeat_map(client_norm)
-    sent_slugs = _fetch_sent_norm_slugs_for_client(client_norm)
 
     for t in tours:
         td = t["tour_date"]
@@ -606,7 +569,7 @@ def _render_client_tours_report(client_display: str, client_norm: str):
         items = []
         for s in stops:
             addr = s.get("address") or ""
-            slug = (s.get("address_slug") or _slug_addr(addr) or "").strip()
+            slug = s.get("address_slug") or _slug_addr(addr)
             href = (s.get("deeplink") or _address_to_deeplink(addr)).strip()
             start = (s.get("start") or "").strip()
             end   = (s.get("end") or "").strip()
@@ -614,10 +577,7 @@ def _render_client_tours_report(client_display: str, client_norm: str):
             visit = repeat_map.get((slug, td), 1)
             stat  = _normalize_status(s.get("status"))
 
-            # Badges: Sent (left), then Scheduled/Confirmed/Canceled, then time
             right_badges = []
-            if slug in sent_slugs:
-                right_badges.append(_sent_tag_html())
             if stat:
                 right_badges.append(_status_tag_html(stat))
             if when:
