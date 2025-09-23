@@ -1,6 +1,8 @@
 # ui/run_tab.py
 # Run tab with: hyperlinks-only results, clickable thumbnails, TOURED cross-check,
 # de-dup by client, optional logging to Supabase, AND a "Fix" flow to re-run one item with overrides.
+# ⭐ NEW: After fixing an item we (a) fetch a fresh thumbnail and (b) rerun the app so Images refresh.
+# ⭐ NEW: "Remove this item from results" button in Fix section.
 
 import os, csv, io, re, time, json, asyncio
 from datetime import datetime
@@ -623,8 +625,10 @@ async def enrich_results_async(results: List[Dict[str, Any]]) -> List[Dict[str, 
         sem = asyncio.Semaphore(limits)
         async def task(i, url):
             async with sem:
-                html = await _fetch_html_async(client, url)
-                return i, parse_listing_meta(html)
+                html = await client.get(url, headers=UA_HEADERS, timeout=REQUEST_TIMEOUT)
+                if html.status_code == 200:
+                    return i, parse_listing_meta(html.text)
+                return i, {}
         coros = [task(i, url) for i, url in targets]
         for fut in asyncio.as_completed(coros):
             i, meta = await fut
@@ -1284,85 +1288,109 @@ def render_run_tab(state: dict):
     with c4:
         re_enrich = st.checkbox("Re-enrich details", value=False)
 
-    # Action
-    if st.button("Re-run selected with overrides", type="primary", use_container_width=False, key="__apply_fix__"):
-        try:
-            defaults = {"city": hint_city, "state": hint_state, "zip": hint_zip}
-            # Prepare base row
-            if (source_url_override or "").strip():
-                zurl, used_addr = resolve_from_source_url(source_url_override.strip(), defaults)
-                new_r = {
-                    "input_address": used_addr or override_address or pre_addr or "",
-                    "mls_id": override_mls or pre_mls or "",
-                    "zillow_url": zurl,
-                    "status": "",
-                    "csv_photo": None
-                }
-            else:
-                row = {"address": override_address or pre_addr or ""}
-                if override_mls: row["mls"] = override_mls
-                if override_mlsname: row["mls name"] = override_mlsname
-                if hint_city: row["city"] = hint_city
-                if hint_state: row["state"] = hint_state
-                if hint_zip: row["zip"] = hint_zip
-                new_r = process_single_row(
-                    row, delay=0.4, land_mode=land_mode, defaults=defaults,
-                    require_state=require_state, mls_first=mls_first,
-                    default_mls_name=(override_mlsname or ""), max_candidates=20
-                )
+    colFixAct1, colFixAct2 = st.columns([1,1])
 
-            # upgrade + enrich optional
-            if new_r.get("zillow_url"):
-                new_r["zillow_url"] = upgrade_to_homedetails_if_needed(new_r["zillow_url"])
-            if re_enrich:
-                # mini enrich for single item
-                try:
-                    html = requests.get(new_r["zillow_url"], headers=UA_HEADERS, timeout=REQUEST_TIMEOUT).text if new_r.get("zillow_url") else ""
-                    new_r.update(parse_listing_meta(html))
-                except Exception:
-                    pass
+    # Action: Re-run with overrides
+    with colFixAct1:
+        if st.button("Re-run selected with overrides", type="primary", use_container_width=True, key="__apply_fix__"):
+            try:
+                defaults = {"city": hint_city, "state": hint_state, "zip": hint_zip}
+                # Prepare base row
+                if (source_url_override or "").strip():
+                    zurl, used_addr = resolve_from_source_url(source_url_override.strip(), defaults)
+                    new_r = {
+                        "input_address": used_addr or override_address or pre_addr or "",
+                        "mls_id": override_mls or pre_mls or "",
+                        "zillow_url": zurl,
+                        "status": "",
+                        "csv_photo": None
+                    }
+                else:
+                    row = {"address": override_address or pre_addr or ""}
+                    if override_mls: row["mls"] = override_mls
+                    if override_mlsname: row["mls name"] = override_mlsname
+                    if hint_city: row["city"] = hint_city
+                    if hint_state: row["state"] = hint_state
+                    if hint_zip: row["zip"] = hint_zip
+                    new_r = process_single_row(
+                        row, delay=0.4, land_mode=land_mode, defaults=defaults,
+                        require_state=require_state, mls_first=mls_first,
+                        default_mls_name=(override_mlsname or ""), max_candidates=20
+                    )
 
-            # tracking + preview
-            base = new_r.get("zillow_url")
-            new_r["preview_url"] = make_preview_url(base) if base else ""
-            display = make_trackable_url(base, client_tag, campaign_tag) if base else base
-            if st.session_state.get("__use_shortlinks_override__", use_shortlinks) and display:
-                short = bitly_shorten(display)
-                new_r["display_url"] = short or display
-            else:
-                new_r["display_url"] = display or base
+                # upgrade + enrich optional
+                if new_r.get("zillow_url"):
+                    new_r["zillow_url"] = upgrade_to_homedetails_if_needed(new_r["zillow_url"])
+                if re_enrich:
+                    # mini enrich for single item
+                    try:
+                        html = requests.get(new_r["zillow_url"], headers=UA_HEADERS, timeout=REQUEST_TIMEOUT).text if new_r.get("zillow_url") else ""
+                        new_r.update(parse_listing_meta(html))
+                    except Exception:
+                        pass
 
-            # recompute dup/toured flags for this item
-            if client_tag.strip():
-                canon_set, zpid_set, canon_info, zpid_info = get_already_sent_maps(client_tag)
-                mark_duplicates([new_r], canon_set, zpid_set, canon_info, zpid_info)
-                tmap = get_tour_slug_map(client_tag)
-                info = tmap.get(result_to_slug(new_r), {})
-                new_r["toured"] = bool(info)
-                new_r["toured_date"] = info.get("date") if info else ""
-                new_r["toured_start"] = info.get("start") if info else ""
-                new_r["toured_end"] = info.get("end") if info else ""
-            else:
-                new_r["already_sent"] = False
-                new_r["toured"] = False
+                # tracking + preview
+                base = new_r.get("zillow_url")
+                new_r["preview_url"] = make_preview_url(base) if base else ""
+                display = make_trackable_url(base, client_tag, campaign_tag) if base else base
+                if st.session_state.get("__use_shortlinks_override__", use_shortlinks) and display:
+                    short = bitly_shorten(display)
+                    new_r["display_url"] = short or display
+                else:
+                    new_r["display_url"] = display or base
 
-            # Replace in results
-            results[pick] = new_r
-            st.session_state["__results__"]["results"] = results
-            st.success("Updated that item. Scroll up to Results to see the corrected link.")
-            # Optionally scroll back to top results
-            st.components.v1.html(
-                """
-                <script>
-                  const el = parent.document.querySelector('.results-wrap');
-                  if (el) { el.scrollIntoView({behavior:'smooth', block:'start'}); }
-                </script>
-                """, height=0
-            )
+                # recompute dup/toured flags for this item
+                if client_tag.strip():
+                    canon_set, zpid_set, canon_info, zpid_info = get_already_sent_maps(client_tag)
+                    mark_duplicates([new_r], canon_set, zpid_set, canon_info, zpid_info)
+                    tmap = get_tour_slug_map(client_tag)
+                    info = tmap.get(result_to_slug(new_r), {})
+                    new_r["toured"] = bool(info)
+                    new_r["toured_date"] = info.get("date") if info else ""
+                    new_r["toured_start"] = info.get("start") if info else ""
+                    new_r["toured_end"] = info.get("end") if info else ""
+                else:
+                    new_r["already_sent"] = False
+                    new_r["toured"] = False
 
-        except Exception as e:
-            st.error("Fix failed.")
-            with st.expander("Details"): st.exception(e)
+                # ⭐ NEW: ensure we have a thumbnail now that the URL/addr changed
+                if not new_r.get("image_url"):
+                    img, _ = get_thumbnail_and_log(
+                        new_r.get("input_address",""),
+                        new_r.get("preview_url") or new_r.get("zillow_url") or "",
+                        new_r.get("csv_photo")
+                    )
+                    if img:
+                        new_r["image_url"] = img
+
+                # Replace in results
+                results[pick] = new_r
+                st.session_state["__results__"]["results"] = results
+
+                # ⭐ NEW: hard refresh UI so Images section updates immediately
+                _safe_rerun()
+
+            except Exception as e:
+                st.error("Fix failed.")
+                with st.expander("Details"): st.exception(e)
+
+    # ⭐ NEW: Remove from results (UI-only; does not touch Supabase)
+    with colFixAct2:
+        if st.button("Remove this item from results", use_container_width=True, key="__remove_fix__"):
+            try:
+                if 0 <= pick < len(results):
+                    del results[pick]
+                    st.session_state["__results__"]["results"] = results
+                    st.success("Removed from results.")
+                    # Adjust the selected index if needed
+                    if pick >= len(results):
+                        st.session_state["__fix_target_index__"] = max(0, len(results)-1)
+                    _safe_rerun()
+                else:
+                    st.warning("Nothing to remove.")
+            except Exception as e:
+                st.error("Remove failed.")
+                with st.expander("Details"): st.exception(e)
 
     # Handle auto-scroll when coming from Fix button
     if st.session_state.get("__scroll_to_fix__"):
