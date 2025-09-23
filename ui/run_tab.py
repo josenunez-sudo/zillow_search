@@ -1,5 +1,6 @@
 # ui/run_tab.py
-# Run tab with: hyperlinks-only results, clickable thumbnails, TOURED cross-check, and per-item re-run overrides.
+# Run tab with: hyperlinks-only results, clickable thumbnails, TOURED cross-check,
+# de-dup by client, optional logging to Supabase, AND a "Fix" flow to re-run one item with overrides.
 
 import os, csv, io, re, time, json, asyncio
 from datetime import datetime
@@ -59,13 +60,46 @@ GOOGLE_MAPS_API_KEY   = os.getenv("GOOGLE_MAPS_API_KEY","")
 BITLY_TOKEN           = os.getenv("BITLY_TOKEN","")
 REQUEST_TIMEOUT       = 12
 
-# ---------- Styles (kept minimal; badges used below) ----------
+# ---------- Styles ----------
 st.markdown("""
 <style>
-.badge { font-size:11px; font-weight:800; padding:2px 8px; border-radius:999px; margin-left:6px; }
-.badge.new { background:#dcfce7; color:#166534; border:1px solid rgba(5,150,105,.35); }
-.badge.dup { background:#fee2e2; color:#991b1b; border:1px solid rgba(239,68,68,.35); }
-.badge.tour { background:#e0f2fe; color:#075985; border:1px solid rgba(7,89,133,.35); }
+/* Mac-style blue button */
+.blue-btn-zone .stButton > button {
+  background: linear-gradient(180deg, #0A84FF 0%, #0060DF 100%) !important;
+  color: #FFFFFF !important;
+  font-weight: 800 !important;
+  border: 0 !important;
+  border-radius: 12px !important;
+  box-shadow: 0 8px 20px rgba(10,132,255,.35), 0 2px 6px rgba(0,0,0,.18) !important;
+  transition: all .1s ease !important;
+}
+.blue-btn-zone .stButton > button:hover {
+  box-shadow: 0 12px 26px rgba(10,132,255,.42), 0 4px 10px rgba(0,0,0,.2) !important;
+}
+
+/* Badges (NEW / Duplicate / TOURED) */
+.badge {
+  display:inline-block;
+  font-size:11px; font-weight:800;
+  padding:2px 6px; border-radius:999px; margin-left:8px;
+  border:1px solid rgba(0,0,0,.18);
+}
+.badge.new { background:#dcfce7; color:#166534; border-color:rgba(5,150,105,.35); }
+.badge.dup { background:#f1f5f9; color:#0f172a; border-color:#cbd5e1; }
+.badge.tour { background:#e0f2fe; color:#075985; border-color:rgba(7,89,133,.35); }
+
+/* Small Fix buttons under result list */
+.fix-row { display:flex; align-items:center; gap:8px; padding:2px 0; }
+.fix-row .idx { width:36px; text-align:right; opacity:.7; font-variant-numeric:tabular-nums; }
+.fix-row .url { flex:1; overflow:hidden; white-space:nowrap; text-overflow:ellipsis; }
+.fix-row .stButton>button { padding:2px 8px; border-radius:8px; font-weight:700; }
+
+.results-wrap { position:relative; box-sizing:border-box; padding:8px 120px 4px 0; }
+ul.link-list { margin:0 0 0.2rem 1.2rem; padding:0; list-style:disc; }
+ul.link-list li { margin:0.2rem 0; }
+
+/* Anchor target spacing */
+.anchor-space { height:1px; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -771,7 +805,7 @@ def log_sent_rows(results: List[Dict[str, Any]], client_tag: str, campaign_tag: 
     except Exception as e:
         return False, str(e)
 
-# ---------- Clients registry helpers ----------
+# ---------- Clients registry helpers (cached) ----------
 @st.cache_data(ttl=60, show_spinner=False)
 def fetch_clients(include_inactive: bool = False):
     if not _sb_ok(): return []
@@ -830,7 +864,9 @@ def build_output(rows: List[Dict[str, Any]], fmt: str, use_display: bool = True,
     payload = "\n".join(lines) + ("\n" if lines else "")
     return payload, ("text/markdown" if fmt == "md" else "text/plain")
 
-# ---------- Main renderer ----------
+# =====================================================================
+# ============================ MAIN TAB ===============================
+# =====================================================================
 def render_run_tab(state: dict):
     NO_CLIENT = "➤ No client (show ALL, no logging)"
     ADD_SENTINEL = "➕ Add new client…"
@@ -873,6 +909,7 @@ def render_run_tab(state: dict):
         if not selected_client:
             only_show_new = False
 
+    # Default: hide table to remove dead space
     table_view = st.checkbox("Show results as table", value=False, help="Easier to scan details")
 
     client_tag = _norm_tag(client_tag_raw)
@@ -931,7 +968,9 @@ def render_run_tab(state: dict):
         st.markdown("<ul class='link-list'>" + "\n".join([f"<li>{escape(p)}</li>" for p in lines_clean[:5]]) + ("<li>…</li>" if count_pasted > 5 else "") + "</ul>", unsafe_allow_html=True)
 
     # RUN
+    st.markdown('<div class="run-zone">', unsafe_allow_html=True)
     clicked = st.button("🚀 Run", use_container_width=True, key="__run_btn__")
+    st.markdown('</div>', unsafe_allow_html=True)
 
     # Results HTML list with copy-all
     def results_list_with_copy_all(results: List[Dict[str, Any]], client_selected: bool):
@@ -941,8 +980,9 @@ def render_run_tab(state: dict):
             if not href:
                 continue
             safe_href = escape(href)
-            link_txt = href
+            link_txt = href  # keep URL text for best SMS unfurls
 
+            # Badges: duplicate/new + toured
             badge_html = ""
             if client_selected:
                 if r.get("already_sent"):
@@ -955,8 +995,8 @@ def render_run_tab(state: dict):
                     tm = str(r.get("toured_start") or "")
                     title = ("Toured " + (dt + (" " + tm if tm else ""))).strip()
                     badge_html += (
-                        ' <span class="badge tour" title="{}">TOURED</span>'
-                    ).format(escape(title))
+                        ' <span class="badge tour" title="{title}">TOURED</span>'
+                    ).replace("{title}", escape(title))
 
             li_html.append(
                 f'<li style="margin:0.2rem 0;"><a href="{safe_href}" target="_blank" rel="noopener">{escape(link_txt)}</a>{badge_html}</li>'
@@ -975,9 +1015,6 @@ def render_run_tab(state: dict):
         <html><head><meta charset="utf-8" />
           <style>
             html,body {{ margin:0; font-family:-apple-system, Segoe UI, Roboto, Arial, sans-serif; }}
-            .results-wrap {{ position:relative; box-sizing:border-box; padding:8px 120px 4px 0; }}
-            ul.link-list {{ margin:0 0 0.2rem 1.2rem; padding:0; list-style:disc; }}
-            ul.link-list li {{ margin:0.2rem 0; }}
             .copyall-btn {{ position:absolute; top:0; right:8px; z-index:5; padding:6px 10px; height:26px; border:0; border-radius:10px; color:#fff; font-weight:700; background:#1d4ed8; cursor:pointer; opacity:.95; }}
           </style>
         </head><body>
@@ -1003,71 +1040,26 @@ def render_run_tab(state: dict):
         est_h = max(60, min(34 * max(1, len(li_html)) + 20, 700))
         components.html(html, height=est_h, scrolling=False)
 
-    def _render_results_and_downloads(results: List[Dict[str, Any]], client_tag: str, campaign_tag: str, include_notes: bool, client_selected: bool):
-        st.markdown("#### Results")
-        results_list_with_copy_all(results, client_selected=client_selected)
+    # ----- Fix buttons row (per-item) -----
+    def render_fix_buttons(results: List[Dict[str, Any]]):
+        st.caption("Need to correct one? Click **Fix** and we’ll open the overrides below.")
+        for i, r in enumerate(results):
+            cols = st.columns([0.08, 0.74, 0.18])
+            with cols[0]:
+                st.markdown(f"<div class='fix-row'><span class='idx'>{i+1}.</span></div>", unsafe_allow_html=True)
+            with cols[1]:
+                u = r.get("preview_url") or r.get("zillow_url") or r.get("display_url") or ""
+                addr = (r.get("input_address") or "") or address_text_from_url(u)
+                label = u or addr or "(empty)"
+                st.markdown(f"<div class='fix-row'><div class='url'>{escape(label)}</div></div>", unsafe_allow_html=True)
+            with cols[2]:
+                if st.button("Fix", key=f"__fixbtn_{i}"):
+                    # Pre-select this item in the fix section and scroll to it
+                    st.session_state["__fix_target_index__"] = i
+                    st.session_state["__scroll_to_fix__"] = True
+                    _safe_rerun()
 
-        if table_view:
-            import pandas as pd
-            cols = ["already_sent","dup_reason","dup_sent_at","toured","toured_date","toured_start","toured_end",
-                    "display_url","zillow_url","preview_url","status","price","beds","baths","sqft","mls_id","input_address"]
-            df = pd.DataFrame([{c: r.get(c) for c in cols} for r in results])
-            st.dataframe(df, use_container_width=True, hide_index=True)
-
-        fmt_options = ["txt","csv","md","html"]
-        prev_fmt = (st.session_state.get("__results__") or {}).get("fmt")
-        default_idx = fmt_options.index(prev_fmt) if prev_fmt in fmt_options else 0
-        fmt = st.selectbox("Download format", fmt_options, index=default_idx)
-        payload, mime = build_output(results, fmt, use_display=True, include_notes=include_notes)
-        ts = datetime.utcnow().strftime("%Y%m%d%H%M%S")
-        tag = ("_" + re.sub(r'[^a-z0-9\-]+','', (client_tag or "").lower().replace(" ","-"))) if client_tag else ""
-        st.download_button("Export", data=payload, file_name=f"address_alchemist{tag}_{ts}.{fmt}", mime=mime, use_container_width=True)
-        st.session_state["__results__"] = {"results": results, "fmt": fmt}
-
-        # Thumbs (clickable)
-        thumbs=[]
-        for r in results:
-            img = r.get("image_url")
-            if not img:
-                img, _ = get_thumbnail_and_log(r.get("input_address",""), r.get("preview_url") or r.get("zillow_url") or "", r.get("csv_photo"))
-            if img: thumbs.append((r,img))
-        if thumbs:
-            st.markdown("#### Images")
-            cols = st.columns(3)
-            for i,(r,img) in enumerate(thumbs):
-                with cols[i%3]:
-                    mls_id = (r.get("mls_id") or "").strip()
-                    addr = (r.get("input_address") or "").strip()
-                    url = r.get("preview_url") or r.get("zillow_url") or r.get("display_url") or "#"
-                    alt = addr or (f"MLS# {mls_id}" if mls_id else "Listing")
-
-                    toured_badge = ""
-                    if r.get("toured"):
-                        dt = str(r.get("toured_date") or "")
-                        tm = str(r.get("toured_start") or "")
-                        title = ("Toured " + (dt + (" " + tm if tm else ""))).strip()
-                        toured_badge = (
-                            f'<span class="badge tour" title="{escape(title)}">TOURED</span>'
-                        )
-
-                    st.markdown(
-                        f"""
-                        <a href="{escape(url)}" target="_blank" rel="noopener" style="text-decoration:none;">
-                          <img src="{escape(img)}" alt="{escape(alt)}"
-                               style="width:100%;height:auto;border-radius:12px;display:block;" />
-                        </a>
-                        <div class='img-label'>
-                          {('<strong>MLS#: ' + escape(mls_id) + '</strong><br/>' if mls_id else '')}
-                          <a href="{escape(url)}" target="_blank" rel="noopener">
-                            {escape(addr) if addr else "View listing"}
-                          </a>
-                          {toured_badge}
-                        </div>
-                        """,
-                        unsafe_allow_html=True
-                    )
-
-    # ---------- Run click ----------
+    # ===== RUN CLICKED =====
     if clicked:
         try:
             rows_in: List[Dict[str, Any]] = []
@@ -1133,7 +1125,6 @@ def render_run_tab(state: dict):
 
             client_selected = bool(client_tag.strip())
             tour_map = get_tour_slug_map(client_tag) if client_selected else {}
-
             if client_selected:
                 canon_set, zpid_set, canon_info, zpid_info = get_already_sent_maps(client_tag)
                 results = mark_duplicates(results, canon_set, zpid_set, canon_info, zpid_info)
@@ -1155,154 +1146,232 @@ def render_run_tab(state: dict):
 
             st.success(f"Processed {len(results)} item(s)" + (f" — CSV rows read: {csv_count}" if file is not None else ""))
 
-            _render_results_and_downloads(results, client_tag, campaign_tag, include_notes=enrich_details, client_selected=client_selected)
+            # Persist for Fix section
+            st.session_state["__results__"] = {"results": results, "fmt": st.session_state.get("__results__", {}).get("fmt")}
 
         except Exception as e:
             st.error("We hit an error while processing.")
             with st.expander("Details"): st.exception(e)
 
+    # ----- Show Results (from state or this run) -----
     data = st.session_state.get("__results__") or {}
     results = data.get("results") or []
-    if results and not clicked:
-        client_selected = bool(client_tag.strip())
-        _render_results_and_downloads(results, client_tag, campaign_tag, include_notes=False, client_selected=client_selected)
-    else:
-        if not clicked:
-            st.info("Paste addresses or links (or upload CSV), then click **Run**.")
 
-    # =========================
-    # ### Fix a specific result (re-run one with overrides)
-    # =========================
-    if (st.session_state.get("__results__") or {}).get("results"):
-        results = (st.session_state.get("__results__") or {}).get("results") or []
-        st.markdown("---")
-        st.markdown("### Fix a specific result")
+    if results:
+        st.markdown("#### Results")
+        results_list_with_copy_all(results, client_selected=bool(client_tag.strip()))
 
-        # Label each result nicely for the picker
-        def _label_for(i: int, r: Dict[str,Any]) -> str:
-            addr = (r.get("input_address") or "").strip()
-            url  = (r.get("preview_url") or r.get("zillow_url") or r.get("display_url") or "").strip()
-            short = ""
-            if url:
-                m = re.search(r"/homedetails/([^/]+)/(\d{6,})_zpid", url)
-                if m: short = f"{m.group(1).replace('-',' ').title()} · {m.group(2)}"
-            if not addr and not short: addr = address_text_from_url(url)
-            base = addr or short or url or f"Item {i+1}"
-            return f"{i+1}. {base}"
+        # Optional table
+        if table_view:
+            import pandas as pd
+            cols = ["already_sent","dup_reason","dup_sent_at","toured","toured_date","toured_start","toured_end",
+                    "display_url","zillow_url","preview_url","status","price","beds","baths","sqft","mls_id","input_address"]
+            df = pd.DataFrame([{c: r.get(c) for c in cols} for r in results])
+            st.dataframe(df, use_container_width=True, hide_index=True)
 
-        idx = st.selectbox(
-            "Pick an item",
-            options=list(range(len(results))),
-            format_func=lambda i: _label_for(i, results[i])
-        )
+        # Downloads
+        fmt_options = ["txt","csv","md","html"]
+        prev_fmt = (st.session_state.get("__results__") or {}).get("fmt")
+        default_idx = fmt_options.index(prev_fmt) if prev_fmt in fmt_options else 0
+        fmt = st.selectbox("Download format", fmt_options, index=default_idx)
+        payload, mime = build_output(results, fmt, use_display=True, include_notes=enrich_details)
+        ts = datetime.utcnow().strftime("%Y%m%d%H%M%S")
+        tag = ("_" + re.sub(r'[^a-z0-9\-]+','', (client_tag or "").lower().replace(" ","-"))) if client_tag else ""
+        st.download_button("Export", data=payload, file_name=f"address_alchemist{tag}_{ts}.{fmt}", mime=mime, use_container_width=True)
+        st.session_state["__results__"]["fmt"] = fmt
 
-        with st.expander("Override parameters", expanded=True):
-            r0 = results[idx]
-            # Direct overrides
-            manual_z = st.text_input("Set exact Zillow homedetails URL (optional)", value="")
-            source_url = st.text_input("Source URL to resolve (MLS / brokerage / Realtor.com, optional)", value="")
-            override_addr = st.text_input("Override address (optional)", value=r0.get("input_address",""))
-            override_city = st.text_input("City (optional)", value="")
-            override_state = st.text_input("State (2 letters, optional)", value="")
-            override_zip = st.text_input("ZIP (optional)", value="")
-            override_mls = st.text_input("MLS ID (optional)", value=r0.get("mls_id","") or "")
-            mls_first = st.checkbox("Prefer MLS-first", value=True)
-            require_state = st.checkbox("Require state match", value=bool(override_state))
-            land_mode = st.checkbox("Land/loose parsing", value=True)
-            max_candidates = st.number_input("Max candidates", min_value=5, max_value=50, step=1, value=20)
-            delay = st.slider("Fetch delay per candidate (s)", min_value=0.1, max_value=1.0, value=0.45, step=0.05)
-            fetch_details = st.checkbox("Fetch details (image/price) after rerun", value=False)
-
-            if st.button("Re-run selected with overrides", type="primary", use_container_width=False, key="__rerun_one__"):
-                try:
-                    defaults = {"city": override_city.strip(), "state": override_state.strip(), "zip": override_zip.strip()}
-                    new_res: Dict[str,Any] = {}
-
-                    if manual_z.strip():
-                        z = upgrade_to_homedetails_if_needed(manual_z.strip())
-                        new_res = {
-                            "input_address": override_addr or r0.get("input_address",""),
-                            "mls_id": override_mls.strip(),
-                            "zillow_url": z,
-                            "status": "manual"
-                        }
-                    elif source_url.strip():
-                        zurl, used_addr = resolve_from_source_url(source_url.strip(), defaults)
-                        new_res = {
-                            "input_address": used_addr or override_addr or r0.get("input_address",""),
-                            "mls_id": override_mls.strip(),
-                            "zillow_url": zurl,
-                            "status": "source_resolve"
-                        }
-                    else:
-                        row = {}
-                        if override_addr.strip():
-                            row["address"] = override_addr.strip()
-                        else:
-                            row["address"] = r0.get("input_address","")
-                        if override_city.strip():  row["city"]  = override_city.strip()
-                        if override_state.strip(): row["state"] = override_state.strip()
-                        if override_zip.strip():   row["zip"]   = override_zip.strip()
-                        if override_mls.strip():   row["mls_id"]= override_mls.strip()
-
-                        res = process_single_row(
-                            row,
-                            delay=delay,
-                            land_mode=land_mode,
-                            defaults=defaults,
-                            require_state=require_state,
-                            mls_first=mls_first,
-                            default_mls_name="",
-                            max_candidates=int(max_candidates)
+        # Thumbnails
+        thumbs=[]
+        for r in results:
+            img = r.get("image_url")
+            if not img:
+                img, _ = get_thumbnail_and_log(r.get("input_address",""), r.get("preview_url") or r.get("zillow_url") or "", r.get("csv_photo"))
+            if img: thumbs.append((r,img))
+        if thumbs:
+            st.markdown("#### Images")
+            cols = st.columns(3)
+            for i,(r,img) in enumerate(thumbs):
+                with cols[i%3]:
+                    mls_id = (r.get("mls_id") or "").strip()
+                    addr = (r.get("input_address") or "").strip()
+                    url = r.get("preview_url") or r.get("zillow_url") or r.get("display_url") or "#"
+                    alt = addr or (f"MLS# {mls_id}" if mls_id else "Listing")
+                    toured_badge = ""
+                    if r.get("toured"):
+                        dt = str(r.get("toured_date") or "")
+                        tm = str(r.get("toured_start") or "")
+                        title = ("Toured " + (dt + (" " + tm if tm else ""))).strip()
+                        toured_badge = (
+                            f'<span class="badge tour" title="{escape(title)}">TOURED</span>'
                         )
-                        new_res = res
+                    st.markdown(
+                        f"""
+                        <a href="{escape(url)}" target="_blank" rel="noopener" style="text-decoration:none;">
+                          <img src="{escape(img)}" alt="{escape(alt)}"
+                               style="width:100%;height:auto;border-radius:12px;display:block;" />
+                        </a>
+                        <div class='img-label'>
+                          {('<strong>MLS#: ' + escape(mls_id) + '</strong><br/>' if mls_id else '')}
+                          <a href="{escape(url)}" target="_blank" rel="noopener">
+                            {escape(alt)}
+                          </a>
+                          {toured_badge}
+                        </div>
+                        """,
+                        unsafe_allow_html=True
+                    )
 
-                    # Normalize to homedetails, rebuild preview/display
-                    base = new_res.get("zillow_url") or ""
-                    if base:
-                        base = upgrade_to_homedetails_if_needed(base)
-                        new_res["zillow_url"] = base
-                    new_res["preview_url"] = make_preview_url(base) if base else ""
-                    display = make_trackable_url(base, client_tag, campaign_tag) if base else base
-                    if use_shortlinks and display:
-                        short = bitly_shorten(display)
-                        new_res["display_url"] = short or display
-                    else:
-                        new_res["display_url"] = display or base
+        # --- Fix buttons ---
+        st.markdown("#### Quick Fix")
+        render_fix_buttons(results)
 
-                    # Copy across enrichment if requested
-                    if fetch_details and new_res.get("zillow_url"):
-                        try:
-                            html = requests.get(new_res["zillow_url"], headers=UA_HEADERS, timeout=REQUEST_TIMEOUT).text
-                            new_res.update(parse_listing_meta(html))
-                        except Exception:
-                            pass
+    # =================================================================
+    # ==================== FIX A SPECIFIC RESULT ======================
+    # =================================================================
+    st.markdown('<div id="fix_anchor" class="anchor-space"></div>', unsafe_allow_html=True)
+    st.markdown("### Fix a specific result")
 
-                    # Duplicate + toured recalculation
-                    client_selected = bool(client_tag.strip())
-                    if client_selected:
-                        canon_set, zpid_set, canon_info, zpid_info = get_already_sent_maps(client_tag)
-                        mark_duplicates([new_res], canon_set, zpid_set, canon_info, zpid_info)
-                        tour_map = get_tour_slug_map(client_tag)
-                        info = tour_map.get(result_to_slug(new_res), {})
-                        new_res["toured"] = bool(info)
-                        new_res["toured_date"] = info.get("date") if info else ""
-                        new_res["toured_start"] = info.get("start") if info else ""
-                        new_res["toured_end"] = info.get("end") if info else ""
-                    else:
-                        new_res["already_sent"] = False
-                        new_res["toured"] = False
+    if not results:
+        st.info("Run a search first to enable fixing a specific item.")
+        return
 
-                    # Preserve MLS if set
-                    if override_mls.strip():
-                        new_res["mls_id"] = override_mls.strip()
+    # selection (persist)
+    if "__fix_target_index__" not in st.session_state:
+        st.session_state["__fix_target_index__"] = 0
+    idx = st.session_state["__fix_target_index__"]
+    if idx >= len(results): idx = 0
 
-                    # Merge into existing result row (keep some old extras if new missing)
-                    merged = {**r0, **new_res}
-                    results[idx] = merged
-                    st.session_state["__results__"]["results"] = results
-                    st.success("Re-ran and updated the selected item.")
-                    _safe_rerun()
-                except Exception as e:
-                    st.error("Re-run failed.")
-                    with st.expander("Details"): st.exception(e)
+    # Build labels for selection
+    def _label_for(r, i):
+        u = r.get("preview_url") or r.get("zillow_url") or r.get("display_url") or ""
+        addr = (r.get("input_address") or "") or address_text_from_url(u)
+        base = u or addr or "(empty)"
+        if len(base) > 80: base = base[:77] + "…"
+        return f"{i+1}. {base}"
+
+    pick = st.selectbox(
+        "Pick an item to fix",
+        options=list(range(len(results))),
+        format_func=lambda i: _label_for(results[i], i),
+        index=idx,
+        key="__fix_select__"
+    )
+    st.session_state["__fix_target_index__"] = pick
+    targ = results[pick]
+
+    # Prefills
+    pre_addr = (targ.get("input_address") or "").strip()
+    pre_mls  = (targ.get("mls_id") or "").strip()
+
+    colA, colB = st.columns([1.2, 1])
+    with colA:
+        override_address = st.text_input("Address override (optional)", value=pre_addr, placeholder="e.g. 123 US-301 S, Four Oaks, NC 27524")
+        override_mls     = st.text_input("MLS ID (optional)", value=pre_mls, placeholder="e.g. 2523456")
+        override_mlsname = st.text_input("MLS Name (optional)", value="", placeholder="e.g. Triangle MLS")
+    with colB:
+        hint_city  = st.text_input("Hint: City", value="", placeholder="e.g. Smithfield")
+        hint_state = st.text_input("Hint: State (2-letter)", value="", placeholder="e.g. NC")
+        hint_zip   = st.text_input("Hint: ZIP", value="", placeholder="e.g. 27577")
+        source_url_override = st.text_input("Or resolve from this source URL (optional)", value="", placeholder="Paste an MLS/short/internal link")
+
+    c1, c2, c3, c4 = st.columns([1,1,1,1.4])
+    with c1:
+        require_state = st.checkbox("Require state match", value=True)
+    with c2:
+        mls_first = st.checkbox("Try MLS first", value=True)
+    with c3:
+        land_mode = st.checkbox("Land-mode cleanup", value=True, help="Normalize HWY/LOT tokens")
+    with c4:
+        re_enrich = st.checkbox("Re-enrich details", value=False)
+
+    # Action
+    if st.button("Re-run selected with overrides", type="primary", use_container_width=False, key="__apply_fix__"):
+        try:
+            defaults = {"city": hint_city, "state": hint_state, "zip": hint_zip}
+            # Prepare base row
+            if (source_url_override or "").strip():
+                zurl, used_addr = resolve_from_source_url(source_url_override.strip(), defaults)
+                new_r = {
+                    "input_address": used_addr or override_address or pre_addr or "",
+                    "mls_id": override_mls or pre_mls or "",
+                    "zillow_url": zurl,
+                    "status": "",
+                    "csv_photo": None
+                }
+            else:
+                row = {"address": override_address or pre_addr or ""}
+                if override_mls: row["mls"] = override_mls
+                if override_mlsname: row["mls name"] = override_mlsname
+                if hint_city: row["city"] = hint_city
+                if hint_state: row["state"] = hint_state
+                if hint_zip: row["zip"] = hint_zip
+                new_r = process_single_row(
+                    row, delay=0.4, land_mode=land_mode, defaults=defaults,
+                    require_state=require_state, mls_first=mls_first,
+                    default_mls_name=(override_mlsname or ""), max_candidates=20
+                )
+
+            # upgrade + enrich optional
+            if new_r.get("zillow_url"):
+                new_r["zillow_url"] = upgrade_to_homedetails_if_needed(new_r["zillow_url"])
+            if re_enrich:
+                # mini enrich for single item
+                try:
+                    html = requests.get(new_r["zillow_url"], headers=UA_HEADERS, timeout=REQUEST_TIMEOUT).text if new_r.get("zillow_url") else ""
+                    new_r.update(parse_listing_meta(html))
+                except Exception:
+                    pass
+
+            # tracking + preview
+            base = new_r.get("zillow_url")
+            new_r["preview_url"] = make_preview_url(base) if base else ""
+            display = make_trackable_url(base, client_tag, campaign_tag) if base else base
+            if st.session_state.get("__use_shortlinks_override__", use_shortlinks) and display:
+                short = bitly_shorten(display)
+                new_r["display_url"] = short or display
+            else:
+                new_r["display_url"] = display or base
+
+            # recompute dup/toured flags for this item
+            if client_tag.strip():
+                canon_set, zpid_set, canon_info, zpid_info = get_already_sent_maps(client_tag)
+                mark_duplicates([new_r], canon_set, zpid_set, canon_info, zpid_info)
+                tmap = get_tour_slug_map(client_tag)
+                info = tmap.get(result_to_slug(new_r), {})
+                new_r["toured"] = bool(info)
+                new_r["toured_date"] = info.get("date") if info else ""
+                new_r["toured_start"] = info.get("start") if info else ""
+                new_r["toured_end"] = info.get("end") if info else ""
+            else:
+                new_r["already_sent"] = False
+                new_r["toured"] = False
+
+            # Replace in results
+            results[pick] = new_r
+            st.session_state["__results__"]["results"] = results
+            st.success("Updated that item. Scroll up to Results to see the corrected link.")
+            # Optionally scroll back to top results
+            st.components.v1.html(
+                """
+                <script>
+                  const el = parent.document.querySelector('.results-wrap');
+                  if (el) { el.scrollIntoView({behavior:'smooth', block:'start'}); }
+                </script>
+                """, height=0
+            )
+
+        except Exception as e:
+            st.error("Fix failed.")
+            with st.expander("Details"): st.exception(e)
+
+    # Handle auto-scroll when coming from Fix button
+    if st.session_state.get("__scroll_to_fix__"):
+        st.components.v1.html(
+            """
+            <script>
+              const el = parent.document.getElementById("fix_anchor");
+              if (el) { el.scrollIntoView({behavior: "smooth", block: "start"}); }
+            </script>
+            """, height=0
+        )
+        st.session_state["__scroll_to_fix__"] = False
