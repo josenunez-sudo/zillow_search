@@ -10,7 +10,7 @@ from supabase import create_client, Client
 
 # ---------- Optional PDF support ----------
 try:
-    import PyPDF2  # ensure "PyPDF2" is in requirements.txt
+    import PyPDF2  # add PyPDF2 to requirements.txt if you want PDF parsing
 except Exception:
     PyPDF2 = None
 
@@ -64,9 +64,11 @@ def _stay_on_tours():
     st.session_state["__active_tab__"] = "Tours"
 
 def _norm_tag(s: str) -> str:
+    import re
     return re.sub(r"\s+", " ", (s or "").strip()).lower()
 
 def _slug_addr(addr: str) -> str:
+    import re
     a = (addr or "").strip().lower()
     a = re.sub(r"[^\w\s,-]", "", a).replace(",", "")
     return re.sub(r"\s+", "-", a).strip("-")
@@ -74,14 +76,18 @@ def _slug_addr(addr: str) -> str:
 def _address_to_deeplink(addr: str) -> str:
     return f"https://www.zillow.com/homes/{_slug_addr(addr)}_rb/"
 
-def _canonicalize_zillow(url: str) -> Tuple[str, Optional[str]]:
-    if not url:
-        return "", None
-    base = re.sub(r"[?#].*$", "", url.strip())
-    m_full = re.search(r'^(https?://[^?#]*/homedetails/[^/]+/\d{6,}_zpid/)', base, re.I)
-    canon = m_full.group(1) if m_full else base
-    m_z = re.search(r'(\d{6,})_zpid', base, re.I)
-    return canon, (m_z.group(1) if m_z else None)
+# ---------- ShowingTime canonical ----------
+_ST_TOUR_ID_RE = re.compile(r'/Tour/Print/(\d+)', re.I)
+
+def _st_tour_canonical(tour_url: Optional[str], tour_date: date) -> str:
+    u = (tour_url or "").strip()
+    if u:
+        u2 = re.sub(r'\(S\([^)]+\)\)', '', u)   # strip session tokens
+        u2 = re.sub(r'[?#].*$', '', u2)
+        m = _ST_TOUR_ID_RE.search(u2)
+        if m:
+            return f"st-tour-{m.group(1)}"
+    return f"st-tour-{tour_date.strftime('%Y%m%d')}"
 
 # ---------- Clients ----------
 @st.cache_data(ttl=60, show_spinner=False)
@@ -93,7 +99,7 @@ def fetch_clients():
     except Exception:
         return []
 
-# ---------- ShowingTime parsing ----------
+# ---------- Parse helpers (URL/PDF -> text) ----------
 _BAD_AFTER_NUM = r"(?:Beds?|Baths?|Sqft|Canceled|Cancelled|Confirmed|Reason|Presented|Access|Alarm|Instructions|Agent|Buyer)\b"
 _STREET_TYPES = r"(?:St|Street|Ave|Avenue|Dr|Drive|Ln|Lane|Rd|Road|Blvd|Boulevard|Ct|Court|Pl|Place|Ter|Terrace|Way|Cir|Circle|Pkwy|Parkway|Hwy|Highway)"
 ADDR_RE = re.compile(
@@ -109,7 +115,6 @@ ADDR_RE = re.compile(
     \b""",
     re.I | re.X
 )
-
 TIME_RE = re.compile(r'(\d{1,2}:\d{2}\s*(?:AM|PM))\s*[-–]\s*(\d{1,2}:\d{2}\s*(?:AM|PM))', re.I)
 DATE_HEADER_RE = re.compile(r'(?:Buyer|Agent)[^\n]{0,80}Tour\s*-\s*[A-Za-z]+,\s*([A-Za-z]+)\s*(\d{1,2}),\s*(\d{4})', re.I)
 GENERIC_DATE_RE = re.compile(r'([A-Za-z]+)\s+(\d{1,2}),\s*(\d{4})')
@@ -150,7 +155,6 @@ def _fetch_html(url: str) -> str:
     except Exception:
         return ""
 
-# ---------- Status normalization for STOPS (not tours) ----------
 ALLOWED_STOP_STATUSES = {"scheduled", "confirmed", "canceled"}
 
 def _normalize_stop_status(s: str) -> str:
@@ -163,9 +167,8 @@ def _status_in_window(txt: str) -> str:
     if "CANCELLED" in u or "CANCELED" in u: return "canceled"
     if "CONFIRMED" in u: return "confirmed"
     if "SCHEDULED" in u: return "scheduled"
-    return ""  # caller will normalize
+    return ""
 
-# ---------- Parse core ----------
 def _parse_tour_text(txt: str) -> Dict[str, Any]:
     # Tour date
     tdate = None
@@ -233,7 +236,7 @@ def parse_showingtime_input(url: str, uploaded_pdf) -> Dict[str, Any]:
 
     return {"error": "Provide a Print URL or a PDF."}
 
-# ---------- Sent logging helper for stops ----------
+# ---------- SENT logging for stops (optional) ----------
 def _insert_sent_for_stops(client_norm: str, stops: List[Dict[str, Any]], tour_date: date) -> int:
     if not SUPABASE or not client_norm or not stops: return 0
     now_iso = datetime.utcnow().isoformat(timespec="seconds") + "Z"
@@ -243,13 +246,12 @@ def _insert_sent_for_stops(client_norm: str, stops: List[Dict[str, Any]], tour_d
         addr = (s.get("address") or "").strip()
         if not addr: continue
         url = (s.get("deeplink") or _address_to_deeplink(addr)).strip()
-        canon, zpid = _canonicalize_zillow(url)
         rows.append({
             "client":   client_norm,
             "campaign": campaign,
             "url":      url,
-            "canonical": canon or None,
-            "zpid":     zpid or None,
+            "canonical": None,
+            "zpid":     None,
             "mls_id":   None,
             "address":  addr or None,
             "sent_at":  now_iso,
@@ -261,36 +263,158 @@ def _insert_sent_for_stops(client_norm: str, stops: List[Dict[str, Any]], tour_d
     except Exception:
         return 0
 
-# ---------- Build repeat map ----------
-def _build_repeat_map(client_norm: str) -> Dict[tuple, int]:
-    if not SUPABASE: return {}
-    tq = SUPABASE.table("tours").select("id,tour_date").eq("client", client_norm).order("tour_date", desc=False).limit(5000).execute()
-    tours = tq.data or []
-    if not tours: return {}
-    ids = [t["id"] for t in tours]
-    if not ids: return {}
-    sq = SUPABASE.table("tour_stops").select("tour_id,address_slug").in_("tour_id", ids).limit(50000).execute()
-    stops = sq.data or []
-    t2s: Dict[int, List[str]] = {}
+# ---------- Repair / lookup helpers for tours ----------
+def _fetch_tour_by_date(client_norm: str, tour_date: date):
+    if not SUPABASE: return None
+    q = SUPABASE.table("tours").select("id,url,canonical,zpid,status")\
+        .eq("client", client_norm).eq("tour_date", tour_date.isoformat())\
+        .limit(1).execute()
+    rows = q.data or []
+    return rows[0] if rows else None
+
+def _fetch_first_blank_zpid_tour(client_norm: str):
+    if not SUPABASE: return None
+    # NULL
+    q1 = SUPABASE.table("tours").select("id,url,tour_date,canonical,zpid,status")\
+        .eq("client", client_norm).is_("zpid", None).limit(1).execute()
+    rows = q1.data or []
+    if rows: return rows[0]
+    # Empty string
+    q2 = SUPABASE.table("tours").select("id,url,tour_date,canonical,zpid,status")\
+        .eq("client", client_norm).eq("zpid", "").limit(1).execute()
+    rows = q2.data or []
+    return rows[0] if rows else None
+
+def _backfill_blank_tours(client_norm: str):
+    """Best-effort: fix any legacy blank/NULL zpid rows so they stop blocking."""
+    if not SUPABASE: return
+    try:
+        q = SUPABASE.table("tours").select("id,url,tour_date,canonical,zpid,status")\
+            .eq("client", client_norm).limit(2000).execute()
+        rows = q.data or []
+        patches = []
+        for r in rows:
+            z = (r.get("zpid") or "").strip()
+            if z: continue
+            td = r.get("tour_date")
+            try:
+                d = datetime.fromisoformat(td).date() if td else date.today()
+            except Exception:
+                d = date.today()
+            canon_new = (r.get("canonical") or "").strip() or _st_tour_canonical(r.get("url") or "", d)
+            zpid_new  = canon_new
+            patch = {"id": r["id"], "canonical": canon_new, "zpid": zpid_new, "status": None}
+            patches.append(patch)
+        if patches:
+            SUPABASE.table("tours").upsert(patches).execute()
+    except Exception:
+        pass
+
+# ---------- Create or reuse a tour safely ----------
+def _create_or_get_tour(client_norm: str, client_display: str, tour_url: Optional[str], tour_date: date) -> int:
+    """
+    Strongly guarantees we won't collide with unique (client, COALESCE(zpid,'')):
+    - Prefer updating an existing same-date tour.
+    - Else 'claim' a legacy blank-zpid tour row for this client by updating it in-place.
+    - Else insert with non-empty zpid; on duplicate, retry with suffixed zpid once.
+    """
+    if not SUPABASE: raise RuntimeError("Supabase not configured.")
+
+    # 0) Quick repair pass (best-effort)
+    _backfill_blank_tours(client_norm)
+
+    canon = _st_tour_canonical(tour_url or "", tour_date)
+    zpid  = canon  # non-empty by construction
+
+    # 1) Same-date tour exists? update it and return
+    same = _fetch_tour_by_date(client_norm, tour_date)
+    if same:
+        tid = same["id"]
+        updates = {}
+        if not (same.get("canonical") or "").strip(): updates["canonical"] = canon
+        if not (same.get("zpid") or "").strip():      updates["zpid"] = zpid
+        if tour_url and (same.get("url") or "").strip() != tour_url: updates["url"] = tour_url
+        if same.get("status") not in (None, ""): updates["status"] = None
+        if updates:
+            try: SUPABASE.table("tours").update(updates).eq("id", tid).execute()
+            except Exception: pass
+        return tid
+
+    # 2) Legacy blank-zpid row exists for this client? claim it by updating in-place
+    blank = _fetch_first_blank_zpid_tour(client_norm)
+    if blank:
+        tid = blank["id"]
+        try:
+            SUPABASE.table("tours").update({
+                "url": tour_url or blank.get("url"),
+                "tour_date": tour_date.isoformat(),
+                "canonical": canon,
+                "zpid": zpid,
+                "status": None
+            }).eq("id", tid).execute()
+            return tid
+        except Exception:
+            # if update fails, fall through to insert
+            pass
+
+    # 3) Insert new row (with non-empty zpid). If a race still hits, try once with a suffixed zpid.
+    payload = {
+        "client":         client_norm,
+        "client_display": client_display,
+        "url":            (tour_url or None),
+        "canonical":      canon,
+        "zpid":           zpid,
+        "tour_date":      tour_date.isoformat(),
+        "status":         None,   # keep NULL to satisfy tours_status_check
+    }
+    try:
+        ins = SUPABASE.table("tours").insert(payload).execute()
+        if not ins.data:
+            # fallback: fetch by date
+            again = _fetch_tour_by_date(client_norm, tour_date)
+            if again: return again["id"]
+            raise RuntimeError("Create tour failed.")
+        return ins.data[0]["id"]
+    except Exception as e:
+        # If server still produced a duplicate on (client, COALESCE(zpid,'')),
+        # retry once with a guaranteed unique zpid.
+        try:
+            zpid2 = f"{zpid}-{int(datetime.utcnow().timestamp())%100000}"
+            payload["zpid"] = zpid2
+            ins2 = SUPABASE.table("tours").insert(payload).execute()
+            if not ins2.data:
+                again = _fetch_tour_by_date(client_norm, tour_date)
+                if again: return again["id"]
+                raise RuntimeError("Create tour failed (retry).")
+            return ins2.data[0]["id"]
+        except Exception as e2:
+            raise RuntimeError(f"Insert failed: {e2}")
+
+# ---------- Stops insert ----------
+def _insert_stops(tour_id: int, stops: List[Dict[str, Any]]) -> int:
+    if not SUPABASE: return 0
+    existing = SUPABASE.table("tour_stops").select("address_slug").eq("tour_id", tour_id).limit(50000).execute().data or []
+    seen = {e["address_slug"] for e in existing if e.get("address_slug")}
+    rows = []
     for s in stops:
-        t2s.setdefault(s["tour_id"], []).append(s["address_slug"])
-    seen_count: Dict[str, int] = {}
-    rep: Dict[tuple, int] = {}
-    for t in tours:
-        td = t["tour_date"]
-        for slug in t2s.get(t["id"], []):
-            seen_count[slug] = seen_count.get(slug, 0) + 1
-            rep[(slug, td)] = seen_count[slug]
-    return rep
+        addr = (s.get("address") or "").strip()
+        if not addr: continue
+        slug = _slug_addr(addr)
+        if slug in seen: continue
+        rows.append({
+            "tour_id": tour_id,
+            "address": addr,
+            "start": (s.get("start") or None),
+            "end":   (s.get("end") or None),
+            "deeplink": (s.get("deeplink") or _address_to_deeplink(addr)),
+            "status": _normalize_stop_status(s.get("status")),
+        })
+        seen.add(slug)
+    if not rows: return 0
+    ins = SUPABASE.table("tour_stops").insert(rows).execute()
+    return len(ins.data or [])
 
-# ---------- Session: parsed payload ----------
-def _get_parsed() -> Dict[str, Any]:
-    return st.session_state.get("__parsed_tour__") or {}
-
-def _set_parsed(payload: Dict[str, Any]):
-    st.session_state["__parsed_tour__"] = payload or {}
-
-# ---------- HTML helpers ----------
+# ---------- UI helpers ----------
 def _date_badge_html(d: str) -> str:
     return ("<span style='display:inline-block;padding:2px 10px;border-radius:9999px;"
             "background:#1d4ed8;color:#fff;font-weight:800;border:1px solid rgba(0,0,0,.15);'>" + escape(d) + "</span>")
@@ -308,169 +432,6 @@ def _status_tag_html(stat: str) -> str:
 def _time_badge_html(when: str) -> str:
     if not when: return ""
     return "<span style='padding:2px 8px;border-radius:9999px;font-size:11px;font-weight:800;background:#0a84ff;color:#ffffff;border:1px solid rgba(0,0,0,.15);white-space:nowrap;'>" + escape(when) + "</span>"
-
-def _repeat_tag_html(n: int) -> str:
-    if n >= 2:
-        return "<span style='padding:2px 8px;border-radius:9999px;font-size:11px;font-weight:800;background:#92400e;color:#fff7ed;border:1px solid #f59e0b;white-space:nowrap;margin-left:8px;'>2nd+ showing</span>"
-    return ""
-
-def _sent_tag_html() -> str:
-    return "<span style='padding:2px 8px;border-radius:9999px;font-size:11px;font-weight:800;background:#1e293b;color:#e2e8f0;border:1px solid #334155;white-space:nowrap;margin-right:8px;'>Sent</span>"
-
-# ---------- SENT cross-check for a client ----------
-@st.cache_data(ttl=90, show_spinner=False)
-def _fetch_sent_norm_slugs_for_client(client_norm: str) -> set:
-    if not (SUPABASE and client_norm.strip()): return set()
-    try:
-        rows = SUPABASE.table("sent").select("address,canonical,url").eq("client", client_norm.strip()).limit(50000).execute().data or []
-        out: set = set()
-        for r in rows:
-            can = (r.get("canonical") or "").strip()
-            if can and "/homedetails/" in can:
-                m = re.search(r"/homedetails/([^/]+)/\d{6,}_zpid/", can, re.I)
-                if m:
-                    out.add(_slug_addr(re.sub(r"[-+]", " ", m.group(1))))
-                    continue
-            addr = (r.get("address") or "").strip()
-            if addr:
-                out.add(_slug_addr(addr))
-    except Exception:
-        return set()
-    return out
-
-# ---------- Tours canonicalization ----------
-_ST_TOUR_ID_RE = re.compile(r'/Tour/Print/(\d+)', re.I)
-
-def _st_tour_canonical(tour_url: Optional[str], tour_date: date) -> str:
-    u = (tour_url or "").strip()
-    if u:
-        u2 = re.sub(r'\(S\([^)]+\)\)', '', u)   # strip session tokens
-        u2 = re.sub(r'[?#].*$', '', u2)
-        m = _ST_TOUR_ID_RE.search(u2)
-        if m:
-            return f"st-tour-{m.group(1)}"
-    return f"st-tour-{tour_date.strftime('%Y%m%d')}"
-
-# NEW: Backfill helper sets BOTH canonical and zpid when blank, plus clears status to NULL.
-def _backfill_tour_identities(client_norm: str):
-    if not SUPABASE or not client_norm: return
-    try:
-        rows = SUPABASE.table("tours")\
-            .select("id,url,tour_date,canonical,zpid,status")\
-            .eq("client", client_norm)\
-            .limit(2000).execute().data or []
-        updates = []
-        for r in rows:
-            td = r.get("tour_date")
-            try:
-                d = datetime.fromisoformat(td).date() if td else date.today()
-            except Exception:
-                d = date.today()
-            canon = (r.get("canonical") or "").strip() or _st_tour_canonical(r.get("url") or "", d)
-            zpid  = (r.get("zpid") or "").strip() or canon  # <-- ensure non-empty zpid
-            patch = {"id": r["id"]}
-            do = False
-            if (r.get("canonical") or "").strip() != canon:
-                patch["canonical"] = canon; do = True
-            if (r.get("zpid") or "").strip() != zpid:
-                patch["zpid"] = zpid; do = True
-            if r.get("status") not in (None, ""):
-                patch["status"] = None; do = True
-            if do:
-                updates.append(patch)
-        if updates:
-            SUPABASE.table("tours").upsert(updates).execute()
-    except Exception:
-        pass
-
-# ---------- DB helpers ----------
-def _create_or_get_tour(client_norm: str, client_display: str, tour_url: Optional[str], tour_date: date) -> int:
-    """
-    Guarantees:
-    - unique 'canonical' per tour,
-    - non-empty 'zpid' (uses the same value as 'canonical'),
-    - 'status' = NULL (bypass tours_status_check).
-    """
-    if not SUPABASE: raise RuntimeError("Supabase not configured.")
-
-    # Prevent legacy blanks from blocking new inserts
-    _backfill_tour_identities(client_norm)
-
-    canon = _st_tour_canonical(tour_url or "", tour_date)
-    zpid  = canon  # <-- CRITICAL: ensure non-empty zpid to satisfy unique (client, COALESCE(zpid,''))
-
-    # 1) Existing row for (client, tour_date)?
-    q = SUPABASE.table("tours")\
-        .select("id,url,canonical,zpid,status")\
-        .eq("client", client_norm)\
-        .eq("tour_date", tour_date.isoformat())\
-        .limit(1).execute()
-    rows = q.data or []
-    if rows:
-        tid = rows[0]["id"]
-        updates = {}
-        if not (rows[0].get("canonical") or "").strip():
-            updates["canonical"] = canon
-        if not (rows[0].get("zpid") or "").strip():
-            updates["zpid"] = zpid
-        if rows[0].get("status") not in (None, ""):
-            updates["status"] = None
-        if tour_url and not (rows[0].get("url") or "").strip():
-            updates["url"] = tour_url
-        if updates:
-            try:
-                SUPABASE.table("tours").update(updates).eq("id", tid).execute()
-            except Exception:
-                pass
-        return tid
-
-    # 2) Insert fresh tour (status NULL + non-empty zpid)
-    payload = {
-        "client":         client_norm,
-        "client_display": client_display,
-        "url":            (tour_url or None),
-        "canonical":      canon,
-        "zpid":           zpid,    # <-- unique per tour/client
-        "tour_date":      tour_date.isoformat(),
-        "status":         None,    # <-- NULL to satisfy tours_status_check
-    }
-    ins = SUPABASE.table("tours").insert(payload).execute()
-    if not ins.data:
-        # In rare race, fetch again by date
-        q2 = SUPABASE.table("tours")\
-            .select("id")\
-            .eq("client", client_norm)\
-            .eq("tour_date", tour_date.isoformat())\
-            .limit(1).execute()
-        rows2 = q2.data or []
-        if rows2:
-            return rows2[0]["id"]
-        raise RuntimeError("Create tour failed.")
-    return ins.data[0]["id"]
-
-def _insert_stops(tour_id: int, stops: List[Dict[str, Any]]) -> int:
-    if not SUPABASE: return 0
-    existing = SUPABASE.table("tour_stops").select("address_slug").eq("tour_id", tour_id).limit(50000).execute().data or []
-    seen = {e["address_slug"] for e in existing if e.get("address_slug")}
-    rows = []
-    for s in stops:
-        addr = (s.get("address") or "").strip()
-        if not addr: continue
-        slug = _slug_addr(addr)
-        if slug in seen: continue
-        rows.append({
-            "tour_id": tour_id,
-            "address": addr,
-            # address_slug is generated by DB (if defined that way)
-            "start": (s.get("start") or None),
-            "end":   (s.get("end") or None),
-            "deeplink": (s.get("deeplink") or _address_to_deeplink(addr)),
-            "status": _normalize_stop_status(s.get("status")),
-        })
-        seen.add(slug)
-    if not rows: return 0
-    ins = SUPABASE.table("tour_stops").insert(rows).execute()
-    return len(ins.data or [])
 
 # ---------- Main renderer ----------
 def render_tours_tab(state: dict):
@@ -493,23 +454,25 @@ def render_tours_tab(state: dict):
         st.markdown("</div>", unsafe_allow_html=True)
 
     if do_clear:
-        _set_parsed({})
+        st.session_state["__parsed_tour__"] = {}
         st.success("Cleared.")
         _stay_on_tours()
         _safe_rerun()
 
+    parsed = st.session_state.get("__parsed_tour__") or {}
     if do_parse:
-        parsed = parse_showingtime_input(url, uploaded)
-        if parsed.get("error"):
-            st.error(parsed["error"])
+        payload = parse_showingtime_input(url, uploaded)
+        if payload.get("error"):
+            st.error(payload["error"])
         else:
-            if not parsed.get("stops"):
-                st.warning("No stops found. Double-check that this is a ShowingTime tour Print page or the exported Tour PDF.")
-            _set_parsed(parsed)
+            if not payload.get("stops"):
+                st.warning("No stops found. Make sure this is a ShowingTime tour Print page or the exported Tour PDF.")
+            st.session_state["__parsed_tour__"] = payload
+            parsed = payload
             _stay_on_tours()
             _safe_rerun()
 
-    parsed = _get_parsed()
+    parsed = st.session_state.get("__parsed_tour__") or {}
 
     # ===== Preview =====
     if parsed:
@@ -532,13 +495,9 @@ def render_tours_tab(state: dict):
                 end   = (s.get("end") or "").strip()
                 when  = f"{start}–{end}" if (start and end) else (start or end or "")
                 stat  = _normalize_stop_status(s.get("status"))
-
                 right_badges = []
-                if stat:
-                    right_badges.append(_status_tag_html(stat))
-                if when:
-                    right_badges.append(_time_badge_html(when))
-
+                if stat: right_badges.append(_status_tag_html(stat))
+                if when: right_badges.append(_time_badge_html(when))
                 lis.append(
                     "<li style='display:flex;justify-content:space-between;align-items:center;gap:12px;padding:6px 0;border-bottom:1px solid var(--row-border);'>"
                     + "<div style='min-width:0;'>"
@@ -617,7 +576,7 @@ def render_tours_tab(state: dict):
     st.markdown("---")
     st.markdown('<div id="report_anchor"></div>', unsafe_allow_html=True)
 
-    # ===== Tours report (inline) =====
+    # ===== Minimal tours report (optional) =====
     st.markdown("### Tours report")
     clients2 = fetch_clients()
     names2 = [c["name"] for c in clients2]
@@ -646,50 +605,33 @@ def _render_client_tours_report(client_display: str, client_norm: str):
     if not tours:
         st.info("No tours logged for this client yet.")
         return
-
-    sent_slugs = _fetch_sent_norm_slugs_for_client(client_norm)
-    repeat_map = _build_repeat_map(client_norm)
-
     for t in tours:
         td = t["tour_date"]
         st.markdown(f"#### {escape(client_display)} {_date_badge_html(td)}", unsafe_allow_html=True)
-        sq = SUPABASE.table("tour_stops").select("address,address_slug,start,end,deeplink,status").eq("tour_id", t["id"]).order("start", desc=False).limit(500).execute()
+        sq = SUPABASE.table("tour_stops").select("address,start,end,deeplink,status").eq("tour_id", t["id"]).order("start", desc=False).limit(500).execute()
         stops = sq.data or []
         if not stops:
             st.caption("_(No stops logged for this date.)_")
             continue
-
         items = []
         for s in stops:
             addr = s.get("address") or ""
-            slug = s.get("address_slug") or _slug_addr(addr)
             href = (s.get("deeplink") or _address_to_deeplink(addr)).strip()
             start = (s.get("start") or "").strip()
             end   = (s.get("end") or "").strip()
             when  = f"{start}–{end}" if (start and end) else (start or end or "")
-            visit = repeat_map.get((slug, td), 1)
             stat  = _normalize_stop_status(s.get("status"))
-
             right_badges = []
-            if stat:
-                right_badges.append(_status_tag_html(stat))
-            if when:
-                right_badges.append(_time_badge_html(when))
-
-            sent_html = _sent_tag_html() if slug in sent_slugs else ""
-            rep_tag = _repeat_tag_html(visit)
-
+            if stat: right_badges.append(_status_tag_html(stat))
+            if when: right_badges.append(_time_badge_html(when))
             items.append(
                 "<li style='display:flex;justify-content:space-between;align-items:center;gap:12px;padding:6px 0;border-bottom:1px solid var(--row-border);'>"
                 + "<div style='min-width:0;'>"
                 + f"<a href='{escape(href)}' target='_blank' rel='noopener'>{escape(addr)}</a>"
-                + (rep_tag if rep_tag else "")
                 + "</div>"
                 + "<div style='flex:0 0 auto;display:flex;align-items:center;gap:8px;'>"
-                + sent_html
                 + "".join(right_badges)
                 + "</div>"
                 + "</li>"
             )
         st.markdown("<ul style='margin:.25rem 0 .5rem 0;padding:0;list-style:none;'>" + "\n".join(items) + "</ul>", unsafe_allow_html=True)
-
