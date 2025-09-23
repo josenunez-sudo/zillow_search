@@ -1,5 +1,6 @@
 # ui/run_tab.py
-# Run tab with: hyperlinks-only results, clickable thumbnails, and TOURED cross-check via Supabase tours/tour_stops.
+# Run tab with: hyperlinks-only results, clickable thumbnails, TOURED cross-check via Supabase,
+# and a post-run "Add to client" action (like the Tours tab) — no auto-logging.
 
 import os, csv, io, re, time, json, asyncio
 from datetime import datetime
@@ -59,6 +60,19 @@ GOOGLE_MAPS_API_KEY   = os.getenv("GOOGLE_MAPS_API_KEY","")
 BITLY_TOKEN           = os.getenv("BITLY_TOKEN","")
 REQUEST_TIMEOUT       = 12
 
+# ---------- Styles ----------
+st.markdown("""
+<style>
+.center-box { padding:10px 12px; background:transparent; border-radius:12px; }
+.link-list { margin:0.25rem 0 0 1.1rem; padding:0; }
+.badge { display:inline-block; font-size:11px; font-weight:800; padding:2px 6px; border-radius:999px; margin-left:6px; border:1px solid rgba(0,0,0,.15); }
+.badge.new { background:#dcfce7; color:#065f46; border-color:#86efac; }
+.badge.dup { background:#fee2e2; color:#7f1d1d; border-color:#fecaca; }
+.badge.tour { background:#e0f2fe; color:#075985; border-color:#7dd3fc; }
+.run-zone .stButton>button { background: linear-gradient(180deg, #0A84FF 0%, #0060DF 100%) !important; color:#fff !important; font-weight:800 !important; border:0 !important; border-radius:12px !important; box-shadow:0 10px 22px rgba(10,132,255,.35),0 2px 6px rgba(0,0,0,.18)!important; }
+</style>
+""", unsafe_allow_html=True)
+
 # ---------- Helpers ----------
 def _norm_tag(s: str) -> str:
     return re.sub(r"\s+", " ", (s or "").strip()).lower()
@@ -88,7 +102,6 @@ def address_text_from_url(url: str) -> str:
     return ""
 
 def result_to_slug(r: Dict[str, Any]) -> str:
-    # Prefer explicit input address; fall back to Zillow slug -> address.
     addr = (r.get("input_address") or "").strip()
     if not addr:
         url = (r.get("preview_url") or r.get("zillow_url") or r.get("display_url") or "").strip()
@@ -672,13 +685,9 @@ def get_already_sent_maps(client_tag: str):
     except Exception:
         return set(), set(), {}, {}
 
-# ---------- NEW: Tours cross-check ----------
+# ---------- Tours cross-check ----------
 @st.cache_data(ttl=120, show_spinner=False)
 def get_tour_slug_map(client_tag: str) -> Dict[str, Dict[str, str]]:
-    """
-    Returns { address_slug: {date: 'YYYY-MM-DD' or None, start: '10:00 AM', end:'10:15 AM'} }
-    for all stops across this client's tours (latest date wins per slug).
-    """
     if not (_supabase_available() and client_tag.strip()):
         return {}
     try:
@@ -706,7 +715,6 @@ def get_tour_slug_map(client_tag: str) -> Dict[str, Dict[str, str]]:
             if not slug: continue
             info = {"date": (tdate.get(s.get("tour_id")) or ""), "start": s.get("start","") or "", "end": s.get("end","") or ""}
             prev = by_slug.get(slug)
-            # Keep the most recent date if multiple tours
             if not prev or (info["date"] and prev.get("date") and str(info["date"]) > str(prev.get("date"))):
                 by_slug[slug] = info
             elif not prev:
@@ -826,10 +834,24 @@ def build_output(rows: List[Dict[str, Any]], fmt: str, use_display: bool = True,
     payload = "\n".join(lines) + ("\n" if lines else "")
     return payload, ("text/markdown" if fmt == "md" else "text/plain")
 
-# --- Small helper for visible YYYYMMDD chip ---
-def _yyyymmdd(d: str) -> str:
-    d = (d or "").strip()
-    return d.replace("-", "") if re.fullmatch(r"\d{4}-\d{2}-\d{2}", d) else d
+# ---------- Batch dedupe for logging ----------
+def _dedupe_results_for_logging(results: List[Dict[str,Any]]) -> List[Dict[str,Any]]:
+    out, seen = [], set()
+    for r in results:
+        url = (r.get("preview_url") or r.get("zillow_url") or r.get("display_url") or "").strip()
+        c, z = canonicalize_zillow(url) if url else ("","")
+        key = c or z or url
+        if not key:  # skip empties
+            continue
+        if key in seen:
+            continue
+        seen.add(key)
+        # stash the canon/zpid so log_sent_rows doesn't need to recompute
+        r = dict(r)
+        if c: r["canonical"] = c
+        if z: r["zpid"] = z
+        out.append(r)
+    return out
 
 # ---------- Main renderer ----------
 def render_run_tab(state: dict):
@@ -841,7 +863,7 @@ def render_run_tab(state: dict):
         active_clients = fetch_clients(include_inactive=False)
         names = [c["name"] for c in active_clients]
         options = [NO_CLIENT] + names + [ADD_SENTINEL]
-        sel_idx = st.selectbox("Client", list(range(len(options))), format_func=lambda i: options[i], index=0)
+        sel_idx = st.selectbox("Client (for badges only; logging happens later below)", list(range(len(options))), format_func=lambda i: options[i], index=0)
         selected_client = None if sel_idx in (0, len(options)-1) else active_clients[sel_idx-1]
 
         if options[sel_idx] == ADD_SENTINEL:
@@ -856,7 +878,7 @@ def render_run_tab(state: dict):
 
         client_tag_raw = (selected_client["name"] if selected_client else "")
     with colK:
-        campaign_tag_raw = st.text_input("Campaign tag", value=datetime.utcnow().strftime("%Y%m%d"))
+        campaign_tag_raw = st.text_input("Campaign tag (used when you log later)", value=datetime.utcnow().strftime("%Y%m%d"))
 
     c1, c2, c3, c4 = st.columns([1,1,1.25,1.45])
     with c1:
@@ -869,12 +891,11 @@ def render_run_tab(state: dict):
         only_show_new = st.checkbox(
             "Only show NEW for this client",
             value=bool(selected_client),
-            help="Hide duplicates. Disabled when 'No client' is selected."
+            help="Hides duplicates in the results view; logging happens later."
         )
         if not selected_client:
             only_show_new = False
 
-    # Default: hide table to remove dead space
     table_view = st.checkbox("Show results as table", value=False, help="Easier to scan details")
 
     client_tag = _norm_tag(client_tag_raw)
@@ -947,7 +968,7 @@ def render_run_tab(state: dict):
             safe_href = escape(href)
             link_txt = href  # keep URL text for best SMS unfurls
 
-            # Badges: duplicate/new + toured (with visible date chip)
+            # Badges: duplicate/new + toured
             badge_html = ""
             if client_selected:
                 if r.get("already_sent"):
@@ -959,18 +980,10 @@ def render_run_tab(state: dict):
                     dt = str(r.get("toured_date") or "")
                     tm = str(r.get("toured_start") or "")
                     title = ("Toured " + (dt + (" " + tm if tm else ""))).strip()
-                    if dt:
-                        badge_html += (
-                            f' <span class="badge date" '
-                            f'style="background:#e0f2fe;color:#075985;border:1px solid rgba(7,89,133,.35);'
-                            f'font-weight:700;padding:2px 6px;border-radius:999px;">{escape(_yyyymmdd(dt))}</span>'
-                        )
                     badge_html += (
                         ' <span class="badge tour" '
-                        'style="background:#fee2e2;color:#991b1b;border:1px solid rgba(153,27,27,.35);'
-                        'font-weight:700;padding:2px 6px;border-radius:999px;" '
-                        f'title="{escape(title)}">TOURED</span>'
-                    )
+                        'title="{title}">TOURED</span>'
+                    ).replace("{title}", escape(title))
 
             li_html.append(
                 f'<li style="margin:0.2rem 0;"><a href="{safe_href}" target="_blank" rel="noopener">{escape(link_txt)}</a>{badge_html}</li>'
@@ -1029,6 +1042,7 @@ def render_run_tab(state: dict):
             df = pd.DataFrame([{c: r.get(c) for c in cols} for r in results])
             st.dataframe(df, use_container_width=True, hide_index=True)
 
+        # ---- Download
         fmt_options = ["txt","csv","md","html"]
         prev_fmt = (st.session_state.get("__results__") or {}).get("fmt")
         default_idx = fmt_options.index(prev_fmt) if prev_fmt in fmt_options else 0
@@ -1039,12 +1053,12 @@ def render_run_tab(state: dict):
         st.download_button("Export", data=payload, file_name=f"address_alchemist{tag}_{ts}.{fmt}", mime=mime, use_container_width=True)
         st.session_state["__results__"] = {"results": results, "fmt": fmt}
 
-        # Thumbs (clickable)
+        # ---- Thumbnails grid
         thumbs=[]
         for r in results:
             img = r.get("image_url")
             if not img:
-                img, _log = get_thumbnail_and_log(r.get("input_address",""), r.get("preview_url") or r.get("zillow_url") or "", r.get("csv_photo"))
+                img, _ = get_thumbnail_and_log(r.get("input_address",""), r.get("preview_url") or r.get("zillow_url") or "", r.get("csv_photo"))
             if img: thumbs.append((r,img))
         if thumbs:
             st.markdown("#### Images")
@@ -1061,16 +1075,8 @@ def render_run_tab(state: dict):
                         dt = str(r.get("toured_date") or "")
                         tm = str(r.get("toured_start") or "")
                         title = ("Toured " + (dt + (" " + tm if tm else ""))).strip()
-                        ymd = _yyyymmdd(dt) if dt else ""
                         toured_badge = (
-                            (f'<span class="badge date" '
-                             f'style="background:#e0f2fe;color:#075985;border:1px solid rgba(7,89,133,.35);'
-                             f'font-weight:700;padding:2px 6px;border-radius:999px;margin-right:6px;">{escape(ymd)}</span>' if ymd else "")
-                            +
-                            f'<span class="badge tour" '
-                            f'style="background:#fee2e2;color:#991b1b;border:1px solid rgba(153,27,27,.35);'
-                            f'font-weight:700;padding:2px 6px;border-radius:999px;" '
-                            f'title="{escape(title)}">TOURED</span>'
+                            f'<span class="badge tour" title="{escape(title)}">TOURED</span>'
                         )
 
                     st.markdown(
@@ -1089,6 +1095,71 @@ def render_run_tab(state: dict):
                         """,
                         unsafe_allow_html=True
                     )
+
+        # ============================
+        # NEW: Add to client (optional)
+        # ============================
+        st.markdown("---")
+        st.markdown("### Add to client (optional)")
+
+        add_clients = fetch_clients(include_inactive=False)
+        add_names = [c["name"] for c in add_clients]
+        # Preselect the same client if present; otherwise first item
+        default_idx = 0
+        if client_tag:
+            for i,c in enumerate(add_clients):
+                if _norm_tag(c["name"]) == client_tag:
+                    default_idx = i
+                    break
+        sel_add = st.selectbox("Choose client to log to", list(range(len(add_clients))), format_func=lambda i: add_names[i], index=default_idx, key="__add_to_client_sel__")
+        add_client_name = add_names[sel_add]
+        add_client_norm = _norm_tag(add_client_name)
+
+        add_campaign = st.text_input("Campaign tag for this batch", value=(campaign_tag or datetime.utcnow().strftime("%Y%m%d")), key="__add_campaign_tag__")
+
+        colAA, colBB, colCC = st.columns([1.2, 1.2, 1])
+        with colAA:
+            only_log_new = st.checkbox("Only log NEW for this client", value=only_show_new, help="Skips URLs already sent to this client.")
+        with colBB:
+            dedupe_batch = st.checkbox("Deduplicate this batch (by property)", value=True)
+        with colCC:
+            pass
+
+        if st.button("Add ALL results to selected client", type="primary", use_container_width=True):
+            try:
+                items = results[:]
+                # Batch dedupe (optional)
+                if dedupe_batch:
+                    items = _dedupe_results_for_logging(items)
+
+                # Filter to NEW (optional)
+                if only_log_new:
+                    canon_set, zpid_set, _, _ = get_already_sent_maps(add_client_norm)
+                    filt = []
+                    for r in items:
+                        url = (r.get("preview_url") or r.get("zillow_url") or r.get("display_url") or "").strip()
+                        c, z = canonicalize_zillow(url) if url else ("","")
+                        if (c and c in canon_set) or (z and z in zpid_set):
+                            continue
+                        filt.append(r)
+                    items = filt
+
+                if not items:
+                    st.warning("Nothing to log (after filters).")
+                else:
+                    ok, msg = log_sent_rows(items, add_client_norm, _norm_tag(add_campaign))
+                    if ok:
+                        st.success(f"Logged {len(items)} item(s) to **{add_client_name}**.")
+                        # Update badges for the currently selected (view) client if it matches
+                        if client_tag and client_tag == add_client_norm:
+                            canon_set, zpid_set, canon_info, zpid_info = get_already_sent_maps(client_tag)
+                            updated = mark_duplicates(results, canon_set, zpid_set, canon_info, zpid_info)
+                            st.session_state["__results__"] = {"results": updated, "fmt": st.session_state.get("__results__",{}).get("fmt","txt")}
+                    else:
+                        st.error(f"Log failed: {msg}")
+            except Exception as e:
+                st.error("Could not log to client.")
+                with st.expander("Details"): st.exception(e)
 
     # ---------- Run click ----------
     if clicked:
@@ -1154,14 +1225,12 @@ def render_run_tab(state: dict):
                 else:
                     r["display_url"] = display or base
 
+            # ---- Mark duplicates & toured for the *view* client only (no logging here)
             client_selected = bool(client_tag.strip())
-            # ---- NEW: tours map and mark
             tour_map = get_tour_slug_map(client_tag) if client_selected else {}
-
             if client_selected:
                 canon_set, zpid_set, canon_info, zpid_info = get_already_sent_maps(client_tag)
                 results = mark_duplicates(results, canon_set, zpid_set, canon_info, zpid_info)
-                # mark toured
                 for r in results:
                     info = tour_map.get(result_to_slug(r), {})
                     r["toured"] = bool(info)
@@ -1170,9 +1239,6 @@ def render_run_tab(state: dict):
                     r["toured_end"] = info.get("end") if info else ""
                 if only_show_new:
                     results = [r for r in results if not r.get("already_sent")]
-                if SUPABASE and results:
-                    ok_log, info_log = log_sent_rows(results, client_tag, campaign_tag)
-                    st.success("Logged to Supabase.") if ok_log else st.warning(f"Supabase log skipped/failed: {info_log}")
             else:
                 for r in results:
                     r["already_sent"] = False
