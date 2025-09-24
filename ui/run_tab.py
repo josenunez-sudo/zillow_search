@@ -6,6 +6,7 @@ import os, csv, io, re, time, json, asyncio
 from datetime import datetime
 from typing import List, Dict, Any, Optional, Tuple
 from html import escape
+from urllib.parse import urlparse
 
 import requests
 import httpx
@@ -17,13 +18,6 @@ try:
     import usaddress
 except Exception:
     usaddress = None
-
-# ---------- Optional address parser import (safe fallback) ----------
-try:
-    # from utils/address_parser.py you added
-    from utils.address_parser import address_as_markdown_link
-except Exception:
-    address_as_markdown_link = None  # degrade gracefully if module isn't present
 
 # ---------- Rerun helper ----------
 def _safe_rerun():
@@ -156,13 +150,49 @@ def extract_any_mls_id(html: str) -> Optional[str]:
     m = re.search(r'\bMLS[^A-Za-z0-9]{0,5}#?\s*([A-Za-z0-9\-]{5,})\b', html, re.I)
     return m.group(1) if m else None
 
+def _jsonld_blocks(html: str) -> List[Dict[str, Any]]:
+    out = []
+    try:
+        for m in re.finditer(r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>(.*?)</script>', html, re.I|re.S):
+            blob = m.group(1)
+            try:
+                data = json.loads(blob)
+                if isinstance(data, list):
+                    out.extend([d for d in data if isinstance(d, dict)])
+                elif isinstance(data, dict):
+                    out.append(data)
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return out
+
 def extract_address_from_html(html: str) -> Dict[str, str]:
     out = {"street": "", "city": "", "state": "", "zip": ""}
     if not html: return out
-    m = re.search(r'"streetAddress"\s*:\s*"([^"]+)"', html, re.I); out["street"] = m.group(1) if m else ""
-    m = re.search(r'"addressLocality"\s*:\s*"([^"]+)"', html, re.I); out["city"] = m.group(1) if m else ""
-    m = re.search(r'"addressRegion"\s*:\s*"([A-Za-z]{2})"', html, re.I); out["state"] = m.group(1) if m else ""
-    m = re.search(r'"postalCode"\s*:\s*"(\d{5}(?:-\d{4})?)"', html, re.I); out["zip"] = m.group(1) if m else ""
+
+    # Try JSON-LD first (covers Homespotter, IDX, many MLS)
+    try:
+        blocks = _jsonld_blocks(html)
+        for b in blocks:
+            addr = b.get("address") or b.get("itemOffered", {}).get("address") if isinstance(b, dict) else None
+            if isinstance(addr, dict):
+                street = addr.get("streetAddress") or ""
+                city   = addr.get("addressLocality") or ""
+                state  = addr.get("addressRegion") or addr.get("addressCountry") or ""
+                zipc   = addr.get("postalCode") or ""
+                if street or (city and state):
+                    out.update({"street": street, "city": city, "state": state[:2], "zip": zipc})
+                    if out["street"]: return out
+    except Exception:
+        pass
+
+    # Generic meta/title fallbacks
+    m = re.search(r'"streetAddress"\s*:\s*"([^"]+)"', html, re.I); out["street"] = out["street"] or (m.group(1) if m else "")
+    m = re.search(r'"addressLocality"\s*:\s*"([^"]+)"', html, re.I); out["city"] = out["city"] or (m.group(1) if m else "")
+    m = re.search(r'"addressRegion"\s*:\s*"([A-Za-z]{2})"', html, re.I); out["state"] = out["state"] or (m.group(1) if m else "")
+    m = re.search(r'"postalCode"\s*:\s*"(\d{5}(?:-\d{4})?)"', html, re.I); out["zip"] = out["zip"] or (m.group(1) if m else "")
+
     if not out["street"]:
         for pat in [
             r"<meta[^>]+property=['\"]og:title['\"][^>]+content=['\"]([^'\"]+)['\"]",
@@ -327,13 +357,15 @@ def bing_search_items(query):
     except requests.RequestException:
         return []
 
+# ---- FIXED: avoid rf-strings with {0,5} quantifier braces ----
 MLS_HTML_PATTERNS = [
-    lambda mid: rf'\bMLS[^A-Za-z0-9]{{0,5}}#?\s*{re.escape(mid)}\b',
-    lambda mid: rf'\bMLS\s*#?\s*{re.escape(mid)}\b',
-    lambda mid: rf'"mls"\s*:\s*"{re.escape(mid)}"',
-    lambda mid: rf'"mlsId"\s*:\s*"{re.escape(mid)}"',
-    lambda mid: rf'"mlsId"\s*:\s*{re.escape(mid)}',
+    lambda mid: r'\bMLS[^A-Za-z0-9]{0,5}#?\s*{}\b'.format(re.escape(mid)),
+    lambda mid: r'\bMLS\s*#?\s*{}\b'.format(re.escape(mid)),
+    lambda mid: r'"mls"\s*:\s*"{}"'.format(re.escape(mid)),
+    lambda mid: r'"mlsId"\s*:\s*"{}"'.format(re.escape(mid)),
+    lambda mid: r'"mlsId"\s*:\s*{}'.format(re.escape(mid)),
 ]
+
 def page_contains_mls(html:str, mls_id:str) -> bool:
     for mk in MLS_HTML_PATTERNS:
         if re.search(mk(mls_id), html, re.I): return True
@@ -454,70 +486,100 @@ def construct_deeplink_from_parts(street, city, state, zipc, defaults):
     a = slug.lower(); a = re.sub(r"[^\w\s,-]", "", a).replace(",", ""); a = re.sub(r"\s+", "-", a.strip())
     return f"https://www.zillow.com/homes/{a}_rb/"
 
-# ---------- Robust address anchor (cached) ----------
-@st.cache_data(ttl=1800, show_spinner=False)
-def _address_text_for_url(url: str) -> str:
-    if not address_as_markdown_link or not url:
-        return ""
+# --------- Special: Homespotter / l.hms.pt resolver helpers ----------
+def _is_homespotter_like(u: str) -> bool:
     try:
-        _md, info = address_as_markdown_link(url, parse_html=True)
-        return (info.get("full") or "").strip()
+        h = urlparse(u).hostname or ""
+        return ("l.hms.pt" in h) or ("idx.homespotter.com" in h) or ("homespotter" in h)
     except Exception:
-        return ""
+        return False
 
-# ---------- Resolve from arbitrary source URL (updated to force Zillow deeplink when address is found) ----------
+def _extract_addr_homespotter(html: str) -> Dict[str, str]:
+    """
+    Homespotter pages often embed JSON-LD with address.
+    This tries JSON-LD first, then a few more patterns common on IDX pages.
+    """
+    addr = extract_address_from_html(html)
+    if addr.get("street"): return addr
+
+    # Additional loose patterns used by some IDX skins
+    pats = [
+        (r'"street"\s*:\s*"([^"]+)"', "street"),
+        (r'"city"\s*:\s*"([^"]+)"', "city"),
+        (r'"state(?:OrProvince)?"\s*:\s*"([A-Za-z]{2})"', "state"),
+        (r'"postal(?:Code)?"\s*:\s*"(\d{5}(?:-\d{4})?)"', "zip"),
+        (r'itemprop=["\']streetAddress["\'][^>]*>\s*([^<]+)', "street"),
+        (r'itemprop=["\']addressLocality["\'][^>]*>\s*([^<]+)', "city"),
+        (r'itemprop=["\']addressRegion["\'][^>]*>\s*([A-Za-z]{2})', "state"),
+        (r'itemprop=["\']postalCode["\'][^>]*>\s*(\d{5}(?:-\d{4})?)', "zip"),
+    ]
+    for pat, key in pats:
+        m = re.search(pat, html, re.I)
+        if m and (not addr.get(key)):
+            addr[key] = m.group(1).strip()
+
+    # og:title title fallback (e.g., "721 Currituck Dr, Raleigh, NC 27609 - ...")
+    if not addr.get("street"):
+        title = extract_title_or_desc(html)
+        if title and re.search(r"\b[A-Za-z]{2}\b", title) and re.search(r"\d{5}", title):
+            addr["street"] = title
+
+    return addr
+
+# Resolve from arbitrary source URL
 def resolve_from_source_url(source_url: str, defaults: Dict[str,str]) -> Tuple[str, str]:
-    """
-    Try (in order):
-      1) MLS->Zillow via Bing (if we can extract an MLS id)
-      2) Parse address robustly (utils.address_parser) from the final page HTML
-         and build a Zillow deeplink (then later upgrade to /homedetails/)
-      3) Title/description search for a homedetails URL
-      4) Last resort: return the final source URL
-    """
     final_url, html, _ = expand_url_and_fetch_html(source_url)
 
-    # 1) MLS id from HTML or URL tail (e.g. idx.homespotter.com/.../10116790)
+    # 1) Try MLS id first (works for many IDX pages)
     mls_id = extract_any_mls_id(html)
-    if not mls_id:
-        m = re.search(r"/([A-Za-z0-9]{6,})/?$", final_url)
-        if m:
-            mls_id = m.group(1)
     if mls_id:
         z1, _ = find_zillow_by_mls_with_confirmation(mls_id)
-        if z1:
-            return z1, ""
+        if z1: return z1, ""
 
-    # 2) Robust HTML parsing for address (works on many IDX including Homespotter)
-    street = city = state = zipc = ""
-    if address_as_markdown_link:
-        try:
-            _md, info = address_as_markdown_link(final_url, parse_html=True)
-            street = (info.get("streetAddress") or "").strip()
-            city   = (info.get("addressLocality") or "").strip()
-            state  = (info.get("addressRegion") or "").strip()
-            zipc   = (info.get("postalCode") or "").strip()
-        except Exception:
-            pass
+    # 2) Special handling for Homespotter/IDX short links:
+    #    Extract address from page, then search Zillow homedetails by address variants
+    if _is_homespotter_like(final_url):
+        hs_addr = _extract_addr_homespotter(html)
+        street = hs_addr.get("street","") or ""
+        city   = hs_addr.get("city","") or ""
+        state  = hs_addr.get("state","") or ""
+        zipc   = hs_addr.get("zip","") or ""
+        if street or (city and state):
+            variants = generate_address_variants(street, city, state, zipc, defaults)
+            z2, _ = resolve_homedetails_with_bing_variants(
+                variants, required_state=state or None, required_city=city or None, mls_id=mls_id or None
+            )
+            if z2:
+                return z2, compose_query_address(street, city, state, zipc, defaults)
+            # If still no homedetails, return a Zillow deeplink search for that address
+            return construct_deeplink_from_parts(street or "", city, state, zipc, defaults), compose_query_address(street, city, state, zipc, defaults)
+
+    # 3) Generic address extraction path
+    addr = extract_address_from_html(html)
+    street = addr.get("street","") or ""
+    city, state, zipc = addr.get("city",""), addr.get("state",""), addr.get("zip","")
     if street or (city and state):
-        used_addr = compose_query_address(street, city, state, zipc, defaults)
-        zurl = construct_deeplink_from_parts(street or used_addr, city, state, zipc, defaults)
-        return zurl, used_addr
+        variants = generate_address_variants(street or "", city, state, zipc, defaults)
+        z2, _ = resolve_homedetails_with_bing_variants(variants, required_state=state or None, required_city=city or None)
+        if z2: return z2, compose_query_address(street, city, state, zipc, defaults)
 
-    # 3) Title/description → Bing search for homedetails link
+    # 4) Title-based fallback → Bing → Zillow
     title = extract_title_or_desc(html)
     if title:
         for q in [f'"{title}" site:zillow.com/homedetails', f'{title} site:zillow.com']:
             items = bing_search_items(q)
             for it in items:
                 u = it.get("url") or ""
-                if "/homedetails/" in u:
-                    return u, title
+                if "/homedetails/" in u: return u, title
 
-    # 4) Last resort: original final URL
+    # 5) If we know *something* (city/state/street), build a Zillow _rb deeplink as final fallback
+    if city or state or street:
+        return construct_deeplink_from_parts(street or title or "", city, state, zipc, defaults), compose_query_address(street or title or "", city, state, zipc, defaults)
+
+    # 6) Nothing to extract — just return the final URL we got redirected to (rare)
     return final_url, ""
 
-# ---------- Primary resolver ----------
+# Primary resolver
 def process_single_row(row, *, delay=0.5, land_mode=True, defaults=None,
                        require_state=True, mls_first=True, default_mls_name="", max_candidates=20):
     defaults = defaults or {"city":"", "state":"", "zip":""}
@@ -555,7 +617,7 @@ def process_single_row(row, *, delay=0.5, land_mode=True, defaults=None,
     time.sleep(min(delay, 0.4))
     return {"input_address": query_address, "mls_id": mls_id, "zillow_url": zurl, "status": status, "csv_photo": csv_photo}
 
-# ---------- Enrichment ----------
+# Enrichment
 RE_PRICE  = re.compile(r'"(?:price|unformattedPrice|priceZestimate)"\s*:\s*"?\$?([\d,]+)"?', re.I)
 RE_STATUS = re.compile(r'"(?:homeStatus|statusText)"\s*:\s*"([^"]+)"', re.I)
 RE_BEDS   = re.compile(r'"(?:bedrooms|beds)"\s*:\s*(\d+)', re.I)
@@ -763,7 +825,7 @@ def get_tour_slug_map(client_tag: str) -> Dict[str, Dict[str, str]]:
             if not prev or (info["date"] and prev.get("date") and str(info["date"]) > str(prev.get("date"))):
                 by_slug[slug] = info
             elif not prev:
-                by_slug[slug] = info
+                by_slug = {**by_slug, slug: info}
         return by_slug
     except Exception:
         return {}
@@ -820,34 +882,6 @@ def log_sent_rows(results: List[Dict[str, Any]], client_tag: str, campaign_tag: 
     except Exception as e:
         return False, str(e)
 
-# ---------- Clients registry helpers (cached) ----------
-@st.cache_data(ttl=60, show_spinner=False)
-def fetch_clients(include_inactive: bool = False):
-    if not _sb_ok(): return []
-    try:
-        rows = SUPABASE.table("clients").select("id,name,name_norm,active").order("name", desc=False).execute().data or []
-        rows = [r for r in rows if r.get("name_norm") != _norm_tag("test test")]
-        return rows if include_inactive else [r for r in rows if r.get("active")]
-    except Exception:
-        return []
-
-def invalidate_clients_cache():
-    try: fetch_clients.clear()  # type: ignore[attr-defined]
-    except Exception: pass
-
-def upsert_client(name: str, active: bool = True, notes: str = None):
-    if not _sb_ok() or not (name or "").strip():
-        return False, "Not configured or empty name"
-    try:
-        name_norm = _norm_tag(name)
-        payload = {"name": name.strip(), "name_norm": name_norm, "active": active}
-        if notes is not None: payload["notes"] = notes
-        SUPABASE.table("clients").upsert(payload, on_conflict="name_norm").execute()
-        invalidate_clients_cache()
-        return True, "ok"
-    except Exception as e:
-        return False, str(e)
-
 # ---------- Output builders ----------
 def build_output(rows: List[Dict[str, Any]], fmt: str, use_display: bool = True, include_notes: bool = False):
     def pick_url(r):
@@ -857,9 +891,7 @@ def build_output(rows: List[Dict[str, Any]], fmt: str, use_display: bool = True,
         fields = ["input_address","mls_id","url","status","price","beds","baths","sqft","already_sent","dup_reason","dup_sent_at","toured","toured_date","toured_start","toured_end"]
         if include_notes:
             fields += ["summary","highlights","remarks"]
-        s = io.StringIO()
-        w = csv.DictWriter(s, fieldnames=fields)
-        w.writeheader()
+        s = io.StringIO(); w = csv.DictWriter(s, fieldnames=fields); w.writeheader()
         for r in rows:
             row = {k: r.get(k) for k in fields if k != "url"}
             row["url"] = pick_url(r)
@@ -888,16 +920,92 @@ def _dedupe_results_for_logging(results: List[Dict[str,Any]]) -> List[Dict[str,A
         url = (r.get("preview_url") or r.get("zillow_url") or r.get("display_url") or "").strip()
         c, z = canonicalize_zillow(url) if url else ("","")
         key = c or z or url
-        if not key:
+        if not key:  # skip empties
             continue
         if key in seen:
             continue
         seen.add(key)
+        # stash the canon/zpid so log_sent_rows doesn't need to recompute
         r = dict(r)
         if c: r["canonical"] = c
         if z: r["zpid"] = z
         out.append(r)
     return out
+
+# ---------- Results list (no f-string braces to avoid SyntaxError) ----------
+def results_list_with_copy_all(results: List[Dict[str, Any]], client_selected: bool):
+    li_html = []
+    for r in results:
+        href = r.get("preview_url") or r.get("zillow_url") or r.get("display_url") or ""
+        if not href:
+            continue
+        safe_href = escape(href)
+        link_txt = href  # keep URL text for best SMS unfurls
+
+        # Badges: duplicate/new + toured
+        badge_html = ""
+        if client_selected:
+            if r.get("already_sent"):
+                tip = f"Duplicate ({escape(r.get('dup_reason','') or '-')}); sent {escape(r.get('dup_sent_at') or '-')}"
+                badge_html += f' <span class="badge dup" title="{tip}">Duplicate</span>'
+            else:
+                badge_html += ' <span class="badge new" title="New for this client">NEW</span>'
+            if r.get("toured"):
+                dt = str(r.get("toured_date") or "")
+                tm = str(r.get("toured_start") or "")
+                title = ("Toured " + (dt + (" " + tm if tm else ""))).strip()
+                badge_html += (
+                    ' <span class="badge tour" title="{}">TOURED</span>'
+                ).format(escape(title))
+
+        li_html.append(
+            '<li style="margin:0.2rem 0;"><a href="{0}" target="_blank" rel="noopener">{1}</a>{2}</li>'.format(
+                safe_href, escape(link_txt), badge_html
+            )
+        )
+
+    items_html = "\n".join(li_html) if li_html else "<li>(no results)</li>"
+
+    copy_lines = []
+    for r in results:
+        u = r.get("preview_url") or r.get("zillow_url") or r.get("display_url") or ""
+        if u:
+            copy_lines.append(u.strip())
+    copy_text = "\n".join(copy_lines) + ("\n" if copy_lines else "")
+
+    html_tpl = """
+    <html><head><meta charset="utf-8" />
+      <style>
+        html,body { margin:0; font-family:-apple-system, Segoe UI, Roboto, Arial, sans-serif; }
+        .results-wrap { position:relative; box-sizing:border-box; padding:8px 120px 4px 0; }
+        ul.link-list { margin:0 0 0.2rem 1.2rem; padding:0; list-style:disc; }
+        ul.link-list li { margin:0.2rem 0; }
+        .copyall-btn { position:absolute; top:0; right:8px; z-index:5; padding:6px 10px; height:26px; border:0; border-radius:10px; color:#fff; font-weight:700; background:#1d4ed8; cursor:pointer; opacity:.95; }
+      </style>
+    </head><body>
+      <div class="results-wrap">
+        <button id="copyAll" class="copyall-btn" title="Copy clean URLs" aria-label="Copy clean URLs">Copy</button>
+        <ul class="link-list" id="resultsList">__ITEMS__</ul>
+      </div>
+      <script>
+        (function() {
+          const btn = document.getElementById('copyAll');
+          const text = `__COPY__`;
+          btn.addEventListener('click', async () => {
+            try {
+              await navigator.clipboard.writeText(text);
+              const prev = btn.textContent; btn.textContent='✓'; setTimeout(() => { btn.textContent = prev; }, 900);
+            } catch(e) {
+              const prev = btn.textContent; btn.textContent='×'; setTimeout(() => { btn.textContent = prev; }, 900);
+            }
+          });
+        })();
+      </script>
+    </body></html>
+    """
+    html = html_tpl.replace("__ITEMS__", items_html).replace("__COPY__", copy_text.replace("\\", "\\\\").replace("`", "\\`"))
+    est_h = max(60, min(34 * max(1, len(li_html)) + 20, 700))
+    components.html(html, height=est_h, scrolling=False)
 
 # ---------- Main renderer ----------
 def render_run_tab(state: dict):
@@ -943,9 +1051,6 @@ def render_run_tab(state: dict):
             only_show_new = False
 
     table_view = st.checkbox("Show results as table", value=False, help="Easier to scan details")
-
-    # Toggle to use address text as anchor
-    use_address_anchor = st.checkbox("Use address as link text", value=True, help="Anchor text shows the parsed address; copied URLs stay the same.")
 
     client_tag = _norm_tag(client_tag_raw)
     campaign_tag = _norm_tag(campaign_tag_raw)
@@ -1006,84 +1111,6 @@ def render_run_tab(state: dict):
     st.markdown('<div class="run-zone">', unsafe_allow_html=True)
     clicked = st.button("🚀 Run", use_container_width=True, key="__run_btn__")
     st.markdown('</div>', unsafe_allow_html=True)
-
-    # Results HTML list with copy-all (ALWAYS hyperlinks, tight spacing)
-    def results_list_with_copy_all(results: List[Dict[str, Any]], client_selected: bool):
-        li_html = []
-        for r in results:
-            href = r.get("preview_url") or r.get("zillow_url") or r.get("display_url") or ""
-            if not href:
-                continue
-            safe_href = escape(href)
-
-            # Anchor text (address) if enabled
-            if use_address_anchor and address_as_markdown_link:
-                address_txt = _address_text_for_url(href)
-                link_txt = address_txt or href
-            else:
-                link_txt = href  # default to URL text
-
-            # Badges: duplicate/new + toured
-            badge_html = ""
-            if client_selected:
-                if r.get("already_sent"):
-                    tip = f"Duplicate ({escape(r.get('dup_reason','') or '-')}); sent {escape(r.get('dup_sent_at') or '-')}"
-                    badge_html += f' <span class="badge dup" title="{tip}">Duplicate</span>'
-                else:
-                    badge_html += ' <span class="badge new" title="New for this client">NEW</span>'
-                if r.get("toured"):
-                    dt = str(r.get("toured_date") or "")
-                    tm = str(r.get("toured_start") or "")
-                    title = ("Toured " + (dt + (" " + tm if tm else ""))).strip()
-                    badge_html += (
-                        ' <span class="badge tour" '
-                        'title="{title}">TOURED</span>'
-                    ).replace("{title}", escape(title))
-
-            li_html.append(
-                f'<li style="margin:0.2rem 0;"><a href="{safe_href}" target="_blank" rel="noopener">{escape(link_txt)}</a>{badge_html}</li>'
-            )
-
-        items_html = "\n".join(li_html) if li_html else "<li>(no results)</li>"
-
-        copy_lines = []
-        for r in results:
-            u = r.get("preview_url") or r.get("zillow_url") or r.get("display_url") or ""
-            if u:
-                copy_lines.append(u.strip())
-        copy_text = "\\n".join(copy_lines) + ("\\n" if copy_lines else "")
-
-        html = f"""
-        <html><head><meta charset="utf-8" />
-          <style>
-            html,body {{ margin:0; font-family:-apple-system, Segoe UI, Roboto, Arial, sans-serif; }}
-            .results-wrap {{ position:relative; box-sizing:border-box; padding:8px 120px 4px 0; }}
-            ul.link-list {{ margin:0 0 0.2rem 1.2rem; padding:0; list-style:disc; }}
-            ul.link-list li {{ margin:0.2rem 0; }}
-            .copyall-btn {{ position:absolute; top:0; right:8px; z-index:5; padding:6px 10px; height:26px; border:0; border-radius:10px; color:#fff; font-weight:700; background:#1d4ed8; cursor:pointer; opacity:.95; }}
-          </style>
-        </head><body>
-          <div class="results-wrap">
-            <button id="copyAll" class="copyall-btn" title="Copy clean URLs" aria-label="Copy clean URLs">Copy</button>
-            <ul class="link-list" id="resultsList">{items_html}</ul>
-          </div>
-          <script>
-            (function(){{
-              const btn=document.getElementById('copyAll');
-              const text = "{copy_text}".replaceAll("\\n", "\\n");
-              btn.addEventListener('click', async () => {{
-                try {{
-                  await navigator.clipboard.writeText(text);
-                  const prev=btn.textContent; btn.textContent='✓'; setTimeout(()=>{{ btn.textContent=prev; }}, 900);
-                }} catch(e) {{
-                  const prev=btn.textContent; btn.textContent='×'; setTimeout(()=>{{ btn.textContent=prev; }}, 900);
-                }}
-              }});
-            }})();
-          </script>
-        </body></html>"""
-        est_h = max(60, min(34 * max(1, len(li_html)) + 20, 700))
-        components.html(html, height=est_h, scrolling=False)
 
     def _render_results_and_downloads(results: List[Dict[str, Any]], client_tag: str, campaign_tag: str, include_notes: bool, client_selected: bool):
         st.markdown("#### Results")
@@ -1152,7 +1179,7 @@ def render_run_tab(state: dict):
                     )
 
         # ============================
-        # Add to client (optional)
+        # NEW: Add to client (optional)
         # ============================
         st.markdown("---")
         st.markdown("### Add to client (optional)")
@@ -1301,41 +1328,16 @@ def render_run_tab(state: dict):
 
             st.success(f"Processed {len(results)} item(s)" + (f" — CSV rows read: {csv_count}" if file is not None else ""))
 
-            # Render results/downloads
-            def _render_results_and_downloads(results: List[Dict[str, Any]], client_tag: str, campaign_tag: str, include_notes: bool, client_selected: bool):
-                st.markdown("#### Results")
-                results_list_with_copy_all(results, client_selected=client_selected)
+            _render_results_and_downloads(results, client_tag, campaign_tag, include_notes=enrich_details, client_selected=client_selected)
 
-                # Optional table
-                if table_view:
-                    import pandas as pd
-                    cols = ["already_sent","dup_reason","dup_sent_at","toured","toured_date","toured_start","toured_end",
-                            "display_url","zillow_url","preview_url","status","price","beds","baths","sqft","mls_id","input_address"]
-                    df = pd.DataFrame([{c: r.get(c) for c in cols} for r in results])
-                    st.dataframe(df, use_container_width=True, hide_index=True)
+        except Exception as e:
+            st.error("We hit an error while processing.")
+            with st.expander("Details"): st.exception(e)
 
-                # ---- Download
-                fmt_options = ["txt","csv","md","html"]
-                prev_fmt = (st.session_state.get("__results__") or {}).get("fmt")
-                default_idx = fmt_options.index(prev_fmt) if prev_fmt in fmt_options else 0
-                fmt = st.selectbox("Download format", fmt_options, index=default_idx)
-                payload, mime = build_output(results, fmt, use_display=True, include_notes=include_notes)
-                ts = datetime.utcnow().strftime("%Y%m%d%H%M%S")
-                tag = ("_" + re.sub(r'[^a-z0-9\-]+','', (client_tag or "").lower().replace(" ","-"))) if client_tag else ""
-                st.download_button("Export", data=payload, file_name=f"address_alchemist{tag}_{ts}.{fmt}", mime=mime, use_container_width=True)
-                st.session_state["__results__"] = {"results": results, "fmt": fmt}
-
-                # ---- Thumbnails grid
-                thumbs=[]
-                for r in results:
-                    img = r.get("image_url")
-                    if not img:
-                        img, _ = get_thumbnail_and_log(r.get("input_address",""), r.get("preview_url") or r.get("zillow_url") or "", r.get("csv_photo"))
-                    if img: thumbs.append((r,img))
-                if thumbs:
-                    st.markdown("#### Images")
-                    cols = st.columns(3)
-                    for i,(r,img) in enumerate(thumbs):
-                        with cols[i%3]:
-                            mls_id = (r.get("mls_id") or "").strip()
-                            addr = (r.get("input_address
+    data = st.session_state.get("__results__") or {}
+    results = data.get("results") or []
+    if results and not clicked:
+        _render_results_and_downloads(results, client_tag, campaign_tag, include_notes=False, client_selected=bool(client_tag.strip()))
+    else:
+        if not clicked:
+            st.info("Paste addresses or links (or upload CSV), then click **Run**.")
