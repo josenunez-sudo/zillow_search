@@ -151,14 +151,56 @@ def expand_url_and_fetch_html(url: str) -> Tuple[str, str, int]:
         return url, "", 0
 
 def upgrade_to_homedetails_if_needed(url: str) -> str:
-    if not url or "/homedetails/" in url: return url
+    """
+    If we have a Zillow /homes/..._rb/ page, try to upgrade to the canonical
+    /homedetails/.../_zpid/ by checking anchors, <link rel="canonical"> and
+    embedded JSON (canonicalUrl/url/zpid + address pieces).
+    """
+    if not url or "/homedetails/" in url:
+        return url
     try:
         r = requests.get(url, headers=UA_HEADERS, timeout=REQUEST_TIMEOUT)
-        if not r.ok: return url
-        m = re.search(r'href="(https://www\.zillow\.com/homedetails/[^"]+)"', r.text)
-        return m.group(1) if m else url
+        if not r.ok:
+            return url
+        html = r.text
+
+        # 1) Direct anchors to homedetails
+        for pat in [
+            r'href="(https://www\.zillow\.com/homedetails/[^"]+)"',
+            r"href='(https://www\.zillow\.com/homedetails/[^']+)'",
+        ]:
+            m = re.search(pat, html, re.I)
+            if m:
+                return m.group(1)
+
+        # 2) Canonical link
+        m = re.search(r'rel=["\']canonical["\'][^>]+href=["\'](https://www\.zillow\.com/homedetails/[^"\']+)["\']', html, re.I)
+        if m:
+            return m.group(1)
+
+        # 3) JSON hints (canonicalUrl / url)
+        for pat in [
+            r'"canonicalUrl"\s*:\s*"(https://www\.zillow\.com/homedetails/[^"]+)"',
+            r'"url"\s*:\s*"(https://www\.zillow\.com/homedetails/[^"]+)"',
+        ]:
+            m = re.search(pat, html, re.I)
+            if m:
+                return m.group(1)
+
+        # 4) Reconstruct using zpid + address pieces if present
+        mz = re.search(r'"zpid"\s*:\s*(\d+)', html)
+        if mz:
+            s  = re.search(r'"streetAddress"\s*:\s*"([^"]+)"', html)
+            c  = re.search(r'"addressLocality"\s*:\s*"([^"]+)"', html)
+            st = re.search(r'"addressRegion"\s*:\s*"([A-Za-z]{2})"', html)
+            if s and c and st:
+                # Build a Zillow-style slug
+                slug_src = f"{s.group(1)} {c.group(1)} {st.group(1)}"
+                slug = re.sub(r'[^A-Za-z0-9]+', '-', slug_src).strip('-').lower()
+                return f"https://www.zillow.com/homedetails/{slug}/{mz.group(1)}_zpid/"
     except Exception:
         return url
+    return url
 
 # Content extractors
 def extract_any_mls_id(html: str) -> Optional[str]:
@@ -872,7 +914,7 @@ def get_tour_slug_map(client_tag: str) -> Dict[str, Dict[str, str]]:
             info = {"date": (tdate.get(s.get("tour_id")) or ""), "start": s.get("start","") or "", "end": s.get("end","") or ""}
             prev = by_slug.get(slug)
             if not prev or (info["date"] and prev.get("date") and str(info["date"]) > str(prev.get("date"))):
-                by_slug[slug] = info
+                by_slug = {**by_slug, slug: info}
             elif not prev:
                 by_slug = {**by_slug, slug: info}
         return by_slug
@@ -1337,6 +1379,7 @@ def render_run_tab(state: dict):
                 prog.progress(i/total, text=f"Resolved {i}/{total}")
             prog.progress(1.0, text="Links resolved")
 
+            # Try to upgrade any /homes/..._rb/ to /homedetails/ using canonical/JSON
             for r in results:
                 for key in ("zillow_url","display_url"):
                     if r.get(key):
