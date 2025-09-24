@@ -2,7 +2,7 @@
 # Run tab with: hyperlinks-only results, clickable thumbnails, TOURED cross-check via Supabase,
 # and a post-run "Add to client" action (like the Tours tab) — no auto-logging.
 
-import os, csv, io, re, time, json, asyncio
+import os, csv, io, re, time, json, asyncio, sys
 from datetime import datetime
 from typing import List, Dict, Any, Optional, Tuple
 from html import escape
@@ -13,20 +13,20 @@ import httpx
 import streamlit as st
 import streamlit.components.v1 as components
 
-# --- bring in client helpers without importing the whole UI to avoid circulars ---
+# --- Safe import of clients helpers (avoids NameError for fetch_clients/upsert_client) ---
 try:
-    # relative import when run as a package
-    from .clients_tab import fetch_clients, upsert_client
+    # when imported as a package module
+    from ui.clients_tab import fetch_clients, upsert_client
 except Exception:
     try:
-        # absolute fallback if run differently
-        from ui.clients_tab import fetch_clients, upsert_client
+        # when running with UI_DIR on sys.path (app.py inserts it)
+        from clients_tab import fetch_clients, upsert_client  # type: ignore
     except Exception:
-        # final safety: stub out to prevent NameError; UI will still render
-        def fetch_clients(include_inactive: bool = False):
+        # ultra-safe fallbacks so the module still imports (you'll just see empty client lists)
+        def fetch_clients(include_inactive: bool = False) -> List[Dict[str, Any]]:  # type: ignore
             return []
-        def upsert_client(name: str, active: bool = True):
-            return False, "Clients module unavailable"
+        def upsert_client(name: str, active: bool = True):  # type: ignore
+            return False, "Clients module not available"
 
 # ---------- Optional deps ----------
 try:
@@ -45,10 +45,16 @@ def _safe_rerun():
             pass
 
 # ---------- Supabase ----------
-from supabase import create_client, Client
+try:
+    from supabase import create_client, Client
+except Exception:
+    create_client = None
+    Client = Any  # type: ignore
 
 @st.cache_resource
-def get_supabase() -> Optional[Client]:
+def get_supabase() -> Optional["Client"]:
+    if create_client is None:
+        return None
     try:
         url = os.getenv("SUPABASE_URL", st.secrets.get("SUPABASE_URL", ""))
         key = os.getenv("SUPABASE_SERVICE_ROLE", st.secrets.get("SUPABASE_SERVICE_ROLE", ""))
@@ -230,6 +236,23 @@ def extract_title_or_desc(html: str) -> str:
         m = re.search(pat, html, re.I)
         if m: return re.sub(r'\s+', ' ', m.group(1)).strip()
     return ""
+
+# ---------- NEW: get MLS id directly from URL path/query (Homespotter/IDX fix) ----------
+def extract_mls_id_from_url(u: str) -> Optional[str]:
+    """Pick an MLS-like numeric id out of the URL path or query."""
+    if not u:
+        return None
+    try:
+        # common case: .../something/<digits>[?...] or ...id=<digits>
+        m = re.search(r'/(\d{6,})(?:[/?#]|$)', u)
+        if m:
+            return m.group(1)
+        m = re.search(r'(?i)(?:mls|listing|id|listing_id)=([A-Za-z0-9\-]{6,})', u)
+        if m:
+            return m.group(1)
+    except Exception:
+        return None
+    return None
 
 # Zillow canonicalization
 ZPID_RE = re.compile(r'(\d{6,})_zpid', re.I)
@@ -539,17 +562,19 @@ def _extract_addr_homespotter(html: str) -> Dict[str, str]:
 
     return addr
 
-# Resolve from arbitrary source URL
+# ---------- UPDATED: Resolve from arbitrary source URL (now pulls MLS from URL too) ----------
 def resolve_from_source_url(source_url: str, defaults: Dict[str,str]) -> Tuple[str, str]:
+    # Always try to expand (to get HTML + a clean final URL)
     final_url, html, _ = expand_url_and_fetch_html(source_url)
 
-    # 1) Try MLS id first (works for many IDX pages)
-    mls_id = extract_any_mls_id(html)
+    # 0) Try MLS id — first from HTML, then from URL (homespotter often exposes it in the path)
+    mls_id = extract_any_mls_id(html) or extract_mls_id_from_url(final_url) or extract_mls_id_from_url(source_url)
     if mls_id:
         z1, _ = find_zillow_by_mls_with_confirmation(mls_id)
-        if z1: return z1, ""
+        if z1:
+            return z1, ""  # found Zillow homedetails by MLS
 
-    # 2) Special handling for Homespotter/IDX short links:
+    # 1) Special handling for Homespotter/IDX short links:
     #    Extract address from page, then search Zillow homedetails by address variants
     if _is_homespotter_like(final_url):
         hs_addr = _extract_addr_homespotter(html)
@@ -557,39 +582,50 @@ def resolve_from_source_url(source_url: str, defaults: Dict[str,str]) -> Tuple[s
         city   = hs_addr.get("city","") or ""
         state  = hs_addr.get("state","") or ""
         zipc   = hs_addr.get("zip","") or ""
+
         if street or (city and state):
             variants = generate_address_variants(street, city, state, zipc, defaults)
+
+            # Prefer MLS-confirmed candidates if we discovered an mls_id from URL
             z2, _ = resolve_homedetails_with_bing_variants(
-                variants, required_state=state or None, required_city=city or None, mls_id=mls_id or None
+                variants,
+                required_state=state or None,
+                required_city=city or None,
+                mls_id=mls_id or None
             )
             if z2:
                 return z2, compose_query_address(street, city, state, zipc, defaults)
+
             # If still no homedetails, return a Zillow deeplink search for that address
             return construct_deeplink_from_parts(street or "", city, state, zipc, defaults), compose_query_address(street, city, state, zipc, defaults)
 
-    # 3) Generic address extraction path
+    # 2) Generic address extraction path
     addr = extract_address_from_html(html)
     street = addr.get("street","") or ""
     city, state, zipc = addr.get("city",""), addr.get("state",""), addr.get("zip","")
     if street or (city and state):
         variants = generate_address_variants(street or "", city, state, zipc, defaults)
-        z2, _ = resolve_homedetails_with_bing_variants(variants, required_state=state or None, required_city=city or None)
-        if z2: return z2, compose_query_address(street, city, state, zipc, defaults)
+        z2, _ = resolve_homedetails_with_bing_variants(
+            variants, required_state=state or None, required_city=city or None, mls_id=mls_id or None
+        )
+        if z2:
+            return z2, compose_query_address(street, city, state, zipc, defaults)
 
-    # 4) Title-based fallback → Bing → Zillow
+    # 3) Title-based fallback → Bing → Zillow
     title = extract_title_or_desc(html)
     if title:
         for q in [f'"{title}" site:zillow.com/homedetails', f'{title} site:zillow.com']:
             items = bing_search_items(q)
             for it in items:
                 u = it.get("url") or ""
-                if "/homedetails/" in u: return u, title
+                if "/homedetails/" in u:
+                    return u, title
 
-    # 5) If we know *something* (city/state/street), build a Zillow _rb deeplink as final fallback
-    if city or state or street:
+    # 4) If we know *something*, build a Zillow _rb deeplink as final fallback
+    if city or state or street or title:
         return construct_deeplink_from_parts(street or title or "", city, state, zipc, defaults), compose_query_address(street or title or "", city, state, zipc, defaults)
 
-    # 6) Nothing to extract — just return the final URL we got redirected to (rare)
+    # 5) Nothing worked — last resort is the expanded IDX URL
     return final_url, ""
 
 # Primary resolver
@@ -772,7 +808,7 @@ def bitly_shorten(long_url: str) -> Optional[str]:
     token = BITLY_TOKEN
     if not token: return None
     try:
-        r = requests.post("https://api-ssl.bitly.com/v4/shorten",
+        r = requests.post("https://api-ssl.bit.ly/v4/shorten".replace("bit.ly","bitly.com"),
                           headers={"Authorization": f"Bearer {token}", "Content-Type":"application/json"},
                           json={"long_url": long_url}, timeout=10)
         if r.ok: return r.json().get("link")
