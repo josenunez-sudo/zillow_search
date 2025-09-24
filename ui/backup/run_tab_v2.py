@@ -18,6 +18,12 @@ try:
 except Exception:
     usaddress = None
 
+# ---------- Robust address parser (IDX/Homespotter-safe) ----------
+try:
+    from utils.address_parser import address_as_markdown_link
+except Exception:
+    address_as_markdown_link = None
+
 # ---------- Rerun helper ----------
 def _safe_rerun():
     try:
@@ -447,29 +453,56 @@ def construct_deeplink_from_parts(street, city, state, zipc, defaults):
     a = slug.lower(); a = re.sub(r"[^\w\s,-]", "", a).replace(",", ""); a = re.sub(r"\s+", "-", a.strip())
     return f"https://www.zillow.com/homes/{a}_rb/"
 
-# Resolve from arbitrary source URL
+# ---------- Resolve from arbitrary source URL (PATCHED) ----------
 def resolve_from_source_url(source_url: str, defaults: Dict[str,str]) -> Tuple[str, str]:
     final_url, html, _ = expand_url_and_fetch_html(source_url)
+
+    # 1) Try MLS→Zillow
     mls_id = extract_any_mls_id(html)
+    if not mls_id:
+        # also try to read trailing ID from URLs like .../tmlspar/10116790
+        m = re.search(r"/([A-Za-z0-9]{6,})/?$", final_url)
+        if m: mls_id = m.group(1)
     if mls_id:
         z1, _ = find_zillow_by_mls_with_confirmation(mls_id)
-        if z1: return z1, ""
-    addr = extract_address_from_html(html)
-    street = addr.get("street","") or ""
-    city, state, zipc = addr.get("city",""), addr.get("state",""), addr.get("zip","")
+        if z1:
+            return z1, ""
+
+    # 2) Robust parser: pull address from the page and build a Zillow deeplink
+    street = city = state = zipc = ""
+    if address_as_markdown_link:
+        try:
+            _md, info = address_as_markdown_link(final_url, parse_html=True)
+            street = (info.get("streetAddress") or "").strip()
+            city   = (info.get("addressLocality") or "").strip()
+            state  = (info.get("addressRegion") or "").strip()
+            zipc   = (info.get("postalCode") or "").strip()
+        except Exception:
+            pass
+    if not (street or (city and state)):
+        # fallback to lightweight extractor (older behavior)
+        addr = extract_address_from_html(html)
+        street = street or (addr.get("street","") or "")
+        city   = city   or (addr.get("city","") or "")
+        state  = state  or (addr.get("state","") or "")
+        zipc   = zipc   or (addr.get("zip","") or "")
+
     if street or (city and state):
-        variants = generate_address_variants(street or "", city, state, zipc, defaults)
-        z2, _ = resolve_homedetails_with_bing_variants(variants, required_state=state or None, required_city=city or None)
-        if z2: return z2, compose_query_address(street, city, state, zipc, defaults)
+        used_addr = compose_query_address(street, city, state, zipc, defaults)
+        zurl = construct_deeplink_from_parts(street or used_addr, city, state, zipc, defaults)
+        return zurl, used_addr
+
+    # 3) Title/desc → homedetails search
     title = extract_title_or_desc(html)
     if title:
         for q in [f'"{title}" site:zillow.com/homedetails', f'{title} site:zillow.com']:
             items = bing_search_items(q)
             for it in items:
                 u = it.get("url") or ""
-                if "/homedetails/" in u: return u, title
-    if city or state or street:
-        return construct_deeplink_from_parts(street or title or "", city, state, zipc, defaults), compose_query_address(street or title or "", city, state, zipc, defaults)
+                if "/homedetails/" in u:
+                    return u, title
+
+    # 4) Give up – return final URL (won’t happen for Homespotter anymore)
     return final_url, ""
 
 # Primary resolver
@@ -718,7 +751,7 @@ def get_tour_slug_map(client_tag: str) -> Dict[str, Dict[str, str]]:
             if not prev or (info["date"] and prev.get("date") and str(info["date"]) > str(prev.get("date"))):
                 by_slug[slug] = info
             elif not prev:
-                by_slug[slug] = info
+                by_slug = by_slug
         return by_slug
     except Exception:
         return {}
