@@ -1,8 +1,6 @@
 # ui/run_tab.py
 # Run tab with: hyperlinks-only results, clickable thumbnails, TOURED cross-check via Supabase,
-# a post-run "Add to client" action (like the Tours tab) — no auto-logging,
-# plus a "Fix properties" section to re-run/upgrade links.
-# Includes "Force state to NC" (on by default).
+# post-run "Add to client", a bottom "Fix properties" section, and NC forced as the state everywhere.
 
 import os, csv, io, re, time, json, asyncio, sys
 from datetime import datetime
@@ -151,9 +149,7 @@ def expand_url_and_fetch_html(url: str) -> Tuple[str, str, int]:
 
 def upgrade_to_homedetails_if_needed(url: str) -> str:
     """
-    If we have a Zillow /homes/..._rb/ page, try to upgrade to the canonical
-    /homedetails/.../_zpid/ by checking anchors, <link rel="canonical"> and
-    embedded JSON (canonicalUrl/url/zpid + address pieces).
+    Upgrade Zillow /homes/..._rb/ to canonical /homedetails/.../_zpid/ if possible.
     """
     if not url or "/homedetails/" in url:
         return url
@@ -186,7 +182,7 @@ def upgrade_to_homedetails_if_needed(url: str) -> str:
             if m:
                 return m.group(1)
 
-        # 4) Reconstruct using zpid + address pieces if present
+        # 4) Reconstruct using zpid + address
         mz = re.search(r'"zpid"\s*:\s*(\d+)', html)
         if mz:
             s  = re.search(r'"streetAddress"\s*:\s*"([^"]+)"', html)
@@ -220,8 +216,8 @@ def _jsonld_blocks(html: str) -> List[Dict[str, Any]]:
                 data = json.loads(blob)
                 if isinstance(data, list):
                     out.extend([d for d in data if isinstance(d, dict)])
-                elif isinstance(data, dict):
-                    out.append(data)
+                elif isinstance(d := data, dict):
+                    out.append(d)
             except Exception:
                 continue
     except Exception:
@@ -238,10 +234,10 @@ def extract_address_from_html(html: str) -> Dict[str, str]:
             if isinstance(addr, dict):
                 street = addr.get("streetAddress") or ""
                 city   = addr.get("addressLocality") or ""
-                state  = addr.get("addressRegion") or addr.get("addressCountry") or ""
+                state  = (addr.get("addressRegion") or addr.get("addressCountry") or "")[:2]
                 zipc   = addr.get("postalCode") or ""
                 if street or (city and state):
-                    out.update({"street": street, "city": city, "state": state[:2], "zip": zipc})
+                    out.update({"street": street, "city": city, "state": state, "zip": zipc})
                     if out["street"]: return out
     except Exception:
         pass
@@ -272,7 +268,7 @@ def extract_title_or_desc(html: str) -> str:
         if m: return re.sub(r'\s+', ' ', m.group(1)).strip()
     return ""
 
-# ---------- NEW: get MLS id directly from URL path/query (Homespotter/IDX fix) ----------
+# ---------- get MLS id directly from URL path/query (Homespotter/IDX fix) ----------
 def extract_mls_id_from_url(u: str) -> Optional[str]:
     if not u:
         return None
@@ -373,8 +369,9 @@ def compose_query_address(street, city, state, zipc, defaults):
     return " ".join([p for p in parts if p]).strip()
 
 def generate_address_variants(street, city, state, zipc, defaults):
+    # Force NC whenever state is missing
     city = (city or defaults.get("city","")).strip()
-    st   = (state or defaults.get("state","")).strip()
+    st   = (state or defaults.get("state","NC")).strip() or "NC"
     z    = (zipc or defaults.get("zip","")).strip()
     base = (street or "").strip()
     lot_match = LOT_REGEX.search(base); lot_num = lot_match.group(1) if lot_match else None
@@ -404,7 +401,7 @@ def url_matches_city_state(url:str, city:str=None, state:str=None) -> bool:
     u = (url or '')
     ok = True
     if state:
-        st2 = state.upper().strip()
+        st2 = (state or "NC").upper().strip()
         if f"-{st2}-" not in u and f"/{st2.lower()}/" not in u: ok = False
     if city and ok:
         cs = f"-{_slug(city)}-"
@@ -443,10 +440,10 @@ def page_contains_mls(html:str, mls_id:str) -> bool:
 def page_contains_city_state(html:str, city:str=None, state:str=None) -> bool:
     ok = False
     if city and re.search(re.escape(city), html, re.I): ok = True
-    if state and re.search(rf'\b{re.escape(state)}\b', html, re.I): ok = True
+    if (state or "NC") and re.search(rf'\b{re.escape(state or "NC")}\b', html, re.I): ok = True
     return ok
 
-def confirm_or_resolve_on_page(url:str, mls_id:str=None, required_city:str=None, required_state:str=None):
+def confirm_or_resolve_on_page(url:str, mls_id:str=None, required_city:str=None, required_state:str="NC"):
     try:
         r = requests.get(url, headers=UA_HEADERS, timeout=REQUEST_TIMEOUT); r.raise_for_status()
         html = r.text
@@ -467,7 +464,7 @@ def confirm_or_resolve_on_page(url:str, mls_id:str=None, required_city:str=None,
         return None, None
     return None, None
 
-def find_zillow_by_mls_with_confirmation(mls_id, required_state=None, required_city=None, mls_name=None, delay=0.35, require_match=False, max_candidates=20):
+def find_zillow_by_mls_with_confirmation(mls_id, required_state="NC", required_city=None, mls_name=None, delay=0.35, require_match=True, max_candidates=20):
     if not (BING_API_KEY and mls_id): return None, None
     q_mls = [
         f'"MLS# {mls_id}" site:zillow.com',
@@ -510,7 +507,7 @@ def azure_search_first_zillow(query_address):
         return None
     return None
 
-def resolve_homedetails_with_bing_variants(address_variants, required_state=None, required_city=None, mls_id=None, delay=0.3, require_match=False):
+def resolve_homedetails_with_bing_variants(address_variants, required_state="NC", required_city=None, mls_id=None, delay=0.3, require_match=True):
     if not BING_API_KEY: return None, None
     candidates, seen = [], set()
     for qaddr in address_variants:
@@ -544,7 +541,7 @@ def resolve_homedetails_with_bing_variants(address_variants, required_state=None
 
 def construct_deeplink_from_parts(street, city, state, zipc, defaults):
     c = (city or defaults.get("city","")).strip()
-    st_abbr = (state or defaults.get("state","")).strip()
+    st_abbr = (state or defaults.get("state","NC")).strip() or "NC"
     z = (zipc  or defaults.get("zip","")).strip()
     slug_parts = [street]; loc_parts = [p for p in [c, st_abbr] if p]
     if loc_parts: slug_parts.append(", ".join(loc_parts))
@@ -586,48 +583,45 @@ def _extract_addr_homespotter(html: str) -> Dict[str, str]:
             addr["street"] = title
     return addr
 
-# ---------- UPDATED: Resolve from arbitrary source URL with defaults (Force NC respected) ----------
+# ---------- Resolve from arbitrary source URL (NC forced) ----------
 def resolve_from_source_url(source_url: str, defaults: Dict[str,str]) -> Tuple[str, str]:
     final_url, html, _ = expand_url_and_fetch_html(source_url)
+
+    # MLS id (from HTML or URL)
     mls_id = extract_any_mls_id(html) or extract_mls_id_from_url(final_url) or extract_mls_id_from_url(source_url)
     if mls_id:
-        z1, _ = find_zillow_by_mls_with_confirmation(mls_id, required_state=defaults.get("state"))
+        z1, _ = find_zillow_by_mls_with_confirmation(mls_id, required_state="NC")
         if z1:
             return z1, ""
-    # Homespotter/IDX
+
+    # Homespotter/IDX: extract address then search Zillow with NC enforced
     if _is_homespotter_like(final_url):
         hs_addr = _extract_addr_homespotter(html)
         street = hs_addr.get("street","") or ""
         city   = hs_addr.get("city","") or ""
-        state  = hs_addr.get("state","") or "" or defaults.get("state","")
+        state  = hs_addr.get("state","") or "NC"
         zipc   = hs_addr.get("zip","") or ""
-        if street or (city and (state or defaults.get("state"))):
-            variants = generate_address_variants(street, city, state or defaults.get("state",""), zipc, defaults)
-            z2, _ = resolve_homedetails_with_bing_variants(
-                variants,
-                required_state=state or defaults.get("state") or None,
-                required_city=city or None,
-                mls_id=mls_id or None
-            )
-            if z2:
-                return z2, compose_query_address(street, city, state, zipc, defaults)
-            return construct_deeplink_from_parts(street or "", city, state, zipc, defaults), compose_query_address(street, city, state, zipc, defaults)
-    # Generic
+        variants = generate_address_variants(street, city, state, zipc, {"state":"NC"})
+        z2, _ = resolve_homedetails_with_bing_variants(
+            variants, required_state="NC", required_city=city or None, mls_id=mls_id or None
+        )
+        if z2:
+            return z2, compose_query_address(street, city, "NC", zipc, {"state":"NC"})
+        return construct_deeplink_from_parts(street or "", city, "NC", zipc, {"state":"NC"}), compose_query_address(street, city, "NC", zipc, {"state":"NC"})
+
+    # Generic page
     addr = extract_address_from_html(html)
     street = addr.get("street","") or ""
     city   = addr.get("city","") or ""
-    state  = addr.get("state","") or "" or defaults.get("state","")
+    state  = addr.get("state","") or "NC"
     zipc   = addr.get("zip","") or ""
-    if street or (city and (state or defaults.get("state"))):
-        variants = generate_address_variants(street or "", city, state, zipc, defaults)
-        z2, _ = resolve_homedetails_with_bing_variants(
-            variants,
-            required_state=state or defaults.get("state") or None,
-            required_city=city or None,
-            mls_id=mls_id or None
-        )
-        if z2:
-            return z2, compose_query_address(street, city, state, zipc, defaults)
+    variants = generate_address_variants(street or "", city, state or "NC", zipc, {"state":"NC"})
+    z2, _ = resolve_homedetails_with_bing_variants(
+        variants, required_state="NC", required_city=city or None, mls_id=mls_id or None
+    )
+    if z2:
+        return z2, compose_query_address(street, city, "NC", zipc, {"state":"NC"})
+
     # Title → Bing
     title = extract_title_or_desc(html)
     if title:
@@ -635,27 +629,30 @@ def resolve_from_source_url(source_url: str, defaults: Dict[str,str]) -> Tuple[s
             items = bing_search_items(q)
             for it in items:
                 u = it.get("url") or ""
-                if "/homedetails/" in u:
+                if "/homedetails/" in u and url_matches_city_state(u, None, "NC"):
                     return u, title
+
     # rb deeplink if we know something
     if city or state or street or title:
-        return construct_deeplink_from_parts(street or title or "", city, state, zipc, defaults), compose_query_address(street or title or "", city, state, zipc, defaults)
+        return construct_deeplink_from_parts(street or title or "", city, "NC", zipc, {"state":"NC"}), compose_query_address(street or title or "", city, "NC", zipc, {"state":"NC"})
+
+    # Fallback: expanded URL
     return final_url, ""
 
-# Primary resolver
+# Primary resolver (NC forced)
 def process_single_row(row, *, delay=0.5, land_mode=True, defaults=None,
                        require_state=True, mls_first=True, default_mls_name="", max_candidates=20):
-    defaults = defaults or {"city":"", "state":"", "zip":""}
+    defaults = {"city":"", "state":"NC", "zip":""}
     csv_photo = get_first_by_keys(row, PHOTO_KEYS)
     comp = extract_components(row)
     street_raw = comp["street_raw"]
     street_clean = clean_land_street(street_raw) if land_mode else street_raw
-    variants = generate_address_variants(street_raw, comp["city"], comp["state"] or defaults.get("state",""), comp["zip"], defaults)
+    variants = generate_address_variants(street_raw, comp["city"], comp["state"] or "NC", comp["zip"], defaults)
     if land_mode:
-        variants = list(dict.fromkeys(variants + generate_address_variants(street_clean, comp["city"], comp["state"] or defaults.get("state",""), comp["zip"], defaults)))
-    query_address = variants[0] if variants else compose_query_address(street_raw, comp["city"], comp["state"] or defaults.get("state",""), comp["zip"], defaults)
-    deeplink = construct_deeplink_from_parts(street_raw, comp["city"], comp["state"] or defaults.get("state",""), comp["zip"], defaults)
-    required_state_val = defaults.get("state") if require_state else None
+        variants = list(dict.fromkeys(variants + generate_address_variants(street_clean, comp["city"], comp["state"] or "NC", comp["zip"], defaults)))
+    query_address = variants[0] if variants else compose_query_address(street_raw, comp["city"], "NC", comp["zip"], defaults)
+    deeplink = construct_deeplink_from_parts(street_raw, comp["city"], "NC", comp["zip"], defaults)
+    required_state_val = "NC" if require_state else None
     required_city_val  = comp["city"] or defaults.get("city")
     zurl, status = None, "fallback"
     mls_id   = (comp.get("mls_id") or "").strip()
@@ -663,16 +660,16 @@ def process_single_row(row, *, delay=0.5, land_mode=True, defaults=None,
     if mls_first and mls_id:
         zurl, mtype = find_zillow_by_mls_with_confirmation(
             mls_id, required_state=required_state_val, required_city=required_city_val,
-            mls_name=mls_name, delay=min(delay, 0.6), require_match=require_state, max_candidates=max_candidates
+            mls_name=mls_name, delay=min(delay, 0.6), require_match=True, max_candidates=max_candidates
         )
         if zurl: status = "mls_match" if mtype == "mls_match" else "city_state_match"
     if not zurl:
         z = azure_search_first_zillow(query_address)
-        if z: zurl, status = z, "azure_hit"
+        if z and url_matches_city_state(z, required_city_val, "NC"): zurl, status = z, "azure_hit"
     if not zurl:
         zurl, mtype = resolve_homedetails_with_bing_variants(
-            variants, required_state=required_state_val, required_city=required_city_val,
-            mls_id=mls_id or None, delay=min(delay, 0.6), require_match=require_state
+            variants, required_state="NC", required_city=required_city_val,
+            mls_id=mls_id or None, delay=min(delay, 0.6), require_match=True
         )
         if zurl: status = "mls_match" if mtype == "mls_match" else "city_state_match"
     if not zurl:
@@ -1089,7 +1086,6 @@ def render_run_tab(state: dict):
         client_tag_raw = (selected_client["name"] if selected_client else "")
     with colK:
         campaign_tag_raw = st.text_input("Campaign tag (used when you log later)", value=datetime.utcnow().strftime("%Y%m%d"))
-        force_nc = st.checkbox("Force state to NC", value=True, help="Always treat these as North Carolina (affects search & matching).")
 
     c1, c2, c3, c4 = st.columns([1,1,1.25,1.45])
     with c1:
@@ -1158,13 +1154,13 @@ def render_run_tab(state: dict):
 
     bits = [f"**{count_pasted}** pasted"]
     if file is not None: bits.append(f"**{csv_count}** CSV")
-    st.caption(" • ".join(bits) + "  •  Paste short links or MLS pages too; we’ll resolve them to Zillow.")
+    st.caption(" • ".join(bits) + "  •  Paste short links or MLS pages too; we’ll resolve them to Zillow (NC enforced).")
 
     if show_preview and count_pasted:
         st.markdown("**Preview (pasted)** (first 5):")
         st.markdown("<ul class='link-list'>" + "\n".join([f"<li>{escape(p)}</li>" for p in lines_clean[:5]]) + ("<li>…</li>" if count_pasted > 5 else "") + "</ul>", unsafe_allow_html=True)
 
-    # POPPY RUN BUTTON
+    # RUN
     st.markdown('<div class="run-zone">', unsafe_allow_html=True)
     clicked = st.button("🚀 Run", use_container_width=True, key="__run_btn__")
     st.markdown('</div>', unsafe_allow_html=True)
@@ -1231,9 +1227,7 @@ def render_run_tab(state: dict):
                         unsafe_allow_html=True
                     )
 
-        # ============================
-        # Add to client (optional)
-        # ============================
+        # Add to client
         st.markdown("---")
         st.markdown("### Add to client (optional)")
 
@@ -1307,7 +1301,7 @@ def render_run_tab(state: dict):
                 st.error("Please paste at least one address or link and/or upload a CSV.")
                 st.stop()
 
-            defaults = {"city":"", "state":"NC" if force_nc else "", "zip":""}
+            defaults = {"city":"", "state":"NC", "zip":""}
             total = len(rows_in)
             results: List[Dict[str, Any]] = []
 
@@ -1352,6 +1346,7 @@ def render_run_tab(state: dict):
                 else:
                     r["display_url"] = display or base
 
+            # Mark duplicates & toured for the view client
             client_selected = bool(client_tag.strip())
             tour_map = get_tour_slug_map(client_tag) if client_selected else {}
             if client_selected:
@@ -1387,17 +1382,13 @@ def render_run_tab(state: dict):
             st.info("Paste addresses or links (or upload CSV), then click **Run**.")
 
     # ============================
-    # FIX PROPERTIES (re-run/upgrade)
+    # FIX PROPERTIES (re-run/upgrade) — NC enforced
     # ============================
     st.markdown("---")
     st.markdown("## Fix properties")
-    st.caption("Paste Zillow or IDX links to normalize/upgrade them. Uses **NC** by default when needed.")
+    st.caption("Paste Zillow or IDX links to normalize/upgrade them. **NC is enforced.**")
     fix_input = st.text_area("Paste links to fix (one per line)", height=140, key="__fix_props_input__")
-    colf1, colf2 = st.columns([1,1])
-    with colf1:
-        force_nc_fix = st.checkbox("Force state to NC (fix section)", value=True)
-    with colf2:
-        try_upgrade = st.checkbox("Try to upgrade to /homedetails/", value=True)
+    try_upgrade = st.checkbox("Try to upgrade to /homedetails/", value=True)
 
     if st.button("🔧 Fix / Re-run links", use_container_width=True, key="__fix_props_btn__"):
         lines = [ln.strip() for ln in (fix_input or "").splitlines() if ln.strip()]
@@ -1405,7 +1396,6 @@ def render_run_tab(state: dict):
             st.warning("No links to fix.")
         else:
             fixed = []
-            defaults_fix = {"city":"", "state":"NC" if force_nc_fix else "", "zip":""}
             prog = st.progress(0, text="Fixing…")
             for i, u in enumerate(lines, start=1):
                 best = u
@@ -1413,8 +1403,7 @@ def render_run_tab(state: dict):
                     if try_upgrade:
                         best = upgrade_to_homedetails_if_needed(u) or u
                     if "/homedetails/" not in (best or ""):
-                        # Try a proper resolve using our resolver (respects Force NC)
-                        z, _addr = resolve_from_source_url(best, defaults_fix)
+                        z, _addr = resolve_from_source_url(best, {"state":"NC"})
                         best = z or best
                         if try_upgrade and best:
                             best = upgrade_to_homedetails_if_needed(best)
