@@ -39,8 +39,10 @@ def _mk_parts(street_slug: str, city_slug: str, st: str, zipc: str) -> Dict[str,
         "postalCode": zipc,
     }
 
+# --------- Address text parser (single-string like "123 Main St, City, ST 12345") ---------
+_ADDR_LINE_RE = re.compile(r"(\d{1,7}[^,]+),\s*([A-Za-z .'\-]+),\s*([A-Z]{2})\s*(\d{5}(?:-\d{4})?)?")
 def _pick_address_from_text(txt: str) -> Optional[Dict[str, str]]:
-    m = re.search(r"(\d{1,6}[^,]+),\s*([A-Za-z .'-]+),\s*([A-Z]{2})\s*(\d{5}(?:-\d{4})?)?", txt)
+    m = _ADDR_LINE_RE.search(txt)
     if not m: return None
     return {
         "streetAddress": _titleish(m.group(1)),
@@ -150,17 +152,31 @@ def _addr_from_generic_json(soup) -> Optional[Dict[str, str]]:
     """
     Generic JSON hunter: scans ANY <script> for common address key patterns.
     Helps on idx.homespotter.com, MLS/IDX sites without JSON-LD.
+    Enhanced to support single-string "formattedAddress"/"fullAddress" fields.
     """
-    street_keys = ["streetAddress","address1","line1","addr1","address_line1","street"]
-    city_keys   = ["addressLocality","city","locality","municipality","town"]
-    state_keys  = ["addressRegion","state","stateCode","region","province"]
+    # Wider net of key names used across IDX templates
+    street_keys = ["streetAddress","address1","line1","addr1","address_line1","street","addressLine1"]
+    city_keys   = ["addressLocality","city","locality","municipality","town","cityName","addressCity","localityName"]
+    state_keys  = ["addressRegion","state","stateCode","region","province","stateOrProvince"]
     zip_keys    = ["postalCode","zip","zipCode","postal","postal_code"]
+    full_keys   = ["formattedAddress","displayAddress","fullAddress","address","propertyAddress"]
 
     best = None
     for tag in soup.find_all("script"):
-        txt = tag.string or tag.text or ""
-        if not txt or ("http" in txt and len(txt) > 200000):  # skip huge blobs with tons of urls
-            pass
+        txt = (tag.string or tag.text or "").strip()
+        if not txt:
+            continue
+
+        # 0) Try single-string first (formattedAddress etc.)
+        m_full = None
+        for fk in full_keys:
+            m_full = re.search(rf'"{fk}"\s*:\s*"([^"]+)"', txt, re.I)
+            if m_full:
+                cand = _pick_address_from_text(m_full.group(1))
+                if cand and _normalize(cand):
+                    return cand
+
+        # 1) Key-by-key extraction
         s = _first_match(txt, street_keys)
         c = _first_match(txt, city_keys)
         st = _first_match(txt, state_keys)
@@ -201,7 +217,7 @@ def _addr_from_redfin_json(soup) -> Optional[Dict[str, str]]:
                 data = json.loads(m.group(1)) if m else None
             except Exception:
                 data = None
-            if not data: 
+            if not data:
                 continue
             candidates = [
                 data.get("propertyInfo") or {},
@@ -253,6 +269,58 @@ def _addr_from_realtor_json(soup) -> Optional[Dict[str, str]]:
             }
     return None
 
+# --------- Homespotter/IDX targeted helpers ---------
+
+def _addr_from_homespotter_json(soup) -> Optional[Dict[str, str]]:
+    """
+    Many Homespotter pages (including idx.homespotter.com) expose either:
+      - "formattedAddress":"123 Main St, City, ST 12345"
+      - "displayAddress":"..."
+      - nested address objects with line1/city/state/zipCode
+    We scan scripts explicitly for those first.
+    """
+    # 1) Single string formatted address wins
+    for tag in soup.find_all("script"):
+        txt = (tag.string or tag.text or "").strip()
+        if not txt: continue
+        for key in ("formattedAddress","displayAddress","fullAddress","address"):
+            m = re.search(rf'"{key}"\s*:\s*"([^"]+)"', txt, re.I)
+            if m:
+                cand = _pick_address_from_text(m.group(1))
+                if cand and _normalize(cand):
+                    return cand
+
+    # 2) Object keys (line1/city/state/zip)
+    street_keys = ["line1","address1","streetAddress","addr1","addressLine1"]
+    city_keys   = ["city","addressLocality"]
+    state_keys  = ["state","stateCode","addressRegion"]
+    zip_keys    = ["zip","postalCode","zipCode"]
+    for tag in soup.find_all("script"):
+        txt = (tag.string or tag.text or "").strip()
+        if not txt: continue
+        s = _first_match(txt, street_keys)
+        c = _first_match(txt, city_keys)
+        st = _first_match(txt, state_keys)
+        zp = _first_match(txt, zip_keys)
+        if st and re.fullmatch(r"[A-Za-z]{2}", st): st = st.upper()
+        if s and c and st:
+            cand = {"streetAddress": s, "addressLocality": c, "addressRegion": st, "postalCode": (zp or "")}
+            if _normalize(cand): return cand
+
+    return None
+
+def _mls_id_from_url(u: str) -> Optional[str]:
+    if not u: return None
+    try:
+        # .../some-mls-name/10116790?...
+        m = re.search(r'/(\d{6,})(?:[/?#]|$)', u)
+        if m: return m.group(1)
+        m = re.search(r'(?i)(?:mls|listing|id|listing_id)=([A-Za-z0-9\-]{6,})', u)
+        if m: return m.group(1)
+    except Exception:
+        return None
+    return None
+
 # -------------------- Public API --------------------
 
 def extract_address(url: str, parse_html: bool = True, timeout: float = 12.0) -> Dict[str, Optional[str]]:
@@ -302,6 +370,8 @@ def extract_address(url: str, parse_html: bool = True, timeout: float = 12.0) ->
             return {**parts, "full": _normalize(parts), "source": "url-slug", "url_final": final_url}
         return {"full": None, "streetAddress": None, "addressLocality": None, "addressRegion": None, "postalCode": None, "source": "unknown", "url_final": final_url}
 
+    host = (urlparse(final_url).netloc or "").lower()
+
     # 1) JSON-LD
     a = _addr_from_ld_json(soup)
     if a and _normalize(a):
@@ -313,7 +383,6 @@ def extract_address(url: str, parse_html: bool = True, timeout: float = 12.0) ->
         return {**a, "full": _normalize(a), "source": "microdata", "url_final": final_url}
 
     # 3) Site-hinted JSON for majors
-    host = (urlparse(final_url).netloc or "").lower()
     if "redfin.com" in host:
         a = _addr_from_redfin_json(soup)
         if a and _normalize(a):
@@ -326,6 +395,12 @@ def extract_address(url: str, parse_html: bool = True, timeout: float = 12.0) ->
         a = _addr_from_realtor_json(soup)
         if a and _normalize(a):
             return {**a, "full": _normalize(a), "source": "site-json", "url_final": final_url}
+
+    # 3.5) Homespotter / IDX targeted
+    if "homespotter" in host:
+        a = _addr_from_homespotter_json(soup)
+        if a and _normalize(a):
+            return {**a, "full": _normalize(a), "source": "homespotter-json", "url_final": final_url}
 
     # 4) Generic JSON hunter (works for many IDX pages incl. Homespotter)
     a = _addr_from_generic_json(soup)
