@@ -1,5 +1,5 @@
 # ui/run_tab.py
-# Exports: render_run_tab()
+# Exports: render_run_tab(**kwargs)
 # Import-safe: only stdlib at top level. Non-stdlib imports happen inside the function.
 
 import re, json
@@ -212,12 +212,12 @@ def extract_address(url: str, parse_html: bool = True, timeout: float = 12.0) ->
         return {"full": None, "streetAddress": None, "addressLocality": None, "addressRegion": None, "postalCode": None, "source": "unknown", "url_final": url}
 
     try:
-        resp = requests.Session()
-        resp.headers.update({
+        sess = requests.Session()
+        sess.headers.update({
             "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
             "Accept-Language": "en-US,en;q=0.9",
         })
-        r = resp.get(url, allow_redirects=True, timeout=timeout)
+        r = sess.get(url, allow_redirects=True, timeout=timeout)
         r.raise_for_status()
         final_url = r.url
     except Exception:
@@ -285,9 +285,14 @@ def address_as_markdown_link(url: str, label: Optional[str] = None, parse_html: 
 
 # -------------------- EXPORTED TAB (lazy-imports all heavy deps) --------------------
 
-def render_run_tab() -> None:
-    # Lazy import streamlit to avoid import-time errors if Streamlit isn’t ready yet
+def render_run_tab(**kwargs) -> None:
+    """
+    Entry point called by app.py. Accepts arbitrary kwargs (e.g., state=st.session_state).
+    """
     import streamlit as st
+
+    # Accept but don't require external state
+    state = kwargs.get("state", st.session_state)
 
     st.title("Address Alchemist — Run")
     st.caption("Paste addresses or listing URLs. We’ll render clean address-as-links and (optionally) log sends.")
@@ -300,8 +305,11 @@ def render_run_tab() -> None:
     with c2:
         show_markdown = st.checkbox("Show Markdown list", value=True)
     with c3:
-        parse_html = st.checkbox("Parse from page HTML (JSON-LD/site JSON)", value=True,
-                                 help="If off, falls back to URL slug only (works for many Redfin/Trulia/Zillow/Homes URLs).")
+        parse_html = st.checkbox(
+            "Parse from page HTML (JSON-LD/site JSON)",
+            value=True,
+            help="If off, falls back to URL slug only (works for many Redfin/Trulia/Zillow/Homes URLs)."
+        )
 
     results: List[Dict[str, Any]] = []
 
@@ -345,7 +353,6 @@ def render_run_tab() -> None:
                 import pandas as pd
                 st.dataframe(pd.DataFrame(results)[["address","url_final","source","input"]])
             except Exception:
-                # pandas is optional; degrade gracefully
                 for r in results:
                     st.write(r)
 
