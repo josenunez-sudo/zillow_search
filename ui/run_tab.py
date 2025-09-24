@@ -1,49 +1,31 @@
 # ui/run_tab.py
-# Run tab with: hyperlink results as address text (Big 5: Zillow/Redfin/Realtor/Trulia/Homes + l.hms.pt),
-# clickable thumbnails, and an address parser with graceful fallbacks.
-#
-# NOTE:
-# - This file is self-contained. No extra module needed.
-# - If BeautifulSoup isn't available, parser falls back to URL-slug extraction (still works for most Redfin/Trulia/Zillow/Homes).
-# - To disable address parsing, set ENABLE_ADDRESS_FROM_LINK = False.
+# Run tab with: address-as-link parsing for Zillow/Redfin/Realtor/Trulia/Homes + short links (e.g., l.hms.pt),
+# plus a simple UI. Exports: render_run_tab(st).
 
-import os, csv, io, re, time, json, asyncio
-from datetime import datetime
+import os, re, json
 from typing import List, Dict, Any, Optional, Tuple
-from html import escape
 from urllib.parse import urlparse, unquote
 
 import requests
-import httpx
 import streamlit as st
-import streamlit.components.v1 as components
 
 # ---------- Optional deps ----------
 try:
-    import usaddress  # noqa: F401
-except Exception:
-    usaddress = None
-
-try:
     from bs4 import BeautifulSoup  # type: ignore
 except Exception:
-    BeautifulSoup = None  # gracefully degrade
+    BeautifulSoup = None  # graceful degrade if bs4 isn't installed
 
-# ---------- Rerun helper ----------
-def _safe_rerun():
-    try:
-        st.rerun()
-    except Exception:
-        try:
-            st.experimental_rerun()
-        except Exception:
-            pass
-
-# ---------- Supabase ----------
-from supabase import create_client, Client
+# ---------- Supabase (kept lightweight; only if you already use it elsewhere) ----------
+try:
+    from supabase import create_client, Client
+except Exception:
+    create_client = None
+    Client = None
 
 @st.cache_resource
-def get_supabase() -> Optional[Client]:
+def get_supabase() -> Optional["Client"]:
+    if not create_client:
+        return None
     try:
         url = os.getenv("SUPABASE_URL", st.secrets.get("SUPABASE_URL", ""))
         key = os.getenv("SUPABASE_SERVICE_ROLE", st.secrets.get("SUPABASE_SERVICE_ROLE", ""))
@@ -55,10 +37,10 @@ def get_supabase() -> Optional[Client]:
 
 
 # =====================================================================================
-#                           ADDRESS PARSER (Drop-in)
+#                           ADDRESS PARSER (self-contained)
 # =====================================================================================
 
-ENABLE_ADDRESS_FROM_LINK = True
+ENABLE_ADDRESS_FROM_LINK_DEFAULT = True
 
 _UA = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
@@ -169,7 +151,7 @@ def _addr_from_redfin_json(soup) -> Optional[Dict[str, str]]:
         if "__REDUX_STATE__" in txt:
             try:
                 m = re.search(r"__REDUX_STATE__\s*=\s*({.*?})\s*;", txt, re.S)
-                if not m: 
+                if not m:
                     continue
                 data = json.loads(m.group(1))
             except Exception:
@@ -238,7 +220,6 @@ def _addr_from_url_slug(url: str) -> Optional[Dict[str, str]]:
             return _mk_parts(m.group(1), m.group(2), m.group(3), m.group(4))
 
     if "redfin.com" in host:
-        # /NC/Raleigh/721-Currituck-Dr-27609/home/...
         m1 = re.search(r"^/([A-Z]{2})/([^/]+)/([\w\-]+)-(\d{5})(?:/|$)", path, re.I)
         if m1:
             st_ = m1.group(1).upper()
@@ -248,13 +229,11 @@ def _addr_from_url_slug(url: str) -> Optional[Dict[str, str]]:
             return {"streetAddress": street, "addressLocality": city, "addressRegion": st_, "postalCode": zipc}
 
     if "trulia.com" in host:
-        # /home/721-currituck-dr-raleigh-nc-27609
         m = re.search(r"/home/([\w\-]+)-([a-z ]+)-([a-z]{2})-(\d{5})", path, re.I)
         if m:
             return _mk_parts(m.group(1), m.group(2), m.group(3), m.group(4))
 
     if "homes.com" in host:
-        # /raleigh-nc/721-currituck-dr-27609
         m = re.search(r"/([a-z\-]+)-([a-z]{2})/([\w\-]+)-(\d{5})", path, re.I)
         if m:
             city = _titleish(m.group(1).replace("-", " "))
@@ -263,7 +242,7 @@ def _addr_from_url_slug(url: str) -> Optional[Dict[str, str]]:
             zipc = m.group(4)
             return {"streetAddress": street, "addressLocality": city, "addressRegion": st_, "postalCode": zipc}
 
-    # Realtor.com rarely encodes address in URL
+    # Realtor.com usually needs JSON.
     return None
 
 def _mk_parts(street_slug: str, city_slug: str, st: str, zipc: str) -> Dict[str, str]:
@@ -274,23 +253,26 @@ def _mk_parts(street_slug: str, city_slug: str, st: str, zipc: str) -> Dict[str,
         "postalCode": zipc,
     }
 
-def extract_address(url: str, timeout: float = 12.0) -> Dict[str, Optional[str]]:
+def extract_address(url: str, parse_html: bool = True, timeout: float = 12.0) -> Dict[str, Optional[str]]:
     """
-    Resolve a listing URL (incl. short links) to an address dict with:
+    Resolve a listing URL (incl. short links) to:
     full, streetAddress, addressLocality, addressRegion, postalCode, source, url_final
     """
+    # Try HTTP fetch + redirects
     try:
         resp = _SESSION.get(url, allow_redirects=True, timeout=timeout)
         resp.raise_for_status()
     except Exception:
-        # network error → fallback to slug parsing on original url
+        # network error → fallback to slug parsing on original URL
         parts = _addr_from_url_slug(url)
         if parts and _normalize(parts):
             return {**parts, "full": _normalize(parts), "source": "url-slug", "url_final": url}
         return {"full": None, "streetAddress": None, "addressLocality": None, "addressRegion": None, "postalCode": None, "source": "unknown", "url_final": url}
 
     final_url = resp.url
-    if not ENABLE_ADDRESS_FROM_LINK or not BeautifulSoup:
+
+    # If no BeautifulSoup or parsing disabled, slug fallback only
+    if not parse_html or not BeautifulSoup:
         parts = _addr_from_url_slug(final_url)
         if parts and _normalize(parts):
             return {**parts, "full": _normalize(parts), "source": "url-slug", "url_final": final_url}
@@ -331,8 +313,8 @@ def extract_address(url: str, timeout: float = 12.0) -> Dict[str, Optional[str]]
 
     return {"full": None, "streetAddress": None, "addressLocality": None, "addressRegion": None, "postalCode": None, "source": "unknown", "url_final": final_url}
 
-def address_as_markdown_link(url: str, label: Optional[str] = None, timeout: float = 12.0) -> Tuple[str, Dict[str, Optional[str]]]:
-    info = extract_address(url, timeout=timeout)
+def address_as_markdown_link(url: str, label: Optional[str] = None, parse_html: bool = True, timeout: float = 12.0) -> Tuple[str, Dict[str, Optional[str]]]:
+    info = extract_address(url, parse_html=parse_html, timeout=timeout)
     text = label or info.get("full")
     if not text:
         text = urlparse(info.get("url_final") or url).netloc or "Listing"
@@ -340,84 +322,89 @@ def address_as_markdown_link(url: str, label: Optional[str] = None, timeout: flo
 
 
 # =====================================================================================
-#                           YOUR EXISTING UI / LOGIC
+#                              EXPORTED TAB RENDERER
 # =====================================================================================
 
-st.title("Address Alchemist — Run")
-st.caption("Paste addresses *or* listing links. We’ll render clean address-as-links and log sends.")
+def render_run_tab() -> None:
+    """Entry point called by app.py"""
+    st.title("Address Alchemist — Run")
+    st.caption("Paste addresses *or* listing links. We’ll render clean address-as-links and log sends.")
 
-# Example: paste URLs or addresses
-input_text = st.text_area("Paste addresses or listing URLs", height=140, placeholder="One per line…")
+    input_text = st.text_area("Paste addresses or listing URLs", height=140, placeholder="One per line…")
 
-colA, colB = st.columns([1,1])
-with colA:
-    do_parse = st.button("Run")
-with colB:
-    as_markdown = st.checkbox("Show as Markdown list", value=True)
+    c1, c2, c3 = st.columns([1,1,1])
+    with c1:
+        do_parse = st.button("Run")
+    with c2:
+        show_markdown = st.checkbox("Show Markdown list", value=True)
+    with c3:
+        enable_html_parsing = st.checkbox(
+            "Parse from page HTML (JSON-LD/site JSON)",
+            value=ENABLE_ADDRESS_FROM_LINK_DEFAULT and bool(BeautifulSoup),
+            help="If off (or bs4 not installed), falls back to URL slug only."
+        )
 
-# Optional: exposure of the toggle in UI
-ENABLE_ADDRESS_FROM_LINK = st.toggle("Parse address from listing pages (Big 5 + short links)", value=ENABLE_ADDRESS_FROM_LINK, help="If off, we only use the URL slug fallback.")
+    results: List[Dict[str, Any]] = []
 
-# --- Example result builder (non-destructive; integrate into your existing pipeline) ---
+    def _looks_like_url(s: str) -> bool:
+        return bool(re.match(r"^https?://", s.strip(), re.I))
 
-def _looks_like_url(s: str) -> bool:
-    return bool(re.match(r"^https?://", s.strip(), re.I))
+    def _clean_lines(block: str) -> List[str]:
+        return [ln.strip() for ln in (block or "").splitlines() if ln.strip()]
 
-def _clean_lines(block: str) -> List[str]:
-    return [ln.strip() for ln in (block or "").splitlines() if ln.strip()]
+    if do_parse:
+        lines = _clean_lines(input_text)
+        for raw in lines:
+            if _looks_like_url(raw):
+                link_md, info = address_as_markdown_link(raw, parse_html=enable_html_parsing)
+                results.append({
+                    "input": raw,
+                    "type": "url",
+                    "address": info.get("full"),
+                    "source": info.get("source"),
+                    "url_final": info.get("url_final"),
+                    "link_md": link_md
+                })
+            else:
+                # raw address passthrough (you can add your own normalization here)
+                results.append({
+                    "input": raw,
+                    "type": "address",
+                    "address": raw,
+                    "source": "manual",
+                    "url_final": None,
+                    "link_md": raw
+                })
 
-results: List[Dict[str, Any]] = []
-
-if do_parse:
-    lines = _clean_lines(input_text)
-    for raw in lines:
-        if _looks_like_url(raw):
-            link_md, info = address_as_markdown_link(raw)
-            results.append({
-                "input": raw,
-                "type": "url",
-                "address": info.get("full"),
-                "source": info.get("source"),
-                "url_final": info.get("url_final"),
-                "link_md": link_md
-            })
+        st.subheader("Results")
+        if show_markdown:
+            st.markdown("\n".join(
+                f"- {r['link_md'] if r['type']=='url' else r['address']}"
+                for r in results
+            ))
         else:
-            # treat as raw address — you can keep your existing normalization here
-            results.append({
-                "input": raw,
-                "type": "address",
-                "address": raw,
-                "source": "manual",
-                "url_final": None,
-                "link_md": raw
-            })
+            import pandas as pd
+            st.dataframe(pd.DataFrame(results)[["address","url_final","source","input"]])
 
-    # Render
-    st.subheader("Results")
-    if as_markdown:
-        st.markdown("\n".join(
-            f"- {r['link_md'] if r['type']=='url' else r['address']}"
-            for r in results
-        ))
-    else:
-        import pandas as pd
-        st.dataframe(pd.DataFrame(results)[["address","url_final","source","input"]])
+    # (Optional) Use get_supabase() here if you want to insert logs into your `sent` table.
+    # For example:
+    # sb = get_supabase()
+    # if sb and do_parse:
+    #     for r in results:
+    #         if r["type"] == "url" and r["address"]:
+    #             try:
+    #                 sb.table("sent").insert({
+    #                     "client": "inline",  # replace with your client key
+    #                     "campaign": None,
+    #                     "url": r["url_final"],
+    #                     "canonical": None,
+    #                     "zpid": None,
+    #                     "mls_id": None,
+    #                     "address": r["address"],
+    #                 }).execute()
+    #             except Exception:
+    #                 pass
 
-# =====================================================================================
-#                       (OPTIONAL) HOOK INTO YOUR SEND / LOGGING
-# =====================================================================================
 
-# If you already write to Supabase `sent` table, keep that code.
-# Wherever you currently turn URLs into links for the client,
-# replace your previous renderer with `address_as_markdown_link(url)` so the anchor text is the address.
-#
-# Example (pseudo):
-#
-# def make_client_row(url_or_addr):
-#     if url_or_addr.startswith("http"):
-#         link_md, info = address_as_markdown_link(url_or_addr)
-#         return link_md, info
-#     else:
-#         return url_or_addr, {"source": "manual"}
-#
-# Then use `link_md` anywhere you previously showed “Open Zillow”.
+# Optional explicit export list (helps certain import linters)
+__all__ = ["render_run_tab", "extract_address", "address_as_markdown_link"]
