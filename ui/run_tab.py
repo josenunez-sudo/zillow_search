@@ -20,9 +20,10 @@ except Exception:
 
 # ---------- Optional address parser import (safe fallback) ----------
 try:
-    from utils.address_parser import address_as_markdown_link  # uses your new module
+    # from utils/address_parser.py you added
+    from utils.address_parser import address_as_markdown_link
 except Exception:
-    address_as_markdown_link = None  # degrade gracefully if missing
+    address_as_markdown_link = None  # degrade gracefully if module isn't present
 
 # ---------- Rerun helper ----------
 def _safe_rerun():
@@ -453,39 +454,70 @@ def construct_deeplink_from_parts(street, city, state, zipc, defaults):
     a = slug.lower(); a = re.sub(r"[^\w\s,-]", "", a).replace(",", ""); a = re.sub(r"\s+", "-", a.strip())
     return f"https://www.zillow.com/homes/{a}_rb/"
 
-# Resolve from arbitrary source URL
-def resolve_from_source_url(source_url: str, defaults: Dict[str,str]) -> Tuple[str, str]:
-    final_url, html, _ = expand_url_and_fetch_html(source_url)
-    mls_id = extract_any_mls_id(html)
+# ---------- Robust address anchor (cached) ----------
+@st.cache_data(ttl=1800, show_spinner=False)
+def _address_text_for_url(url: str) -> str:
+    if not address_as_markdown_link or not url:
+        return ""
+    try:
+        _md, info = address_as_markdown_link(url, parse_html=True)
+        return (info.get("full") or "").strip()
+    except Exception:
+        return ""
 
-    # NEW: try to pull MLS-like id from the final URL path (helps on idx.homespotter.com/.../tmlspar/10116790)
+# ---------- Resolve from arbitrary source URL (updated to force Zillow deeplink when address is found) ----------
+def resolve_from_source_url(source_url: str, defaults: Dict[str,str]) -> Tuple[str, str]:
+    """
+    Try (in order):
+      1) MLS->Zillow via Bing (if we can extract an MLS id)
+      2) Parse address robustly (utils.address_parser) from the final page HTML
+         and build a Zillow deeplink (then later upgrade to /homedetails/)
+      3) Title/description search for a homedetails URL
+      4) Last resort: return the final source URL
+    """
+    final_url, html, _ = expand_url_and_fetch_html(source_url)
+
+    # 1) MLS id from HTML or URL tail (e.g. idx.homespotter.com/.../10116790)
+    mls_id = extract_any_mls_id(html)
     if not mls_id:
         m = re.search(r"/([A-Za-z0-9]{6,})/?$", final_url)
         if m:
             mls_id = m.group(1)
-
     if mls_id:
         z1, _ = find_zillow_by_mls_with_confirmation(mls_id)
-        if z1: return z1, ""
-    addr = extract_address_from_html(html)
-    street = addr.get("street","") or ""
-    city, state, zipc = addr.get("city",""), addr.get("state",""), addr.get("zip","")
+        if z1:
+            return z1, ""
+
+    # 2) Robust HTML parsing for address (works on many IDX including Homespotter)
+    street = city = state = zipc = ""
+    if address_as_markdown_link:
+        try:
+            _md, info = address_as_markdown_link(final_url, parse_html=True)
+            street = (info.get("streetAddress") or "").strip()
+            city   = (info.get("addressLocality") or "").strip()
+            state  = (info.get("addressRegion") or "").strip()
+            zipc   = (info.get("postalCode") or "").strip()
+        except Exception:
+            pass
     if street or (city and state):
-        variants = generate_address_variants(street or "", city, state, zipc, defaults)
-        z2, _ = resolve_homedetails_with_bing_variants(variants, required_state=state or None, required_city=city or None)
-        if z2: return z2, compose_query_address(street, city, state, zipc, defaults)
+        used_addr = compose_query_address(street, city, state, zipc, defaults)
+        zurl = construct_deeplink_from_parts(street or used_addr, city, state, zipc, defaults)
+        return zurl, used_addr
+
+    # 3) Title/description → Bing search for homedetails link
     title = extract_title_or_desc(html)
     if title:
         for q in [f'"{title}" site:zillow.com/homedetails', f'{title} site:zillow.com']:
             items = bing_search_items(q)
             for it in items:
                 u = it.get("url") or ""
-                if "/homedetails/" in u: return u, title
-    if city or state or street:
-        return construct_deeplink_from_parts(street or title or "", city, state, zipc, defaults), compose_query_address(street or title or "", city, state, zipc, defaults)
+                if "/homedetails/" in u:
+                    return u, title
+
+    # 4) Last resort: original final URL
     return final_url, ""
 
-# Primary resolver
+# ---------- Primary resolver ----------
 def process_single_row(row, *, delay=0.5, land_mode=True, defaults=None,
                        require_state=True, mls_first=True, default_mls_name="", max_candidates=20):
     defaults = defaults or {"city":"", "state":"", "zip":""}
@@ -523,7 +555,7 @@ def process_single_row(row, *, delay=0.5, land_mode=True, defaults=None,
     time.sleep(min(delay, 0.4))
     return {"input_address": query_address, "mls_id": mls_id, "zillow_url": zurl, "status": status, "csv_photo": csv_photo}
 
-# Enrichment
+# ---------- Enrichment ----------
 RE_PRICE  = re.compile(r'"(?:price|unformattedPrice|priceZestimate)"\s*:\s*"?\$?([\d,]+)"?', re.I)
 RE_STATUS = re.compile(r'"(?:homeStatus|statusText)"\s*:\s*"([^"]+)"', re.I)
 RE_BEDS   = re.compile(r'"(?:bedrooms|beds)"\s*:\s*(\d+)', re.I)
@@ -653,17 +685,6 @@ def picture_for_result_with_log(query_address: str, zurl: str, csv_photo_url: Op
 @st.cache_data(ttl=900, show_spinner=False)
 def get_thumbnail_and_log(query_address: str, zurl: str, csv_photo_url: Optional[str]):
     return picture_for_result_with_log(query_address, zurl, csv_photo_url)
-
-# ---------- Cached helper to fetch address text for a URL ----------
-@st.cache_data(ttl=1800, show_spinner=False)
-def _address_text_for_url(url: str) -> str:
-    if not address_as_markdown_link or not url:
-        return ""
-    try:
-        _md, info = address_as_markdown_link(url, parse_html=True)
-        return (info.get("full") or "").strip()
-    except Exception:
-        return ""
 
 # ---------- Tracking + Bitly ----------
 def make_trackable_url(url: str, client_tag: str, campaign_tag: str) -> str:
@@ -836,7 +857,9 @@ def build_output(rows: List[Dict[str, Any]], fmt: str, use_display: bool = True,
         fields = ["input_address","mls_id","url","status","price","beds","baths","sqft","already_sent","dup_reason","dup_sent_at","toured","toured_date","toured_start","toured_end"]
         if include_notes:
             fields += ["summary","highlights","remarks"]
-        s = io.StringIO(); w = csv.DictWriter(s); w.writeheader()
+        s = io.StringIO()
+        w = csv.DictWriter(s, fieldnames=fields)
+        w.writeheader()
         for r in rows:
             row = {k: r.get(k) for k in fields if k != "url"}
             row["url"] = pick_url(r)
@@ -865,12 +888,11 @@ def _dedupe_results_for_logging(results: List[Dict[str,Any]]) -> List[Dict[str,A
         url = (r.get("preview_url") or r.get("zillow_url") or r.get("display_url") or "").strip()
         c, z = canonicalize_zillow(url) if url else ("","")
         key = c or z or url
-        if not key:  # skip empties
+        if not key:
             continue
         if key in seen:
             continue
         seen.add(key)
-        # stash the canon/zpid so log_sent_rows doesn't need to recompute
         r = dict(r)
         if c: r["canonical"] = c
         if z: r["zpid"] = z
@@ -994,12 +1016,12 @@ def render_run_tab(state: dict):
                 continue
             safe_href = escape(href)
 
-            # Compute anchor text (address) if enabled
+            # Anchor text (address) if enabled
             if use_address_anchor and address_as_markdown_link:
                 address_txt = _address_text_for_url(href)
                 link_txt = address_txt or href
             else:
-                link_txt = href  # keep URL text (old behavior)
+                link_txt = href  # default to URL text
 
             # Badges: duplicate/new + toured
             badge_html = ""
@@ -1279,16 +1301,41 @@ def render_run_tab(state: dict):
 
             st.success(f"Processed {len(results)} item(s)" + (f" — CSV rows read: {csv_count}" if file is not None else ""))
 
-            _render_results_and_downloads(results, client_tag, campaign_tag, include_notes=enrich_details, client_selected=client_selected)
+            # Render results/downloads
+            def _render_results_and_downloads(results: List[Dict[str, Any]], client_tag: str, campaign_tag: str, include_notes: bool, client_selected: bool):
+                st.markdown("#### Results")
+                results_list_with_copy_all(results, client_selected=client_selected)
 
-        except Exception as e:
-            st.error("We hit an error while processing.")
-            with st.expander("Details"): st.exception(e)
+                # Optional table
+                if table_view:
+                    import pandas as pd
+                    cols = ["already_sent","dup_reason","dup_sent_at","toured","toured_date","toured_start","toured_end",
+                            "display_url","zillow_url","preview_url","status","price","beds","baths","sqft","mls_id","input_address"]
+                    df = pd.DataFrame([{c: r.get(c) for c in cols} for r in results])
+                    st.dataframe(df, use_container_width=True, hide_index=True)
 
-    data = st.session_state.get("__results__") or {}
-    results = data.get("results") or []
-    if results and not clicked:
-        _render_results_and_downloads(results, client_tag, campaign_tag, include_notes=False, client_selected=bool(client_tag.strip()))
-    else:
-        if not clicked:
-            st.info("Paste addresses or links (or upload CSV), then click **Run**.")
+                # ---- Download
+                fmt_options = ["txt","csv","md","html"]
+                prev_fmt = (st.session_state.get("__results__") or {}).get("fmt")
+                default_idx = fmt_options.index(prev_fmt) if prev_fmt in fmt_options else 0
+                fmt = st.selectbox("Download format", fmt_options, index=default_idx)
+                payload, mime = build_output(results, fmt, use_display=True, include_notes=include_notes)
+                ts = datetime.utcnow().strftime("%Y%m%d%H%M%S")
+                tag = ("_" + re.sub(r'[^a-z0-9\-]+','', (client_tag or "").lower().replace(" ","-"))) if client_tag else ""
+                st.download_button("Export", data=payload, file_name=f"address_alchemist{tag}_{ts}.{fmt}", mime=mime, use_container_width=True)
+                st.session_state["__results__"] = {"results": results, "fmt": fmt}
+
+                # ---- Thumbnails grid
+                thumbs=[]
+                for r in results:
+                    img = r.get("image_url")
+                    if not img:
+                        img, _ = get_thumbnail_and_log(r.get("input_address",""), r.get("preview_url") or r.get("zillow_url") or "", r.get("csv_photo"))
+                    if img: thumbs.append((r,img))
+                if thumbs:
+                    st.markdown("#### Images")
+                    cols = st.columns(3)
+                    for i,(r,img) in enumerate(thumbs):
+                        with cols[i%3]:
+                            mls_id = (r.get("mls_id") or "").strip()
+                            addr = (r.get("input_address
