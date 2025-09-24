@@ -295,7 +295,7 @@ def delete_client(client_id: int):
     except Exception as e:
         return False, str(e)
 
-# NEW: upsert_client helper
+# >>> ADDED: insert-or-update used by Run tab's “Add new client…” <<<
 def upsert_client(name: str, active: bool = True):
     """Insert-or-update a client by normalized name, used by Run tab's 'Add new client…' flow."""
     SUPABASE = get_supabase()
