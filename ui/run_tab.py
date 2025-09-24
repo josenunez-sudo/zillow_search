@@ -18,7 +18,7 @@ try:
 except Exception:
     usaddress = None
 
-# ---------- NEW: optional address parser import (safe fallback) ----------
+# ---------- Optional address parser import (safe fallback) ----------
 try:
     from utils.address_parser import address_as_markdown_link  # uses your new module
 except Exception:
@@ -457,6 +457,13 @@ def construct_deeplink_from_parts(street, city, state, zipc, defaults):
 def resolve_from_source_url(source_url: str, defaults: Dict[str,str]) -> Tuple[str, str]:
     final_url, html, _ = expand_url_and_fetch_html(source_url)
     mls_id = extract_any_mls_id(html)
+
+    # NEW: try to pull MLS-like id from the final URL path (helps on idx.homespotter.com/.../tmlspar/10116790)
+    if not mls_id:
+        m = re.search(r"/([A-Za-z0-9]{6,})/?$", final_url)
+        if m:
+            mls_id = m.group(1)
+
     if mls_id:
         z1, _ = find_zillow_by_mls_with_confirmation(mls_id)
         if z1: return z1, ""
@@ -647,13 +654,12 @@ def picture_for_result_with_log(query_address: str, zurl: str, csv_photo_url: Op
 def get_thumbnail_and_log(query_address: str, zurl: str, csv_photo_url: Optional[str]):
     return picture_for_result_with_log(query_address, zurl, csv_photo_url)
 
-# ---------- NEW: cached helper to fetch address text for a URL ----------
+# ---------- Cached helper to fetch address text for a URL ----------
 @st.cache_data(ttl=1800, show_spinner=False)
 def _address_text_for_url(url: str) -> str:
     if not address_as_markdown_link or not url:
         return ""
     try:
-        # We only need the text; link comes from our own href
         _md, info = address_as_markdown_link(url, parse_html=True)
         return (info.get("full") or "").strip()
     except Exception:
@@ -916,7 +922,7 @@ def render_run_tab(state: dict):
 
     table_view = st.checkbox("Show results as table", value=False, help="Easier to scan details")
 
-    # ---------- NEW: toggle to use address text as anchor ----------
+    # Toggle to use address text as anchor
     use_address_anchor = st.checkbox("Use address as link text", value=True, help="Anchor text shows the parsed address; copied URLs stay the same.")
 
     client_tag = _norm_tag(client_tag_raw)
@@ -988,9 +994,8 @@ def render_run_tab(state: dict):
                 continue
             safe_href = escape(href)
 
-            # ---------- NEW: compute anchor text (address) if enabled ----------
+            # Compute anchor text (address) if enabled
             if use_address_anchor and address_as_markdown_link:
-                # cached function keeps this snappy
                 address_txt = _address_text_for_url(href)
                 link_txt = address_txt or href
             else:
@@ -1125,7 +1130,7 @@ def render_run_tab(state: dict):
                     )
 
         # ============================
-        # NEW: Add to client (optional)
+        # Add to client (optional)
         # ============================
         st.markdown("---")
         st.markdown("### Add to client (optional)")
