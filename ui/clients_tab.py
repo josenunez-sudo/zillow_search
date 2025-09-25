@@ -133,28 +133,37 @@ def _street_only(addr: str) -> str:
     return a
 
 def _property_key(row: Dict[str, Any]) -> str:
+    """
+    Dedup priority:
+      1) street-only normalized 'address' (most reliable across sources)
+      2) Zillow slug from URL (when present)
+      3) canonical
+      4) zpid
+      5) full URL
+    """
     url = (row.get("url") or "").strip()
     addr_raw = (row.get("address") or "").strip() or _address_text_from_url(url)
 
-    # Prefer slug from Zillow URL when available
+    # 1) Strong address-first key
+    if addr_raw:
+        street = _street_only(addr_raw)
+        if street:
+            sslug = _norm_slug_from_text(street)
+            if sslug:
+                return "saddr::" + sslug
+
+    # 2) Zillow slug from URL
     norm_from_url = _norm_slug_from_url(url)
     if norm_from_url:
         return "normslug::" + norm_from_url
 
-    # Strong, symmetric: slug from street-only address
-    street = _street_only(addr_raw)
-    if street:
-        norm_pslug = _norm_slug_from_text(street)
-        if norm_pslug:
-            return "normslug::" + norm_pslug
-
-    # Canonical/zpid fallbacks
+    # 3) canonical / 4) zpid
     canon = (row.get("canonical") or "").strip().lower()
     if canon: return "canon::" + canon
     zpid = (row.get("zpid") or "").strip()
     if zpid: return "zpid::" + zpid
 
-    # Last resort
+    # 5) Last resort — URL
     return "url::" + (url.lower())
 
 def _qp_get(name, default=None):
@@ -536,8 +545,8 @@ def _render_client_report_view(client_display_name: str, client_norm: str):
         # Single DATE tag (YYYYMMDD)
         date_tag = _pick_timestamp_date_tag(r)
 
-        # Toured badge (once) — use street-only normalization to match tours
-        norm_pslug = _norm_slug_from_url(url) or _norm_slug_from_text(_street_only(addr))
+        # Toured badge (once) — key based on street-only normalization
+        norm_pslug = _norm_slug_from_text(_street_only(addr))
         toured = norm_pslug in tour_norm_slugs
 
         meta: List[str] = []
