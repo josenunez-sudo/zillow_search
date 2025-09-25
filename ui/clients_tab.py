@@ -1,5 +1,8 @@
 # ui/clients_tab.py
-import os, re, io
+# -*- coding: utf-8 -*-
+import os
+import re
+import io
 from datetime import datetime
 from html import escape
 from typing import List, Dict, Any, Optional, Tuple
@@ -11,12 +14,12 @@ try:
     from supabase import create_client, Client
 except Exception:
     create_client = None
-    Client = Any  # type: ignore
+    from typing import Any as _Any
+    Client = _Any  # type: ignore
 
 DEBUG_REPORT = False  # set True if you want to see per-row debug info
 
-
-# ================= Basics (pure helpers; safe at import time) =================
+# ================= Basics =================
 def _norm_tag(s: str) -> str:
     return re.sub(r"\s+", " ", (s or "").strip()).lower()
 
@@ -210,13 +213,13 @@ def _candidate_keys(row: Dict[str, Any]) -> List[str]:
     if zslug: keys.append("zslug::" + zslug)
 
     if sslug and z5:
-        keys.append(f"addrzip::{sslug}::{z5}")
+        keys.append("addrzip::{}::{}".format(sslug, z5))
     if sslug and cslug and st2:
-        keys.append(f"addrcs::{sslug}::{cslug}::{st2}")
+        keys.append("addrcs::{}::{}::{}".format(sslug, cslug, st2))
     if sslug and cslug and not st2:
-        keys.append(f"addrc::{sslug}::{cslug}")
+        keys.append("addrc::{}::{}".format(sslug, cslug))
     if sslug:
-        keys.append(f"addr::{sslug}")
+        keys.append("addr::{}".format(sslug))
 
     if url:
         keys.append("url::" + url.lower())
@@ -260,7 +263,7 @@ def _dedupe_by_property(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         for c in cands:
             if c:
                 return c
-        return f"gid::{len(gid_best)+1}"
+        return "gid::{}".format(len(gid_best) + 1)
 
     for r in rows:
         cands = _candidate_keys(r)
@@ -276,6 +279,29 @@ def _dedupe_by_property(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
     return list(gid_best.values())
 
+# ================= Query params helpers =================
+def _qp_get(name, default=None):
+    try:
+        qp = st.query_params
+        val = qp.get(name, default)
+        if isinstance(val, list) and val:
+            return val[0]
+        return val
+    except Exception:
+        qp = st.experimental_get_query_params()
+        return (qp.get(name, [default]) or [default])[0]
+
+def _qp_set(**kwargs):
+    try:
+        if kwargs:
+            st.query_params.update(kwargs)
+        else:
+            st.query_params.clear()
+    except Exception:
+        if kwargs:
+            st.experimental_set_query_params(**kwargs)
+        else:
+            st.experimental_set_query_params()
 
 # ================= Lazy Streamlit bits (run-time only) =================
 def _inject_css_once():
@@ -309,29 +335,10 @@ def _inject_css_once():
         .pill.inactive { opacity: 0.95; }
 
         .section-rule { border-bottom:1px solid var(--row-border); margin:8px 0 6px 0; }
-        .report-item { margin:0.30rem 0; line-height:1.35; }
-
-        .meta-chip {
-          display:inline-block; font-size:11px; font-weight:800;
-          padding:2px 6px; border-radius:999px; margin-left:8px;
-          background:#eef2ff; color:#1e3a8a; border:1px solid #c7d2fe;
-        }
-        html[data-theme="dark"] .meta-chip { background:#1f2937; color:#bfdbfe; border-color:#374151; }
-
-        .date-badge {
-          display:inline-block; font-size:11px; font-weight:800;
-          padding:2px 6px; border-radius:999px; margin-left:8px;
-          background:#e0f2fe; color:#075985; border:1px solid #7dd3fc;
-        }
-        html[data-theme="dark"] .date-badge {
-          background:#0b1220; color:#7dd3fc; border-color:#164e63;
-        }
-
-        .toured-badge {
-          display:inline-block; font-size:11px; font-weight:800;
-          padding:2px 6px; border-radius:999px; margin-left:8px;
-          background:#fee2e2; color:#991b1b; border:1px solid #fecaca;
-        }
+        .meta-chip { display:inline-block; font-size:11px; font-weight:800; padding:2px 6px; border-radius:999px; margin-left:8px; background:#eef2ff; color:#1e3a8a; border:1px solid #c7d2fe; }
+        .date-badge { display:inline-block; font-size:11px; font-weight:800; padding:2px 6px; border-radius:999px; margin-left:8px; background:#e0f2fe; color:#075985; border:1px solid #7dd3fc; }
+        html[data-theme="dark"] .date-badge { background:#0b1220; color:#7dd3fc; border-color:#164e63; }
+        .toured-badge { display:inline-block; font-size:11px; font-weight:800; padding:2px 6px; border-radius:999px; margin-left:8px; background:#fee2e2; color:#991b1b; border:1px solid #fecaca; }
         html[data-theme="dark"] .toured-badge { background:#7f1d1d; color:#fecaca; border-color:#ef4444; }
         </style>
         """,
@@ -570,7 +577,6 @@ def _collect_ids_for_property(client_norm: str, all_sent_rows: List[Dict[str, An
             continue
     return out_ids
 
-
 # ================= UI bits =================
 def _client_row_icons(name: str, norm: str, cid: int, active: bool):
     col_name, col_rep, col_ren, col_tog, col_del, col_sp = st.columns([8, 1, 1, 1, 1, 2])
@@ -642,7 +648,6 @@ def _client_row_icons(name: str, norm: str, cid: int, active: bool):
             st.session_state["__del_{0}"] = False
 
     st.markdown("<div class='section-rule'></div>", unsafe_allow_html=True)
-
 
 def _render_client_report_view(client_display_name: str, client_norm: str):
     st.markdown("### Report for {nm}".format(nm=escape(client_display_name)), unsafe_allow_html=True)
@@ -833,7 +838,6 @@ def _render_client_report_view(client_display_name: str, client_norm: str):
             use_container_width=False,
         )
 
-
 # ============== Public entry (call this from app.py) ==============
 def render_clients_tab():
     _inject_css_once()
@@ -881,28 +885,3 @@ def render_clients_tab():
                 height=0,
             )
         _qp_set(report=report_norm_qp)
-
-
-# --- Query params helpers (kept last so definitions exist) ---
-def _qp_get(name, default=None):
-    try:
-        qp = st.query_params
-        val = qp.get(name, default)
-        if isinstance(val, list) and val:
-            return val[0]
-        return val
-    except Exception:
-        qp = st.experimental_get_query_params()
-        return (qp.get(name, [default]) or [default])[0]
-
-def _qp_set(**kwargs):
-    try:
-        if kwargs:
-            st.query_params.update(kwargs)
-        else:
-            st.query_params.clear()
-    except Exception:
-        if kwargs:
-            st.experimental_set_query_params(**kwargs)
-        else:
-            st.experimental_set_query_params()
