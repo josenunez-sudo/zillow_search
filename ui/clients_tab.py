@@ -69,7 +69,7 @@ def _pick_timestamp_date_tag(row: Dict[str, Any]) -> str:
 
     return ""
 
-# ------------- Property/address normalization (strong & symmetric) -------------
+# ------------- Property/address normalization -------------
 _STTYPE = {
     "street":"st","st":"st","st.":"st",
     "avenue":"ave","ave":"ave","ave.":"ave","av":"ave",
@@ -123,20 +123,16 @@ def _address_text_from_url(url: str) -> str:
     return ""
 
 # ====== Address parsing (handles comma/no-comma) ======
-_ST_TYPES_REGEX = r"(?:street|st|avenue|ave|road|rd|drive|dr|lane|ln|boulevard|blvd|court|ct|place|pl|terrace|ter|highway|hwy|parkway|pkwy|circle|cir|square|sq)"
-_DIR_WORDS_REGEX = r"(?:north|south|east|west|n|s|e|w)\.?"
 STATE_2 = r"(?:A[LKZR]|C[AOT]|D[EC]|F[LM]|G[AU]|H[IW]|I[ADLN]|K[SY]|L[A]|M[ADEINOST]|N[CDEHJMVY]|O[HKR]|P[A]|R[IL]|S[CD]|T[NX]|UT|V[AIT]|W[AIVY])"
 
 def _split_addr(addr: str) -> Tuple[str, str, str, str]:
     """
-    Try to split into (street, city, state, zip) with or without commas.
-    Robust enough for your data (e.g., '107 Starling St Pine Level Nc 27568').
+    Split into (street, city, state, zip) — robust for lines with or without commas.
     """
     a = (addr or "").strip()
     if not a:
         return "", "", "", ""
 
-    # Normalize whitespace
     a = re.sub(r"\s+", " ", a)
 
     # If there are commas, use them
@@ -144,108 +140,96 @@ def _split_addr(addr: str) -> Tuple[str, str, str, str]:
         parts = [p.strip() for p in a.split(",")]
         street = parts[0] if parts else ""
         rest = " ".join(parts[1:]).strip()
-        # Pull state + zip from end of rest
-        m = re.search(rf"\b({STATE_2})\b(?:\s+(\d{{5}}(?:-\d{{4}})?))?\s*$", rest, re.I)
+        m = re.search(rf"\b({STATE_2})\b(?:\s+(\d{{5}}(?:-\d{{4})?))?\s*$", rest, re.I)
         state = (m.group(1) if m else "").upper()
         zipc  = (m.group(2) if (m and m.lastindex and m.lastindex >= 2) else "")
         city  = rest[:m.start()].strip() if m else rest
         return street, city, state, zipc
 
-    # No commas: find state & zip at tail, city before that
-    m2 = re.search(rf"\b({STATE_2})\b(?:\s+(\d{{5}}(?:-\d{{4}})?))?\s*$", a, re.I)
+    # No commas: find state & zip at tail
+    m2 = re.search(rf"\b({STATE_2})\b(?:\s+(\d{{5}}(?:-\d{{4})?))?\s*$", a, re.I)
     state = (m2.group(1) if m2 else "").upper()
     zipc  = (m2.group(2) if (m2 and m2.lastindex and m2.lastindex >= 2) else "")
 
     head = a[:m2.start()].strip() if m2 else a
 
-    # Street: from house number through street type (optionally with trailing dir)
-    ms = re.search(
-        rf"^\s*\d+\s+.*?\b{_ST_TYPES_REGEX}\b(?:\s+{_DIR_WORDS_REGEX})?\b",
-        head, re.I
-    )
-    street = (ms.group(0).strip() if ms else head)
+    # Street as: number ... (ends before city words, if any)
+    # Heuristic: take first token run that starts with a number
+    m3 = re.match(r"^\s*\d+\s+.*$", head)
+    if m3:
+        # If we can find a street "type", clip there; else take all head as street
+        mtype = re.search(
+            r"\b(st|street|ave|avenue|rd|road|dr|drive|ln|lane|blvd|boulevard|ct|court|pl|place|ter|terrace|hwy|highway|pkwy|parkway|cir|circle|sq|square)\b\.?",
+            head, re.I
+        )
+        street = head[:mtype.end()] if mtype else head
+        city = head[len(street):].strip()
+        return street.strip(), city, state, zipc
 
-    # City: what's left after street
-    city = head[len(street):].strip()
-    return street, city, state, zipc
+    # Fallback: treat everything as street
+    return head, "", state, zipc
 
 def _street_only(addr: str) -> str:
     s, _, _, _ = _split_addr(addr)
-    # Strip unit/lot
     s = re.sub(r"\b(?:apt|unit|suite|ste|lot|#)\s*[A-Za-z0-9\-]*\s*$", "", s, flags=re.I).strip()
     return s
 
-def _addr_key_from_text(addr: str) -> str:
-    """
-    Build a strong canonical key from text:
-      addrkey::<street-slug>::<city-slug>::<STATE>
-    Falls back gracefully if city/state missing.
-    """
-    street, city, state, _ = _split_addr(addr)
-    sslug = _norm_slug_from_text(street)
-    cslug = _norm_slug_from_text(city)
-    st_up = (state or "").upper()
-    if sslug and (cslug or st_up):
-        return f"addrkey::{sslug}::{cslug}::{st_up}"
-    if sslug:
-        return f"addrkey::{sslug}"
-    return ""
+def _street_slug(addr: str) -> str:
+    return _norm_slug_from_text(_street_only(addr))
 
-def _addr_key_from_row(row: Dict[str, Any]) -> str:
-    addr = (row.get("address") or "").strip()
-    if not addr:
-        # try to recover an address-like text from Zillow URL
-        url = (row.get("url") or "").strip()
-        addr = _address_text_from_url(url)
-    return _addr_key_from_text(addr)
+def _city_slug(addr: str) -> str:
+    _, c, _, _ = _split_addr(addr)
+    return _norm_slug_from_text(c)
 
-def _property_key(row: Dict[str, Any]) -> str:
-    """
-    Dedup priority:
-      1) canonical address key (street+city+state) from 'address' (works with/without commas)
-      2) Zillow slug from URL
-      3) canonical
-      4) zpid
-      5) full URL
-    """
-    # 1) address key
-    k = _addr_key_from_row(row)
-    if k:
-        return k
+def _state2(addr: str) -> str:
+    _, _, stt, _ = _split_addr(addr)
+    return (stt or "").upper()
 
-    # 2) Zillow slug from URL
+def _zip5(addr: str) -> str:
+    _, _, _, z = _split_addr(addr)
+    m = re.match(r"^(\d{5})", z or "")
+    return m.group(1) if m else ""
+
+# ---- Candidate keys per row (most specific → least) ----
+def _candidate_keys(row: Dict[str, Any]) -> List[str]:
     url = (row.get("url") or "").strip()
-    norm_from_url = _norm_slug_from_url(url)
-    if norm_from_url:
-        return "normslug::" + norm_from_url
+    addr = (row.get("address") or "").strip() or _address_text_from_url(url)
 
-    # 3) canonical / 4) zpid
+    sslug = _street_slug(addr)
+    cslug = _city_slug(addr)
+    st2   = _state2(addr)
+    z5    = _zip5(addr)
+
+    k = []
+
     canon = (row.get("canonical") or "").strip().lower()
-    if canon: return "canon::" + canon
+    if canon: k.append("canon::" + canon)
+
     zpid = (row.get("zpid") or "").strip()
-    if zpid: return "zpid::" + zpid
+    if zpid: k.append("zpid::" + zpid)
 
-    # 5) URL
-    return "url::" + (url.lower())
+    zslug = _norm_slug_from_url(url)
+    if zslug: k.append("zslug::" + zslug)
 
-def _qp_get(name, default=None):
-    try:
-        qp = st.query_params
-        val = qp.get(name, default)
-        if isinstance(val, list) and val:
-            return val[0]
-        return val
-    except Exception:
-        qp = st.experimental_get_query_params()
-        return (qp.get(name, [default]) or [default])[0]
+    if sslug and z5:
+        k.append(f"addrzip::{sslug}::{z5}")
+    if sslug and cslug and st2:
+        k.append(f"addrcs::{sslug}::{cslug}::{st2}")
+    if sslug and cslug and not st2:
+        k.append(f"addrc::{sslug}::{cslug}")
+    if sslug:
+        k.append(f"addr::{sslug}")
 
-def _qp_set(**kwargs):
-    try:
-        if kwargs: st.query_params.update(kwargs)
-        else:      st.query_params.clear()
-    except Exception:
-        if kwargs: st.experimental_set_query_params(**kwargs)
-        else:      st.experimental_set_query_params()
+    if url:
+        k.append("url::" + url.lower())
+
+    # Ensure uniqueness and keep order
+    out = []
+    seen = set()
+    for kk in k:
+        if kk and kk not in seen:
+            seen.add(kk); out.append(kk)
+    return out
 
 def _best_ts(row) -> datetime:
     tag = _pick_timestamp_date_tag(row)
@@ -260,12 +244,42 @@ def _best_ts(row) -> datetime:
         return datetime.min
 
 def _dedupe_by_property(rows: List[Dict[str,Any]]) -> List[Dict[str,Any]]:
-    best: Dict[str, Dict[str,Any]] = {}
+    """
+    Group rows by ANY overlapping candidate key.
+    We map *all* candidates of the first row in a group to that same group id,
+    so later variants (street-only vs street+city/state) merge properly.
+    """
+    key_to_gid: Dict[str, str] = {}
+    gid_best: Dict[str, Dict[str, Any]] = {}
+
+    def pick_gid(cands: List[str]) -> Optional[str]:
+        for c in cands:
+            if c in key_to_gid:
+                return key_to_gid[c]
+        return None
+
+    def make_gid(cands: List[str]) -> str:
+        # Choose the first candidate as a stable group id
+        for c in cands:
+            if c:
+                return c
+        return f"gid::{len(gid_best)+1}"
+
     for r in rows:
-        key = _property_key(r)
-        if key not in best or _best_ts(r) > _best_ts(best[key]):
-            best[key] = r
-    return list(best.values())
+        cands = _candidate_keys(r)
+        gid = pick_gid(cands)
+        if not gid:
+            gid = make_gid(cands)
+        # Map all candidates to this gid
+        for c in cands:
+            if c and c not in key_to_gid:
+                key_to_gid[c] = gid
+        # Keep newest by timestamp
+        cur = gid_best.get(gid)
+        if not cur or _best_ts(r) > _best_ts(cur):
+            gid_best[gid] = r
+
+    return list(gid_best.values())
 
 
 # ================= Lazy Streamlit bits (run-time only) =================
@@ -438,6 +452,9 @@ def fetch_sent_for_client(client_norm: str, limit: int = 5000):
 
 @st.cache_data(ttl=120, show_spinner=False)
 def fetch_tour_norm_slugs_for_client(client_norm: str) -> set:
+    """
+    Return a set of *street-only* keys so toured tags align with dedupe.
+    """
     SUPABASE = get_supabase()
     if not (_sb_ok(SUPABASE) and client_norm.strip()): return set()
     try:
@@ -448,11 +465,10 @@ def fetch_tour_norm_slugs_for_client(client_norm: str) -> set:
         stops = (sq.data or [])
         out: set = set()
         for s in stops:
-            # build the SAME addr key used for dedupe (street+city+state best-effort)
             raw = s.get("address_slug") or s.get("address") or ""
-            k = _addr_key_from_text(raw)
-            if k:
-                out.add(k)
+            street_key = "addr::" + _street_slug(raw) if raw else ""
+            if street_key.strip("addr::"):
+                out.add(street_key)
         return out
     except Exception:
         return set()
@@ -473,12 +489,43 @@ def _delete_sent_rows_by_ids(ids: List[int]) -> Tuple[bool, str]:
     except Exception as e:
         return False, str(e)
 
-def _collect_ids_for_property(client_norm: str, all_sent_rows: List[Dict[str, Any]], prop_key: str) -> List[int]:
-    """Return all 'sent.id' that match the same-property key for this client."""
+def _collect_ids_for_property(client_norm: str, all_sent_rows: List[Dict[str, Any]], gid: str) -> List[int]:
+    """Return all 'sent.id' that match the same-property group id for this client."""
     ids: List[int] = []
+
+    # Build a temporary equivalence map for this set, so we can match any candidate
+    # belonging to the chosen group id.
+    key_to_gid = {}
+    for r in all_sent_rows:
+        for c in _candidate_keys(r):
+            if c not in key_to_gid:
+                key_to_gid[c] = c  # seed to itself
+
+    # Rebuild using the same logic as deduper so mapping is consistent
+    gid_map = {}
+    def pick_gid(cands: List[str]) -> Optional[str]:
+        for c in cands:
+            if c in gid_map:
+                return gid_map[c]
+        return None
+
+    for r in all_sent_rows:
+        cands = _candidate_keys(r)
+        g = pick_gid(cands) or (cands[0] if cands else None)
+        if not g:
+            continue
+        for c in cands:
+            gid_map.setdefault(c, g)
+
+    # Now collect ids that map to the selected gid
     for r in all_sent_rows:
         try:
-            if _property_key(r) == prop_key and r.get("id"):
+            cands = _candidate_keys(r)
+            g = None
+            for c in cands:
+                if c in gid_map:
+                    g = gid_map[c]; break
+            if g == gid and r.get("id"):
                 ids.append(int(r["id"]))
         except Exception:
             continue
@@ -566,7 +613,7 @@ def _render_client_report_view(client_display_name: str, client_norm: str):
         st.info("No listings have been sent to this client yet.")
         return
 
-    tour_addrkeys = fetch_tour_norm_slugs_for_client(client_norm)
+    tour_street_keys = fetch_tour_norm_slugs_for_client(client_norm)
 
     # Filters
     seen_camps: List[str] = []
@@ -609,9 +656,9 @@ def _render_client_report_view(client_display_name: str, client_norm: str):
         # DATE tag (YYYYMMDD)
         date_tag = _pick_timestamp_date_tag(r)
 
-        # Toured badge — based on canonical addr key (same as dedupe)
-        this_key = _addr_key_from_text(addr)
-        toured = this_key in tour_addrkeys
+        # Toured badge — compare on street-only key
+        street_key = "addr::" + _street_slug(addr)
+        toured = street_key in tour_street_keys
 
         meta: List[str] = []
         if date_tag:
@@ -623,7 +670,7 @@ def _render_client_report_view(client_display_name: str, client_norm: str):
         if DEBUG_REPORT:
             debug_html = (
                 " <span style='font-size:10px;opacity:.7'>(dbg "
-                f"date_tag={escape(date_tag or '-')}, key={escape(this_key)}, toured={'yes' if toured else 'no'})</span>"
+                f"date_tag={escape(date_tag or '-')}, key={escape(street_key)}, toured={'yes' if toured else 'no'})</span>"
             )
 
         line = f"- <a href=\"{escape(url)}\" target=\"_blank\" rel=\"noopener\">{escape(addr)}</a> {' '.join(meta)}{debug_html}"
@@ -636,33 +683,46 @@ def _render_client_report_view(client_display_name: str, client_norm: str):
     st.markdown("\n".join(md_lines), unsafe_allow_html=True)
 
     # ---- Manage sent listings (delete) ----
-    # Build map: property key -> label, and property key -> all row ids (from full sent_rows)
-    propkey_to_label: Dict[str, str] = {}
-    propkey_to_ids: Dict[str, List[int]] = {}
+    # Build group ids using same deduper so selections remove *all* variants
+    # First, recompute groups for filtered
+    groups = {}
+    gid_rows = {}
+    for r in filtered:
+        cands = _candidate_keys(r)
+        # replicate grouping decision
+        # try to find existing gid by any candidate
+        gid = None
+        for c in cands:
+            if c in groups:
+                gid = groups[c]; break
+        if not gid:
+            gid = cands[0] if cands else f"gid::{len(gid_rows)+1}"
+        for c in cands:
+            groups.setdefault(c, gid)
+        gid_rows.setdefault(gid, []).append(r)
 
-    for r in deduped:
-        url  = (r.get("url") or "").strip()
-        addr = (r.get("address") or "").strip() or _address_text_from_url(url) or "Listing"
-        key  = _property_key(r)
-        propkey_to_label[key] = addr
-
-    for key in list(propkey_to_label.keys()):
-        propkey_to_ids[key] = _collect_ids_for_property(client_norm, sent_rows, key)
+    # Friendly labels for each gid (use newest row's address)
+    gid_label = {}
+    for gid, rows_for_gid in gid_rows.items():
+        best = max(rows_for_gid, key=_best_ts)
+        url  = (best.get("url") or "").strip()
+        addr = (best.get("address") or "").strip() or _address_text_from_url(url) or "Listing"
+        gid_label[gid] = addr
 
     with st.expander("Manage sent listings (delete)"):
         # Disambiguate duplicate labels by suffixing counter
-        label_to_key: Dict[str, str] = {}
+        label_to_gid: Dict[str, str] = {}
         counts: Dict[str, int] = {}
-        for k, lbl in propkey_to_label.items():
+        for gid, lbl in gid_label.items():
             c = counts.get(lbl, 0)
             counts[lbl] = c + 1
             if c == 0:
-                label_to_key[lbl] = k
+                label_to_gid[lbl] = gid
             else:
                 dis_lbl = f"{lbl}  · {c+1}"
-                label_to_key[dis_lbl] = k
+                label_to_gid[dis_lbl] = gid
 
-        choices = list(label_to_key.keys())
+        choices = list(label_to_gid.keys())
         to_delete = st.multiselect(
             "Select properties to delete (removes all 'sent' rows for those properties for this client):",
             options=choices
@@ -671,8 +731,8 @@ def _render_client_report_view(client_display_name: str, client_norm: str):
         if st.button("Delete selected properties", type="primary", use_container_width=False):
             ids: List[int] = []
             for lbl in to_delete:
-                key = label_to_key[lbl]
-                ids.extend(propkey_to_ids.get(key, []))
+                gid = label_to_gid[lbl]
+                ids.extend(_collect_ids_for_property(client_norm, sent_rows, gid))
             ids = sorted(set(ids))
             ok, msg = _delete_sent_rows_by_ids(ids)
             if ok:
