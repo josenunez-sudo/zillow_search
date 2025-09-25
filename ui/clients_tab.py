@@ -9,13 +9,12 @@ from typing import List, Dict, Any, Optional, Tuple
 
 import streamlit as st
 
-# --- Make supabase import SAFE so the module can import even if package is missing ---
+# --- Safe supabase import (module loads even if supabase is not installed) ---
 try:
     from supabase import create_client, Client
 except Exception:
     create_client = None
-    from typing import Any as _Any
-    Client = _Any  # type: ignore
+    Client = object  # type: ignore
 
 DEBUG_REPORT = False  # set True if you want to see per-row debug info
 
@@ -28,8 +27,6 @@ def _fmt_ts_date_tag(ts: Any) -> str:
     if ts is None or str(ts).strip() == "":
         return ""
     raw = str(ts).strip()
-
-    # epoch seconds/millis
     try:
         if raw.isdigit():
             val = int(raw)
@@ -40,8 +37,6 @@ def _fmt_ts_date_tag(ts: Any) -> str:
             return d.strftime("%Y%m%d")
     except Exception:
         pass
-
-    # ISO
     try:
         d = datetime.fromisoformat(raw.replace("Z", "+00:00"))
         return d.strftime("%Y%m%d")
@@ -64,12 +59,9 @@ def _pick_timestamp_date_tag(row: Dict[str, Any]) -> str:
         tag = _fmt_ts_date_tag(row.get(k))
         if tag:
             return tag
-
-    # fallback: campaign that is a pure 8-digit date
     camp = (row.get("campaign") or "").strip()
     if re.fullmatch(r"\d{8}", camp):
         return camp
-
     return ""
 
 # ------------- Property/address normalization -------------
@@ -86,7 +78,7 @@ _STTYPE = {
     "highway":"hwy","hwy":"hwy",
     "parkway":"pkwy","pkwy":"pkwy",
     "circle":"cir","cir":"cir",
-    "square":"sq","sq":"sq",
+    "square":"sq","sq":"sq"
 }
 _DIR = {
     "north":"n","n":"n","south":"s","s":"s","east":"e","e":"e","west":"w","w":"w",
@@ -130,15 +122,13 @@ STATE_2 = r"(?:A[LKZR]|C[AOT]|D[EC]|F[LM]|G[AU]|H[IW]|I[ADLN]|K[SY]|L[A]|M[ADEIN
 
 def _split_addr(addr: str) -> Tuple[str, str, str, str]:
     """
-    Split into (street, city, state, zip) — robust for lines with or without commas.
+    Split into (street, city, state, zip) for lines with or without commas.
     """
     a = (addr or "").strip()
     if not a:
         return "", "", "", ""
-
     a = re.sub(r"\s+", " ", a)
 
-    # If there are commas, use them
     if "," in a:
         parts = [p.strip() for p in a.split(",")]
         street = parts[0] if parts else ""
@@ -149,14 +139,11 @@ def _split_addr(addr: str) -> Tuple[str, str, str, str]:
         city  = rest[:m.start()].strip() if m else rest
         return street, city, state, zipc
 
-    # No commas: find state & zip at tail
     m2 = re.search(rf"\b({STATE_2})\b(?:\s+(\d{{5}}(?:-\d{{4})?))?\s*$", a, re.I)
     state = (m2.group(1) if m2 else "").upper()
     zipc  = (m2.group(2) if (m2 and m2.lastindex and m2.lastindex >= 2) else "")
-
     head = a[:m2.start()].strip() if m2 else a
 
-    # Heuristic: take first token run that starts with a number
     m3 = re.match(r"^\s*\d+\s+.*$", head)
     if m3:
         mtype = re.search(
@@ -167,7 +154,6 @@ def _split_addr(addr: str) -> Tuple[str, str, str, str]:
         city = head[len(street):].strip()
         return street.strip(), city, state, zipc
 
-    # Fallback: treat everything as street
     return head, "", state, zipc
 
 def _street_only(addr: str) -> str:
@@ -191,7 +177,7 @@ def _zip5(addr: str) -> str:
     m = re.match(r"^(\d{5})", z or "")
     return m.group(1) if m else ""
 
-# ---- Candidate keys per row (most specific → least) ----
+# ---- Candidate keys per row (most specific -> least) ----
 def _candidate_keys(row: Dict[str, Any]) -> List[str]:
     url = (row.get("url") or "").strip()
     addr = (row.get("address") or "").strip() or _address_text_from_url(url)
@@ -247,8 +233,6 @@ def _best_ts(row: Dict[str, Any]) -> datetime:
 def _dedupe_by_property(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
     Group rows by ANY overlapping candidate key.
-    We map *all* candidates of the first row in a group to that same group id,
-    so later variants (street-only vs street+city/state) merge properly.
     """
     key_to_gid: Dict[str, str] = {}
     gid_best: Dict[str, Dict[str, Any]] = {}
@@ -445,7 +429,7 @@ def delete_client(client_id: int):
         return False, str(e)
 
 def upsert_client(name: str, active: bool = True):
-    """Insert-or-update a client by normalized name (used by Run tab's 'Add new client…')."""
+    """Insert-or-update a client by normalized name (used by Run tab Add new client)."""
     SUPABASE = get_supabase()
     if not _sb_ok(SUPABASE):
         return False, "Not configured"
@@ -495,7 +479,7 @@ def fetch_sent_for_client(client_norm: str, limit: int = 5000):
 @st.cache_data(ttl=120, show_spinner=False)
 def fetch_tour_norm_slugs_for_client(client_norm: str) -> set:
     """
-    Return a set of *street-only* keys so toured tags align with dedupe.
+    Return a set of street-only keys so toured tags align with dedupe.
     """
     SUPABASE = get_supabase()
     if not (_sb_ok(SUPABASE) and client_norm.strip()):
@@ -544,7 +528,6 @@ def _delete_sent_rows_by_ids(ids: List[int]) -> Tuple[bool, str]:
 
 def _collect_ids_for_property(client_norm: str, all_sent_rows: List[Dict[str, Any]], gid: str) -> List[int]:
     """Return all 'sent.id' that match the same-property group id for this client."""
-    # Build mapping consistent with our deduper
     gid_map: Dict[str, str] = {}
 
     def pick_gid(cands: List[str]) -> Optional[str]:
@@ -592,17 +575,17 @@ def _client_row_icons(name: str, norm: str, cid: int, active: bool):
         )
 
     with col_rep:
-        if st.button("▦", key="rep_{0}".format(cid), help="Open report"):
+        if st.button("Open", key="rep_{0}".format(cid), help="Open report"):
             st.session_state["__active_tab__"] = "Clients"
             _qp_set(report=norm, scroll="1")
             _safe_rerun()
 
     with col_ren:
-        if st.button("✎", key="rn_btn_{0}".format(cid), help="Rename"):
+        if st.button("Rename", key="rn_btn_{0}".format(cid), help="Rename"):
             st.session_state["__edit_{0}"] = True
 
     with col_tog:
-        if st.button("⟳", key="tg_{0}".format(cid), help=("Deactivate" if active else "Activate")):
+        if st.button("Toggle", key="tg_{0}".format(cid), help=("Deactivate" if active else "Activate")):
             try:
                 SUPABASE = get_supabase()
                 rows = (
@@ -619,7 +602,7 @@ def _client_row_icons(name: str, norm: str, cid: int, active: bool):
             _safe_rerun()
 
     with col_del:
-        if st.button("⌫", key="del_{0}".format(cid), help="Delete"):
+        if st.button("Delete", key="del_{0}".format(cid), help="Delete"):
             st.session_state["__del_{0}"] = True
 
     if st.session_state.get("__edit_{0}".format(cid)):
@@ -672,7 +655,7 @@ def _render_client_report_view(client_display_name: str, client_norm: str):
         c = (r.get("campaign") or "").strip()
         if c not in seen_camps:
             seen_camps.append(c)
-    labels = ["All campaigns"] + [("— no campaign —" if c == "" else c) for c in seen_camps]
+    labels = ["All campaigns"] + [("no campaign" if c == "" else c) for c in seen_camps]
     keys = [None] + seen_camps
 
     colF1, colF2, colF3 = st.columns([1.2, 1.8, 1])
@@ -723,7 +706,7 @@ def _render_client_report_view(client_display_name: str, client_norm: str):
         # DATE tag (YYYYMMDD)
         date_tag = _pick_timestamp_date_tag(r)
 
-        # Toured badge — compare on street-only key
+        # Toured badge: compare on street-only key
         sslug = _street_slug(addr)
         street_key = "addr::" + sslug if sslug else ""
         toured = street_key in tour_street_keys
@@ -759,7 +742,6 @@ def _render_client_report_view(client_display_name: str, client_norm: str):
     st.markdown("\n".join(md_lines), unsafe_allow_html=True)
 
     # ---- Manage sent listings (delete as groups)
-    # Build groups for filtered with the same logic
     groups: Dict[str, str] = {}
     gid_rows: Dict[str, List[Dict[str, Any]]] = {}
 
@@ -778,7 +760,6 @@ def _render_client_report_view(client_display_name: str, client_norm: str):
             groups.setdefault(c, gid)
         gid_rows.setdefault(gid, []).append(r)
 
-    # Friendly labels: newest row's address for each gid
     gid_label: Dict[str, str] = {}
     for gid, rows_for_gid in gid_rows.items():
         best = max(rows_for_gid, key=_best_ts)
@@ -787,7 +768,6 @@ def _render_client_report_view(client_display_name: str, client_norm: str):
         gid_label[gid] = addr
 
     with st.expander("Manage sent listings (delete)"):
-        # Disambiguate duplicate labels by suffixing counter
         label_to_gid: Dict[str, str] = {}
         counts: Dict[str, int] = {}
         for gid, lbl in gid_label.items():
@@ -823,7 +803,6 @@ def _render_client_report_view(client_display_name: str, client_norm: str):
             else:
                 st.error("Delete failed: {0}".format(msg))
 
-    # Export (deduped)
     with st.expander("Export filtered (deduped)"):
         import pandas as pd
         buf = io.StringIO()
@@ -843,7 +822,7 @@ def render_clients_tab():
     _inject_css_once()
 
     st.subheader("Clients")
-    st.caption("Use ▦ to open an inline report; ✎ rename; ⟳ toggle active; ⌫ delete.")
+    st.caption("Use Open to open an inline report; Rename; Toggle; Delete.")
 
     report_norm_qp = _qp_get("report", "")
     want_scroll = _qp_get("scroll", "") in ("1", "true", "yes")
