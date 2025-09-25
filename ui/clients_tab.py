@@ -91,7 +91,7 @@ def _token_norm(tok: str) -> str:
     t = tok.lower().strip(" .,#")
     if t in _STTYPE: return _STTYPE[t]
     if t in _DIR:    return _DIR[t]
-    if t in {"apt","unit","ste","lot"}: return ""
+    if t in {"apt","unit","ste","lot","suite","#"}: return ""
     return re.sub(r"[^a-z0-9-]", "", t)
 
 def _norm_slug_from_text(text: str) -> str:
@@ -119,18 +119,44 @@ def _address_text_from_url(url: str) -> str:
     if m: return re.sub(r"[-+]", " ", m.group(1)).title()
     return ""
 
+# ====== SMART street-only extractor (handles no-commas) ======
+_ST_TYPES_REGEX = r"(?:street|st|avenue|ave|road|rd|drive|dr|lane|ln|boulevard|blvd|court|ct|place|pl|terrace|ter|highway|hwy|parkway|pkwy|circle|cir|square|sq)"
+_DIR_WORDS_REGEX = r"(?:north|south|east|west|n|s|e|w)\.?"
+
 def _street_only(addr: str) -> str:
     """
-    Return just the primary street line (e.g., '121 N West St') from a full address like
-    '121 N West St, Fuquay Varina, NC 27526'. Also strips trailing unit/lot.
+    Extract just the primary street line, even if the full address has no commas.
+    Examples:
+      - '107 Starling St, Pine Level, NC 27568' -> '107 Starling St'
+      - '107 Starling St Pine Level Nc 27568'   -> '107 Starling St'
+      - '121 north West Street'                 -> '121 N West St'
     """
     a = (addr or "").strip()
     if not a:
         return ""
-    a = a.split("\n", 1)[0]
-    a = re.split(r"\s*,\s*", a)[0]
-    a = re.sub(r"\b(?:apt|unit|ste|suite|lot|#)\s*[A-Za-z0-9\-]*\s*$", "", a, flags=re.I).strip()
-    return a
+    # 1) easy: split at first comma
+    first = a.split("\n", 1)[0]
+    if "," in first:
+        first = first.split(",", 1)[0]
+    else:
+        # 2) no comma: regex from house number through the street type
+        m = re.search(
+            rf"^\s*\d+\s+.*?\b{_ST_TYPES_REGEX}\b(?:\s+{_DIR_WORDS_REGEX})?$",
+            first, re.I
+        )
+        if m:
+            first = m.group(0)
+    # strip trailing unit/lot/suite
+    first = re.sub(r"\b(?:apt|unit|suite|ste|lot|#)\s*[A-Za-z0-9\-]*\s*$", "", first, flags=re.I).strip()
+    # normalize tokens (dir + street type)
+    toks = [t for t in re.split(r"\s+", first) if t]
+    norm = []
+    for t in toks:
+        tt = _token_norm(t)
+        if tt: norm.append(tt.upper() if tt in {"n","s","e","w"} else tt)
+    # Re-inflate common abbreviations for display parity
+    # (We only need the slug for dedupe; display uses original 'address')
+    return " ".join(norm).replace(" AVE", " Ave").replace(" ST", " St").replace(" RD", " Rd").replace(" DR", " Dr").replace(" LN", " Ln").replace(" CT", " Ct").replace(" PL", " Pl").replace(" TER", " Ter").replace(" BLVD", " Blvd").replace(" HWY", " Hwy").replace(" CIR", " Cir").replace(" SQ", " Sq")
 
 def _property_key(row: Dict[str, Any]) -> str:
     """
@@ -144,11 +170,11 @@ def _property_key(row: Dict[str, Any]) -> str:
     url = (row.get("url") or "").strip()
     addr_raw = (row.get("address") or "").strip() or _address_text_from_url(url)
 
-    # 1) Strong address-first key
+    # 1) Strong address-first key (street-only)
     if addr_raw:
-        street = _street_only(addr_raw)
-        if street:
-            sslug = _norm_slug_from_text(street)
+        street_only = _street_only(addr_raw)
+        if street_only:
+            sslug = _norm_slug_from_text(street_only)
             if sslug:
                 return "saddr::" + sslug
 
@@ -186,13 +212,23 @@ def _qp_set(**kwargs):
         else:      st.experimental_set_query_params()
 
 def _dedupe_by_property(rows: List[Dict[str,Any]]) -> List[Dict[str,Any]]:
-    def ts(row):
-        try: return datetime.fromisoformat((row.get("sent_at") or "").replace("Z","+00:00"))
-        except Exception: return datetime.min
+    # Newest wins: use sent_at if present else fall back to campaign (YYYYMMDD)
+    def best_ts(row) -> datetime:
+        tag = _pick_timestamp_date_tag(row)
+        if tag:
+            try:
+                return datetime.strptime(tag, "%Y%m%d")
+            except Exception:
+                pass
+        try:
+            return datetime.fromisoformat((row.get("sent_at") or "").replace("Z","+00:00"))
+        except Exception:
+            return datetime.min
+
     best: Dict[str, Dict[str,Any]] = {}
     for r in rows:
         key = _property_key(r)
-        if key not in best or ts(r) > ts(best[key]):
+        if key not in best or best_ts(r) > best_ts(best[key]):
             best[key] = r
     return list(best.values())
 
