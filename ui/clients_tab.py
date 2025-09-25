@@ -69,7 +69,7 @@ def _pick_timestamp_date_tag(row: Dict[str, Any]) -> str:
 
     return ""
 
-# ------------- Property slug normalization (strong & symmetric) -------------
+# ------------- Property/address normalization (strong & symmetric) -------------
 _STTYPE = {
     "street":"st","st":"st","st.":"st",
     "avenue":"ave","ave":"ave","ave.":"ave","av":"ave",
@@ -85,13 +85,16 @@ _STTYPE = {
     "circle":"cir","cir":"cir",
     "square":"sq","sq":"sq",
 }
-_DIR = {"north":"n","n":"n","south":"s","s":"s","east":"e","e":"e","west":"w","w":"w","n.":"n","s.":"s","e.":"e","w.":"w"}
+_DIR = {
+    "north":"n","n":"n","south":"s","s":"s","east":"e","e":"e","west":"w","w":"w",
+    "n.":"n","s.":"s","e.":"e","w.":"w"
+}
 
 def _token_norm(tok: str) -> str:
     t = tok.lower().strip(" .,#")
     if t in _STTYPE: return _STTYPE[t]
     if t in _DIR:    return _DIR[t]
-    if t in {"apt","unit","ste","lot","suite","#"}: return ""
+    if t in {"apt","unit","ste","suite","lot","#"}: return ""
     return re.sub(r"[^a-z0-9-]", "", t)
 
 def _norm_slug_from_text(text: str) -> str:
@@ -119,66 +122,99 @@ def _address_text_from_url(url: str) -> str:
     if m: return re.sub(r"[-+]", " ", m.group(1)).title()
     return ""
 
-# ====== SMART street-only extractor (handles no-commas) ======
+# ====== Address parsing (handles comma/no-comma) ======
 _ST_TYPES_REGEX = r"(?:street|st|avenue|ave|road|rd|drive|dr|lane|ln|boulevard|blvd|court|ct|place|pl|terrace|ter|highway|hwy|parkway|pkwy|circle|cir|square|sq)"
 _DIR_WORDS_REGEX = r"(?:north|south|east|west|n|s|e|w)\.?"
+STATE_2 = r"(?:A[LKZR]|C[AOT]|D[EC]|F[LM]|G[AU]|H[IW]|I[ADLN]|K[SY]|L[A]|M[ADEINOST]|N[CDEHJMVY]|O[HKR]|P[A]|R[IL]|S[CD]|T[NX]|UT|V[AIT]|W[AIVY])"
 
-def _street_only(addr: str) -> str:
+def _split_addr(addr: str) -> Tuple[str, str, str, str]:
     """
-    Extract just the primary street line, even if the full address has no commas.
-    Examples:
-      - '107 Starling St, Pine Level, NC 27568' -> '107 Starling St'
-      - '107 Starling St Pine Level Nc 27568'   -> '107 Starling St'
-      - '121 north West Street'                 -> '121 N West St'
+    Try to split into (street, city, state, zip) with or without commas.
+    Robust enough for your data (e.g., '107 Starling St Pine Level Nc 27568').
     """
     a = (addr or "").strip()
     if not a:
-        return ""
-    # 1) easy: split at first comma
-    first = a.split("\n", 1)[0]
-    if "," in first:
-        first = first.split(",", 1)[0]
-    else:
-        # 2) no comma: regex from house number through the street type
-        m = re.search(
-            rf"^\s*\d+\s+.*?\b{_ST_TYPES_REGEX}\b(?:\s+{_DIR_WORDS_REGEX})?$",
-            first, re.I
-        )
-        if m:
-            first = m.group(0)
-    # strip trailing unit/lot/suite
-    first = re.sub(r"\b(?:apt|unit|suite|ste|lot|#)\s*[A-Za-z0-9\-]*\s*$", "", first, flags=re.I).strip()
-    # normalize tokens (dir + street type)
-    toks = [t for t in re.split(r"\s+", first) if t]
-    norm = []
-    for t in toks:
-        tt = _token_norm(t)
-        if tt: norm.append(tt.upper() if tt in {"n","s","e","w"} else tt)
-    # Re-inflate common abbreviations for display parity
-    # (We only need the slug for dedupe; display uses original 'address')
-    return " ".join(norm).replace(" AVE", " Ave").replace(" ST", " St").replace(" RD", " Rd").replace(" DR", " Dr").replace(" LN", " Ln").replace(" CT", " Ct").replace(" PL", " Pl").replace(" TER", " Ter").replace(" BLVD", " Blvd").replace(" HWY", " Hwy").replace(" CIR", " Cir").replace(" SQ", " Sq")
+        return "", "", "", ""
+
+    # Normalize whitespace
+    a = re.sub(r"\s+", " ", a)
+
+    # If there are commas, use them
+    if "," in a:
+        parts = [p.strip() for p in a.split(",")]
+        street = parts[0] if parts else ""
+        rest = " ".join(parts[1:]).strip()
+        # Pull state + zip from end of rest
+        m = re.search(rf"\b({STATE_2})\b(?:\s+(\d{{5}}(?:-\d{{4}})?))?\s*$", rest, re.I)
+        state = (m.group(1) if m else "").upper()
+        zipc  = (m.group(2) if (m and m.lastindex and m.lastindex >= 2) else "")
+        city  = rest[:m.start()].strip() if m else rest
+        return street, city, state, zipc
+
+    # No commas: find state & zip at tail, city before that
+    m2 = re.search(rf"\b({STATE_2})\b(?:\s+(\d{{5}}(?:-\d{{4}})?))?\s*$", a, re.I)
+    state = (m2.group(1) if m2 else "").upper()
+    zipc  = (m2.group(2) if (m2 and m2.lastindex and m2.lastindex >= 2) else "")
+
+    head = a[:m2.start()].strip() if m2 else a
+
+    # Street: from house number through street type (optionally with trailing dir)
+    ms = re.search(
+        rf"^\s*\d+\s+.*?\b{_ST_TYPES_REGEX}\b(?:\s+{_DIR_WORDS_REGEX})?\b",
+        head, re.I
+    )
+    street = (ms.group(0).strip() if ms else head)
+
+    # City: what's left after street
+    city = head[len(street):].strip()
+    return street, city, state, zipc
+
+def _street_only(addr: str) -> str:
+    s, _, _, _ = _split_addr(addr)
+    # Strip unit/lot
+    s = re.sub(r"\b(?:apt|unit|suite|ste|lot|#)\s*[A-Za-z0-9\-]*\s*$", "", s, flags=re.I).strip()
+    return s
+
+def _addr_key_from_text(addr: str) -> str:
+    """
+    Build a strong canonical key from text:
+      addrkey::<street-slug>::<city-slug>::<STATE>
+    Falls back gracefully if city/state missing.
+    """
+    street, city, state, _ = _split_addr(addr)
+    sslug = _norm_slug_from_text(street)
+    cslug = _norm_slug_from_text(city)
+    st_up = (state or "").upper()
+    if sslug and (cslug or st_up):
+        return f"addrkey::{sslug}::{cslug}::{st_up}"
+    if sslug:
+        return f"addrkey::{sslug}"
+    return ""
+
+def _addr_key_from_row(row: Dict[str, Any]) -> str:
+    addr = (row.get("address") or "").strip()
+    if not addr:
+        # try to recover an address-like text from Zillow URL
+        url = (row.get("url") or "").strip()
+        addr = _address_text_from_url(url)
+    return _addr_key_from_text(addr)
 
 def _property_key(row: Dict[str, Any]) -> str:
     """
     Dedup priority:
-      1) street-only normalized 'address' (most reliable across sources)
-      2) Zillow slug from URL (when present)
+      1) canonical address key (street+city+state) from 'address' (works with/without commas)
+      2) Zillow slug from URL
       3) canonical
       4) zpid
       5) full URL
     """
-    url = (row.get("url") or "").strip()
-    addr_raw = (row.get("address") or "").strip() or _address_text_from_url(url)
-
-    # 1) Strong address-first key (street-only)
-    if addr_raw:
-        street_only = _street_only(addr_raw)
-        if street_only:
-            sslug = _norm_slug_from_text(street_only)
-            if sslug:
-                return "saddr::" + sslug
+    # 1) address key
+    k = _addr_key_from_row(row)
+    if k:
+        return k
 
     # 2) Zillow slug from URL
+    url = (row.get("url") or "").strip()
     norm_from_url = _norm_slug_from_url(url)
     if norm_from_url:
         return "normslug::" + norm_from_url
@@ -189,7 +225,7 @@ def _property_key(row: Dict[str, Any]) -> str:
     zpid = (row.get("zpid") or "").strip()
     if zpid: return "zpid::" + zpid
 
-    # 5) Last resort — URL
+    # 5) URL
     return "url::" + (url.lower())
 
 def _qp_get(name, default=None):
@@ -211,24 +247,23 @@ def _qp_set(**kwargs):
         if kwargs: st.experimental_set_query_params(**kwargs)
         else:      st.experimental_set_query_params()
 
-def _dedupe_by_property(rows: List[Dict[str,Any]]) -> List[Dict[str,Any]]:
-    # Newest wins: use sent_at if present else fall back to campaign (YYYYMMDD)
-    def best_ts(row) -> datetime:
-        tag = _pick_timestamp_date_tag(row)
-        if tag:
-            try:
-                return datetime.strptime(tag, "%Y%m%d")
-            except Exception:
-                pass
+def _best_ts(row) -> datetime:
+    tag = _pick_timestamp_date_tag(row)
+    if tag:
         try:
-            return datetime.fromisoformat((row.get("sent_at") or "").replace("Z","+00:00"))
+            return datetime.strptime(tag, "%Y%m%d")
         except Exception:
-            return datetime.min
+            pass
+    try:
+        return datetime.fromisoformat((row.get("sent_at") or "").replace("Z","+00:00"))
+    except Exception:
+        return datetime.min
 
+def _dedupe_by_property(rows: List[Dict[str,Any]]) -> List[Dict[str,Any]]:
     best: Dict[str, Dict[str,Any]] = {}
     for r in rows:
         key = _property_key(r)
-        if key not in best or best_ts(r) > best_ts(best[key]):
+        if key not in best or _best_ts(r) > _best_ts(best[key]):
             best[key] = r
     return list(best.values())
 
@@ -367,7 +402,7 @@ def delete_client(client_id: int):
         return False, str(e)
 
 def upsert_client(name: str, active: bool = True):
-    """Insert-or-update a client by normalized name, used by Run tab's 'Add new client…' flow."""
+    """Insert-or-update a client by normalized name (used by Run tab's 'Add new client…')."""
     SUPABASE = get_supabase()
     if not _sb_ok(SUPABASE):
         return False, "Not configured"
@@ -392,7 +427,6 @@ def fetch_sent_for_client(client_norm: str, limit: int = 5000):
     SUPABASE = get_supabase()
     if not (_sb_ok(SUPABASE) and client_norm.strip()): return []
     try:
-        # include 'id' so we can delete rows precisely
         cols = "id,url,address,sent_at,campaign,mls_id,canonical,zpid"
         resp = SUPABASE.table("sent").select(cols)\
             .eq("client", client_norm.strip())\
@@ -414,10 +448,11 @@ def fetch_tour_norm_slugs_for_client(client_norm: str) -> set:
         stops = (sq.data or [])
         out: set = set()
         for s in stops:
-            if s.get("address_slug"):
-                out.add(_norm_slug_from_text(_street_only(s["address_slug"])))
-            elif s.get("address"):
-                out.add(_norm_slug_from_text(_street_only(s["address"])))
+            # build the SAME addr key used for dedupe (street+city+state best-effort)
+            raw = s.get("address_slug") or s.get("address") or ""
+            k = _addr_key_from_text(raw)
+            if k:
+                out.add(k)
         return out
     except Exception:
         return set()
@@ -531,7 +566,7 @@ def _render_client_report_view(client_display_name: str, client_norm: str):
         st.info("No listings have been sent to this client yet.")
         return
 
-    tour_norm_slugs = fetch_tour_norm_slugs_for_client(client_norm)
+    tour_addrkeys = fetch_tour_norm_slugs_for_client(client_norm)
 
     # Filters
     seen_camps: List[str] = []
@@ -566,24 +601,17 @@ def _render_client_report_view(client_display_name: str, client_norm: str):
     deduped  = _dedupe_by_property(filtered)
     st.caption(f"{len(deduped)} unique listing{'s' if len(deduped)!=1 else ''} (deduped by property)")
 
-    def chip(t: Any) -> str:
-        if t is None: return ""
-        s = str(t).strip()
-        if not s: return ""
-        return f"<span class='meta-chip'>{escape(s)}</span>"
-
-    # Build Markdown bullet list with inline HTML chips/badges (avoids raw </li> showing)
     md_lines: List[str] = []
     for r in deduped:
         url  = (r.get("url") or "").strip()
         addr = (r.get("address") or "").strip() or _address_text_from_url(url) or "Listing"
 
-        # Single DATE tag (YYYYMMDD)
+        # DATE tag (YYYYMMDD)
         date_tag = _pick_timestamp_date_tag(r)
 
-        # Toured badge (once) — key based on street-only normalization
-        norm_pslug = _norm_slug_from_text(_street_only(addr))
-        toured = norm_pslug in tour_norm_slugs
+        # Toured badge — based on canonical addr key (same as dedupe)
+        this_key = _addr_key_from_text(addr)
+        toured = this_key in tour_addrkeys
 
         meta: List[str] = []
         if date_tag:
@@ -595,11 +623,9 @@ def _render_client_report_view(client_display_name: str, client_norm: str):
         if DEBUG_REPORT:
             debug_html = (
                 " <span style='font-size:10px;opacity:.7'>(dbg "
-                f"date_tag={escape(date_tag or '-')}, camp={(r.get('campaign') or '')}, "
-                f"slug={escape(norm_pslug)}, toured={'yes' if toured else 'no'})</span>"
+                f"date_tag={escape(date_tag or '-')}, key={escape(this_key)}, toured={'yes' if toured else 'no'})</span>"
             )
 
-        # Use Markdown bullet + inline HTML so no literal </li> appears
         line = f"- <a href=\"{escape(url)}\" target=\"_blank\" rel=\"noopener\">{escape(addr)}</a> {' '.join(meta)}{debug_html}"
         md_lines.append(line)
 
@@ -710,4 +736,4 @@ def render_clients_tab():
                 </script>
                 """, height=0
             )
-            _qp_set(report=report_norm_qp)
+        _qp_set(report=report_norm_qp)
