@@ -119,16 +119,42 @@ def _address_text_from_url(url: str) -> str:
     if m: return re.sub(r"[-+]", " ", m.group(1)).title()
     return ""
 
+def _street_only(addr: str) -> str:
+    """
+    Return just the primary street line (e.g., '121 N West St') from a full address like
+    '121 N West St, Fuquay Varina, NC 27526'. Also strips trailing unit/lot.
+    """
+    a = (addr or "").strip()
+    if not a:
+        return ""
+    a = a.split("\n", 1)[0]
+    a = re.split(r"\s*,\s*", a)[0]
+    a = re.sub(r"\b(?:apt|unit|ste|suite|lot|#)\s*[A-Za-z0-9\-]*\s*$", "", a, flags=re.I).strip()
+    return a
+
 def _property_key(row: Dict[str, Any]) -> str:
     url = (row.get("url") or "").strip()
-    addr = (row.get("address") or "").strip() or _address_text_from_url(url)
-    norm_pslug = _norm_slug_from_url(url) or _norm_slug_from_text(addr)
-    if norm_pslug:
-        return "normslug::" + norm_pslug
+    addr_raw = (row.get("address") or "").strip() or _address_text_from_url(url)
+
+    # Prefer slug from Zillow URL when available
+    norm_from_url = _norm_slug_from_url(url)
+    if norm_from_url:
+        return "normslug::" + norm_from_url
+
+    # Strong, symmetric: slug from street-only address
+    street = _street_only(addr_raw)
+    if street:
+        norm_pslug = _norm_slug_from_text(street)
+        if norm_pslug:
+            return "normslug::" + norm_pslug
+
+    # Canonical/zpid fallbacks
     canon = (row.get("canonical") or "").strip().lower()
     if canon: return "canon::" + canon
     zpid = (row.get("zpid") or "").strip()
     if zpid: return "zpid::" + zpid
+
+    # Last resort
     return "url::" + (url.lower())
 
 def _qp_get(name, default=None):
@@ -295,7 +321,6 @@ def delete_client(client_id: int):
     except Exception as e:
         return False, str(e)
 
-# >>> ADDED: insert-or-update used by Run tab's “Add new client…” <<<
 def upsert_client(name: str, active: bool = True):
     """Insert-or-update a client by normalized name, used by Run tab's 'Add new client…' flow."""
     SUPABASE = get_supabase()
@@ -306,7 +331,6 @@ def upsert_client(name: str, active: bool = True):
         return False, "Name required"
     try:
         norm = _norm_tag(name)
-        # If a client with this normalized name exists, update name/active; else insert.
         existing = SUPABASE.table("clients").select("id").eq("name_norm", norm).limit(1).execute().data or []
         if existing:
             cid = existing[0]["id"]
@@ -346,9 +370,9 @@ def fetch_tour_norm_slugs_for_client(client_norm: str) -> set:
         out: set = set()
         for s in stops:
             if s.get("address_slug"):
-                out.add(_norm_slug_from_text(s["address_slug"]))
+                out.add(_norm_slug_from_text(_street_only(s["address_slug"])))
             elif s.get("address"):
-                out.add(_norm_slug_from_text(s["address"]))
+                out.add(_norm_slug_from_text(_street_only(s["address"])))
         return out
     except Exception:
         return set()
@@ -512,8 +536,8 @@ def _render_client_report_view(client_display_name: str, client_norm: str):
         # Single DATE tag (YYYYMMDD)
         date_tag = _pick_timestamp_date_tag(r)
 
-        # Toured badge (once)
-        norm_pslug = _norm_slug_from_url(url) or _norm_slug_from_text(addr)
+        # Toured badge (once) — use street-only normalization to match tours
+        norm_pslug = _norm_slug_from_url(url) or _norm_slug_from_text(_street_only(addr))
         toured = norm_pslug in tour_norm_slugs
 
         meta: List[str] = []
