@@ -15,7 +15,8 @@ except Exception:
 
 DEBUG_REPORT = False  # set True if you want to see per-row debug info
 
-# ================= Basics =================
+
+# ================= Basics (pure helpers; safe at import time) =================
 def _norm_tag(s: str) -> str:
     return re.sub(r"\s+", " ", (s or "").strip()).lower()
 
@@ -24,6 +25,8 @@ def _fmt_ts_date_tag(ts: Any) -> str:
     if ts is None or str(ts).strip() == "":
         return ""
     raw = str(ts).strip()
+
+    # epoch seconds/millis
     try:
         if raw.isdigit():
             val = int(raw)
@@ -34,6 +37,8 @@ def _fmt_ts_date_tag(ts: Any) -> str:
             return d.strftime("%Y%m%d")
     except Exception:
         pass
+
+    # ISO
     try:
         d = datetime.fromisoformat(raw.replace("Z", "+00:00"))
         return d.strftime("%Y%m%d")
@@ -41,6 +46,10 @@ def _fmt_ts_date_tag(ts: Any) -> str:
         return ""
 
 def _pick_timestamp_date_tag(row: Dict[str, Any]) -> str:
+    """
+    Find first timestamp-like field and convert to YYYYMMDD.
+    If none found, try campaign if it looks like YYYYMMDD.
+    """
     candidates = [
         "sent_at", "sentAt",
         "created_at", "createdAt",
@@ -52,12 +61,15 @@ def _pick_timestamp_date_tag(row: Dict[str, Any]) -> str:
         tag = _fmt_ts_date_tag(row.get(k))
         if tag:
             return tag
+
+    # fallback: campaign that is a pure 8-digit date
     camp = (row.get("campaign") or "").strip()
     if re.fullmatch(r"\d{8}", camp):
         return camp
+
     return ""
 
-# ------------- Normalization helpers -------------
+# ------------- Property slug normalization (strong & symmetric) -------------
 _STTYPE = {
     "street":"st","st":"st","st.":"st",
     "avenue":"ave","ave":"ave","ave.":"ave","av":"ave",
@@ -79,7 +91,7 @@ def _token_norm(tok: str) -> str:
     t = tok.lower().strip(" .,#")
     if t in _STTYPE: return _STTYPE[t]
     if t in _DIR:    return _DIR[t]
-    if t in {"apt","unit","ste","suite","lot","#"}: return ""
+    if t in {"apt","unit","ste","lot"}: return ""
     return re.sub(r"[^a-z0-9-]", "", t)
 
 def _norm_slug_from_text(text: str) -> str:
@@ -107,137 +119,10 @@ def _address_text_from_url(url: str) -> str:
     if m: return re.sub(r"[-+]", " ", m.group(1)).title()
     return ""
 
-# ---- Street-only extraction for dedupe key ----
-STATE_2 = r"(?:A[LKZR]|C[AOT]|D[EC]|F[LM]|G[AU]|H[IW]|I[ADLN]|K[SY]|L[A]|M[ADEINOST]|N[CDEHJMVY]|O[HKR]|P[A]|R[IL]|S[CD]|T[NX]|UT|V[AIT]|W[AIVY])"
-
-def _split_addr(addr: str) -> Tuple[str, str, str, str]:
-    """
-    Very lightweight split into (street, city, state, zip).
-    Handles both 'street, city, ST zip' and bare 'street ... ST zip'.
-    """
-    a = (addr or "").strip()
-    if not a:
-        return "", "", "", ""
-    a = re.sub(r"\s+", " ", a)
-
-    # With commas
-    if "," in a:
-        parts = [p.strip() for p in a.split(",")]
-        street = parts[0] if parts else ""
-        rest = " ".join(parts[1:]).strip()
-        m = re.search(rf"\b({STATE_2})\b(?:\s+(\d{{5}}(?:-\d{{4})?))?\s*$", rest, re.I)
-        state = (m.group(1) if m else "").upper()
-        zipc  = (m.group(2) if (m and m.lastindex and m.lastindex >= 2) else "")
-        city  = rest[:m.start()].strip() if m else rest
-        return street, city, state, zipc
-
-    # No commas: try to peel state/zip from tail
-    m2 = re.search(rf"\b({STATE_2})\b(?:\s+(\d{{5}}(?:-\d{{4})?))?\s*$", a, re.I)
-    state = (m2.group(1) if m2 else "").upper()
-    zipc  = (m2.group(2) if (m2 and m2.lastindex and m2.lastindex >= 2) else "")
-    head = a[:m2.start()].strip() if m2 else a
-
-    # crude guess: street first, then city words
-    return head, "", state, zipc
-
-def _strip_unit_tail(street: str) -> str:
-    return re.sub(r"\b(?:apt|unit|suite|ste|lot|#)\s*[A-Za-z0-9\-]*\s*$", "", street, flags=re.I).strip()
-
-def _canonicalize_street(street: str) -> str:
-    """
-    Canonical display: number + DIR + Name + TYPE (abbrev), e.g. 'E Jackson St'
-    """
-    s = _strip_unit_tail(street or "")
-    s = re.sub(r"\s+", " ", s).strip().strip(",")
-    if not s:
-        return ""
-    parts = s.split()
-    num = parts[0] if parts and parts[0].isdigit() else ""
-    idx = 1 if num else 0
-
-    lead_dir = ""
-    if idx < len(parts) and parts[idx].lower().strip(".,") in _DIR:
-        lead_dir = _DIR[parts[idx].lower().strip(".,")]
-        idx += 1
-
-    # detect street type at end
-    st_type = ""
-    tail_dir = ""
-    j = len(parts) - 1
-    if j >= idx:
-        last = parts[j].lower().strip(".,")
-        if last in _DIR:
-            tail_dir = _DIR[last]
-            j -= 1
-            last = parts[j].lower().strip(".,") if j >= idx else ""
-        if last in _STTYPE:
-            st_type = _STTYPE[last]
-            j -= 1
-
-    core_tokens = [re.sub(r"[^\w-]", "", t) for t in parts[idx:j+1] if t]
-    # Title case core (keep small words lowercase except first)
-    small = {"of","and","the","at","in","on"}
-    core_disp = []
-    for k, tok in enumerate(core_tokens):
-        if k > 0 and tok.lower() in small:
-            core_disp.append(tok.lower())
-        else:
-            core_disp.append(tok[:1].upper() + tok[1:].lower())
-
-    disp: List[str] = []
-    if num: disp.append(num)
-    if lead_dir: disp.append(lead_dir.upper())
-    if core_disp: disp.append(" ".join(core_disp))
-    if st_type: disp.append(st_type.upper())
-    elif tail_dir: disp.append(tail_dir.upper())
-    return " ".join(disp).strip()
-
-def _street_only(addr: str) -> str:
-    street, _, _, _ = _split_addr(addr)
-    return _canonicalize_street(street)
-
-def _city_title(city: str) -> str:
-    c = (city or "").strip()
-    if not c: return ""
-    parts = re.split(r"\s+", c.replace("-", " "))
-    small = {"of","and","the","at","in","on"}
-    out = []
-    for i, p in enumerate(parts):
-        if i > 0 and p.lower() in small:
-            out.append(p.lower())
-        else:
-            out.append(p[:1].upper() + p[1:].lower())
-    return " ".join(out)
-
-def _canonical_display_address(addr: str, url: str = "") -> str:
-    """ '<CanonStreet>, City, ST ZIP' when available; falls back safely. """
-    raw = (addr or "").strip() or _address_text_from_url(url) or ""
-    street, city, st2, z = _split_addr(raw)
-    c_street = _street_only(street)
-    parts = []
-    if c_street: parts.append(c_street)
-    if city: parts.append(_city_title(city))
-    tail = []
-    if st2: tail.append(st2.upper())
-    if z:
-        m = re.match(r"^\d{5}", z)
-        if m: tail.append(m.group(0))
-    if tail: parts.append(" ".join(tail))
-    if not parts:
-        return raw or "Listing"
-    if len(parts) >= 3:
-        return f"{parts[0]}, {parts[1]}, {parts[2]}"
-    if len(parts) == 2:
-        return f"{parts[0]}, {parts[1]}"
-    return parts[0]
-
-# ---- Property key (FIXED: street-only slug) ----
 def _property_key(row: Dict[str, Any]) -> str:
     url = (row.get("url") or "").strip()
     addr = (row.get("address") or "").strip() or _address_text_from_url(url)
-    # KEY CHANGE: slug from street-only to unify variants (with/without city/zip)
-    street = _street_only(addr)
-    norm_pslug = _norm_slug_from_url(url) or _norm_slug_from_text(street)
+    norm_pslug = _norm_slug_from_url(url) or _norm_slug_from_text(addr)
     if norm_pslug:
         return "normslug::" + norm_pslug
     canon = (row.get("canonical") or "").strip().lower()
@@ -246,7 +131,6 @@ def _property_key(row: Dict[str, Any]) -> str:
     if zpid: return "zpid::" + zpid
     return "url::" + (url.lower())
 
-# ================= Query param helpers =================
 def _qp_get(name, default=None):
     try:
         qp = st.query_params
@@ -266,7 +150,6 @@ def _qp_set(**kwargs):
         if kwargs: st.experimental_set_query_params(**kwargs)
         else:      st.experimental_set_query_params()
 
-# ================= Dedupe =================
 def _dedupe_by_property(rows: List[Dict[str,Any]]) -> List[Dict[str,Any]]:
     def ts(row):
         try: return datetime.fromisoformat((row.get("sent_at") or "").replace("Z","+00:00"))
@@ -278,7 +161,8 @@ def _dedupe_by_property(rows: List[Dict[str,Any]]) -> List[Dict[str,Any]]:
             best[key] = r
     return list(best.values())
 
-# ================= Streamlit bits =================
+
+# ================= Lazy Streamlit bits (run-time only) =================
 def _inject_css_once():
     if st.session_state.get("__clients_css_injected__"):
         return
@@ -309,14 +193,26 @@ def _inject_css_once():
     .pill.inactive { opacity: 0.95; }
 
     .section-rule { border-bottom:1px solid var(--row-border); margin:8px 0 6px 0; }
+    .report-item { margin:0.30rem 0; line-height:1.35; }
 
+    .meta-chip {
+      display:inline-block; font-size:11px; font-weight:800;
+      padding:2px 6px; border-radius:999px; margin-left:8px;
+      background:#eef2ff; color:#1e3a8a; border:1px solid #c7d2fe;
+    }
+    html[data-theme="dark"] .meta-chip { background:#1f2937; color:#bfdbfe; border-color:#374151; }
+
+    /* Light blue date badge */
     .date-badge {
       display:inline-block; font-size:11px; font-weight:800;
       padding:2px 6px; border-radius:999px; margin-left:8px;
       background:#e0f2fe; color:#075985; border:1px solid #7dd3fc;
     }
-    html[data-theme="dark"] .date-badge { background:#0b1220; color:#7dd3fc; border-color:#164e63; }
+    html[data-theme="dark"] .date-badge {
+      background:#0b1220; color:#7dd3fc; border-color:#164e63;
+    }
 
+    /* Red toured badge */
     .toured-badge {
       display:inline-block; font-size:11px; font-weight:800;
       padding:2px 6px; border-radius:999px; margin-left:8px;
@@ -332,7 +228,7 @@ def _safe_rerun():
         try: st.experimental_rerun()
         except Exception: pass
 
-# ============== Supabase ==============
+# ============== Supabase (lazy + safe) ==============
 @st.cache_resource(show_spinner=False)
 def get_supabase() -> Optional["Client"]:
     if create_client is None:
@@ -350,7 +246,7 @@ def _sb_ok(SUPABASE) -> bool:
     try: return bool(SUPABASE)
     except Exception: return False
 
-# ============== DB helpers ==============
+# ============== DB helpers (lazy supabase handle) ==============
 @st.cache_data(ttl=60, show_spinner=False)
 def fetch_clients(include_inactive: bool = False) -> List[Dict[str, Any]]:
     SUPABASE = get_supabase()
@@ -404,6 +300,7 @@ def fetch_sent_for_client(client_norm: str, limit: int = 5000):
     SUPABASE = get_supabase()
     if not (_sb_ok(SUPABASE) and client_norm.strip()): return []
     try:
+        # include 'id' so we can delete rows precisely
         cols = "id,url,address,sent_at,campaign,mls_id,canonical,zpid"
         resp = SUPABASE.table("sent").select(cols)\
             .eq("client", client_norm.strip())\
@@ -415,9 +312,6 @@ def fetch_sent_for_client(client_norm: str, limit: int = 5000):
 
 @st.cache_data(ttl=120, show_spinner=False)
 def fetch_tour_norm_slugs_for_client(client_norm: str) -> set:
-    """
-    Return street-only slugs so 'Toured' aligns with dedupe.
-    """
     SUPABASE = get_supabase()
     if not (_sb_ok(SUPABASE) and client_norm.strip()): return set()
     try:
@@ -428,12 +322,10 @@ def fetch_tour_norm_slugs_for_client(client_norm: str) -> set:
         stops = (sq.data or [])
         out: set = set()
         for s in stops:
-            raw = s.get("address_slug") or s.get("address") or ""
-            if raw:
-                street = _street_only(raw)
-                slug = _norm_slug_from_text(street)
-                if slug:
-                    out.add(slug)
+            if s.get("address_slug"):
+                out.add(_norm_slug_from_text(s["address_slug"]))
+            elif s.get("address"):
+                out.add(_norm_slug_from_text(s["address"]))
         return out
     except Exception:
         return set()
@@ -455,6 +347,7 @@ def _delete_sent_rows_by_ids(ids: List[int]) -> Tuple[bool, str]:
         return False, str(e)
 
 def _collect_ids_for_property(client_norm: str, all_sent_rows: List[Dict[str, Any]], prop_key: str) -> List[int]:
+    """Return all 'sent.id' that match the same-property key for this client."""
     ids: List[int] = []
     for r in all_sent_rows:
         try:
@@ -464,7 +357,8 @@ def _collect_ids_for_property(client_norm: str, all_sent_rows: List[Dict[str, An
             continue
     return ids
 
-# ================= UI =================
+
+# ================= UI bits =================
 def _client_row_icons(name: str, norm: str, cid: int, active: bool):
     col_name, col_rep, col_ren, col_tog, col_del, col_sp = st.columns([8, 1, 1, 1, 1, 2])
 
@@ -529,6 +423,7 @@ def _client_row_icons(name: str, norm: str, cid: int, active: bool):
 
     st.markdown("<div class='section-rule'></div>", unsafe_allow_html=True)
 
+
 def _render_client_report_view(client_display_name: str, client_norm: str):
     st.markdown(f"### Report for {escape(client_display_name)}", unsafe_allow_html=True)
 
@@ -544,7 +439,7 @@ def _render_client_report_view(client_display_name: str, client_norm: str):
         st.info("No listings have been sent to this client yet.")
         return
 
-    tour_street_slugs = fetch_tour_norm_slugs_for_client(client_norm)
+    tour_norm_slugs = fetch_tour_norm_slugs_for_client(client_norm)
 
     # Filters
     seen_camps: List[str] = []
@@ -579,16 +474,24 @@ def _render_client_report_view(client_display_name: str, client_norm: str):
     deduped  = _dedupe_by_property(filtered)
     st.caption(f"{len(deduped)} unique listing{'s' if len(deduped)!=1 else ''} (deduped by property)")
 
+    def chip(t: Any) -> str:
+        if t is None: return ""
+        s = str(t).strip()
+        if not s: return ""
+        return f"<span class='meta-chip'>{escape(s)}</span>"
+
+    # Build Markdown bullet list with inline HTML chips/badges
     md_lines: List[str] = []
     for r in deduped:
         url  = (r.get("url") or "").strip()
-        addr_disp = _canonical_display_address((r.get("address") or "").strip(), url)
+        addr = (r.get("address") or "").strip() or _address_text_from_url(url) or "Listing"
 
+        # Single DATE tag (YYYYMMDD)
         date_tag = _pick_timestamp_date_tag(r)
 
-        # toured uses same street-only slug used for dedupe
-        street_slug = _norm_slug_from_text(_street_only(addr_disp))
-        toured = street_slug in tour_street_slugs
+        # Toured badge (once)
+        norm_pslug = _norm_slug_from_url(url) or _norm_slug_from_text(addr)
+        toured = norm_pslug in tour_norm_slugs
 
         meta: List[str] = []
         if date_tag:
@@ -600,10 +503,11 @@ def _render_client_report_view(client_display_name: str, client_norm: str):
         if DEBUG_REPORT:
             debug_html = (
                 " <span style='font-size:10px;opacity:.7'>(dbg "
-                f"date_tag={escape(date_tag or '-')}, slug={escape(street_slug)}, toured={'yes' if toured else 'no'})</span>"
+                f"date_tag={escape(date_tag or '-')}, camp={(r.get('campaign') or '')}, "
+                f"slug={escape(norm_pslug)}, toured={'yes' if toured else 'no'})</span>"
             )
 
-        line = f"- <a href=\"{escape(url)}\" target=\"_blank\" rel=\"noopener\">{escape(addr_disp)}</a> {' '.join(meta)}{debug_html}"
+        line = f"- <a href=\"{escape(url)}\" target=\"_blank\" rel=\"noopener\">{escape(addr)}</a> {' '.join(meta)}{debug_html}"
         md_lines.append(line)
 
     if not md_lines:
@@ -613,19 +517,21 @@ def _render_client_report_view(client_display_name: str, client_norm: str):
     st.markdown("\n".join(md_lines), unsafe_allow_html=True)
 
     # ---- Manage sent listings (delete) ----
+    # Build map: property key -> label, and property key -> all row ids (from full sent_rows)
     propkey_to_label: Dict[str, str] = {}
     propkey_to_ids: Dict[str, List[int]] = {}
 
     for r in deduped:
         url  = (r.get("url") or "").strip()
-        addr_disp = _canonical_display_address((r.get("address") or "").strip(), url)
+        addr = (r.get("address") or "").strip() or _address_text_from_url(url) or "Listing"
         key  = _property_key(r)
-        propkey_to_label[key] = addr_disp
+        propkey_to_label[key] = addr
 
     for key in list(propkey_to_label.keys()):
         propkey_to_ids[key] = _collect_ids_for_property(client_norm, sent_rows, key)
 
     with st.expander("Manage sent listings (delete)"):
+        # Disambiguate duplicate labels by suffixing counter
         label_to_key: Dict[str, str] = {}
         counts: Dict[str, int] = {}
         for k, lbl in propkey_to_label.items():
@@ -670,7 +576,8 @@ def _render_client_report_view(client_display_name: str, client_norm: str):
             use_container_width=False
         )
 
-# ============== Public entry ==============
+
+# ============== Public entry (call this from app.py) ==============
 def render_clients_tab():
     _inject_css_once()
 
