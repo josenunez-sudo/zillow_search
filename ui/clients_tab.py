@@ -274,7 +274,6 @@ def _canonical_display_address(addr: str, url: str = "") -> str:
     st_txt, city, st2, z = _split_addr(raw)
     c_street = _canonicalize_street(st_txt)
 
-    # Prefer ZIP if present, else omit
     parts = []
     if c_street:
         parts.append(c_street)
@@ -289,14 +288,12 @@ def _canonical_display_address(addr: str, url: str = "") -> str:
             tail.append(m.group(0))
     if tail:
         parts.append(" ".join([p for p in tail if p]))
-    # Insert commas appropriately
     if len(parts) >= 3:
-        return f"{parts[0]}, {parts[1]}, {parts[2]}"
+        return parts[0] + ", " + parts[1] + ", " + parts[2]
     if len(parts) == 2:
-        return f"{parts[0]}, {parts[1]}"
+        return parts[0] + ", " + parts[1]
     if len(parts) == 1:
         return parts[0]
-    # Final fallback
     return (raw or "").strip() or (_address_text_from_url(url) or "Listing")
 
 # ---- Candidate keys per row (most specific -> least) ----
@@ -323,7 +320,6 @@ def _candidate_keys(row: Dict[str, Any]) -> List[str]:
     zslug = _norm_slug_from_url(url)
     if zslug: keys.append("zslug::" + zslug)
 
-    # Most precise geographic keys first
     if sslug and z5:
         keys.append("addrzip::{}::{}".format(sslug, z5))
     if sslug and cslug and st2:
@@ -419,42 +415,30 @@ def _inject_css_once():
     if st.session_state.get("__clients_css_injected__"):
         return
     st.session_state["__clients_css_injected__"] = True
-    st.markdown(
-        r"""
-        <style>
-        :root { --row-border:#e2e8f0; --ink:#0f172a; --muted:#475569; }
-        html[data-theme="dark"], .stApp [data-theme="dark"] {
-          --row-border:#0b1220; --ink:#f8fafc; --muted:#cbd5e1;
-        }
-        .client-row { display:flex; align-items:center; justify-content:space-between; padding:10px 8px; border-bottom:1px solid var(--row-border); }
-        .client-left { display:flex; align-items:center; gap:8px; min-width:0; }
-        .client-name { font-weight:700; color:var(--ink); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
 
-        .pill {
-          font-size:11px; font-weight:800; padding:2px 10px; border-radius:999px;
-          background:#f1f5f9; color:#0f172a; border:1px solid #cbd5e1; display:inline-block;
-        }
-        html[data-theme="dark"] .pill { background:#111827; color:#e5e7eb; border-color:#374151; }
-        .pill.active {
-          background: linear-gradient(180deg, #dcfce7 0%, #bbf7d0 100%);
-          color:#166534; border:1px solid rgba(5,150,105,.35);
-        }
-        html[data-theme="dark"] .pill.active {
-          background: linear-gradient(180deg, #064e3b 0%, #065f46 100%);
-          color:#a7f3d0; border-color:rgba(167,243,208,.35);
-        }
-        .pill.inactive { opacity: 0.95; }
-
-        .section-rule { border-bottom:1px solid var(--row-border); margin:8px 0 6px 0; }
-        .meta-chip { display:inline-block; font-size:11px; font-weight:800; padding:2px 6px; border-radius:999px; margin-left:8px; background:#eef2ff; color:#1e3a8a; border:1px solid #c7d2fe; }
-        .date-badge { display:inline-block; font-size:11px; font-weight:800; padding:2px 6px; border-radius:999px; margin-left:8px; background:#e0f2fe; color:#075985; border:1px solid #7dd3fc; }
-        html[data-theme="dark"] .date-badge { background:#0b1220; color:#7dd3fc; border-color:#164e63; }
-        .toured-badge { display:inline-block; font-size:11px; font-weight:800; padding:2px 6px; border-radius:999px; margin-left:8px; background:#fee2e2; color:#991b1b; border:1px solid #fecaca; }
-        html[data-theme="dark"] .toured-badge { background:#7f1d1d; color:#fecaca; border-color:#ef4444; }
-        </style>
-        """,
-        unsafe_allow_html=True,
+    css = (
+        "<style>"
+        ":root { --row-border:#e2e8f0; --ink:#0f172a; --muted:#475569; }"
+        "html[data-theme='dark'], .stApp [data-theme='dark'] {"
+        "  --row-border:#0b1220; --ink:#f8fafc; --muted:#cbd5e1;"
+        "}"
+        ".client-row { display:flex; align-items:center; justify-content:space-between; padding:10px 8px; border-bottom:1px solid var(--row-border); }"
+        ".client-left { display:flex; align-items:center; gap:8px; min-width:0; }"
+        ".client-name { font-weight:700; color:var(--ink); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }"
+        ".pill { font-size:11px; font-weight:800; padding:2px 10px; border-radius:999px; background:#f1f5f9; color:#0f172a; border:1px solid #cbd5e1; display:inline-block; }"
+        "html[data-theme='dark'] .pill { background:#111827; color:#e5e7eb; border-color:#374151; }"
+        ".pill.active { background: linear-gradient(180deg, #dcfce7 0%, #bbf7d0 100%); color:#166534; border:1px solid rgba(5,150,105,.35); }"
+        "html[data-theme='dark'] .pill.active { background: linear-gradient(180deg, #064e3b 0%, #065f46 100%); color:#a7f3d0; border-color:rgba(167,243,208,.35); }"
+        ".pill.inactive { opacity: 0.95; }"
+        ".section-rule { border-bottom:1px solid var(--row-border); margin:8px 0 6px 0; }"
+        ".meta-chip { display:inline-block; font-size:11px; font-weight:800; padding:2px 6px; border-radius:999px; margin-left:8px; background:#eef2ff; color:#1e3a8a; border:1px solid #c7d2fe; }"
+        ".date-badge { display:inline-block; font-size:11px; font-weight:800; padding:2px 6px; border-radius:999px; margin-left:8px; background:#e0f2fe; color:#075985; border:1px solid #7dd3fc; }"
+        "html[data-theme='dark'] .date-badge { background:#0b1220; color:#7dd3fc; border-color:#164e63; }"
+        ".toured-badge { display:inline-block; font-size:11px; font-weight:800; padding:2px 6px; border-radius:999px; margin-left:8px; background:#fee2e2; color:#991b1b; border:1px solid #fecaca; }"
+        "html[data-theme='dark'] .toured-badge { background:#7f1d1d; color:#fecaca; border-color:#ef4444; }"
+        "</style>"
     )
+    st.markdown(css, unsafe_allow_html=True)
 
 def _safe_rerun():
     try:
@@ -628,7 +612,6 @@ def fetch_tour_norm_slugs_for_client(client_norm: str) -> set:
         for s in stops:
             raw = s.get("address_slug") or s.get("address") or ""
             if raw:
-                # Normalize with the same canonical rules used in the report
                 sslug = _street_slug(_canonical_display_address(raw))
                 if sslug:
                     out.add("addr::" + sslug)
@@ -809,48 +792,34 @@ def _render_client_report_view(client_display_name: str, client_norm: str):
 
     filtered = [r for r in sent_rows if _match(r)]
     deduped = _dedupe_by_property(filtered)
-    st.caption(
-        "{n} unique listing{pl} (deduped by property)".format(
-            n=len(deduped), pl=("s" if len(deduped) != 1 else "")
-        )
-    )
+    st.caption("{n} unique listing{pl}".format(n=len(deduped), pl=("s" if len(deduped) != 1 else "")))
 
     md_lines: List[str] = []
     for r in deduped:
         url = (r.get("url") or "").strip()
-        # Uniform display address
         addr_display = _canonical_display_address((r.get("address") or "").strip(), url)
-
-        # DATE tag (YYYYMMDD)
         date_tag = _pick_timestamp_date_tag(r)
 
-        # Toured badge: compare on street-only key (canonical rules)
         sslug = _street_slug(addr_display)
         street_key = "addr::" + sslug if sslug else ""
         toured = street_key in tour_street_keys
 
-        debug_html = ""
-        if DEBUG_REPORT:
-            debug_html = (
-                " <span style='font-size:10px;opacity:.7'>(dbg date_tag={dt}, key={k}, toured={t})</span>".format(
-                    dt=escape(date_tag or "-"),
-                    k=escape(street_key or "-"),
-                    t=("yes" if toured else "no"),
-                )
-            )
-
-        meta: List[str] = []
+        meta = []
         if date_tag:
-            meta.append("<span class='date-badge'>{}</span>".format(escape(date_tag)))
+            meta.append("<span class='date-badge'>" + escape(date_tag) + "</span>")
         if toured:
             meta.append("<span class='toured-badge'>Toured</span>")
 
-        line = "- <a href=\"{u}\" target=\"_blank\" rel=\"noopener\">{a}</a> {meta}{dbg}".format(
-            u=escape(url) if url else "#",
-            a=escape(addr_display),
-            meta=" ".join(meta),
-            dbg=debug_html,
-        )
+        debug_html = ""
+        if DEBUG_REPORT:
+            dbg = "(dbg date_tag={dt}, key={k}, toured={t})".format(
+                dt=escape(date_tag or "-"),
+                k=escape(street_key or "-"),
+                t=("yes" if toured else "no")
+            )
+            debug_html = " <span style='font-size:10px;opacity:.7'>" + dbg + "</span>"
+
+        line = "- <a href=\"" + (escape(url) if url else "#") + "\" target=\"_blank\" rel=\"noopener\">" + escape(addr_display) + "</a> " + " ".join(meta) + debug_html
         md_lines.append(line)
 
     if not md_lines:
@@ -881,9 +850,9 @@ def _render_client_report_view(client_display_name: str, client_norm: str):
     gid_label: Dict[str, str] = {}
     for gid, rows_for_gid in gid_rows.items():
         best = max(rows_for_gid, key=_best_ts)
-        url = (best.get("url") or "").strip()
-        addr_display = _canonical_display_address((best.get("address") or "").strip(), url)
-        gid_label[gid] = addr_display
+        url_b = (best.get("url") or "").strip()
+        addr_display_b = _canonical_display_address((best.get("address") or "").strip(), url_b)
+        gid_label[gid] = addr_display_b
 
     with st.expander("Manage sent listings (delete)"):
         label_to_gid: Dict[str, str] = {}
@@ -894,7 +863,7 @@ def _render_client_report_view(client_display_name: str, client_norm: str):
             if c == 0:
                 label_to_gid[lbl] = gid
             else:
-                dis_lbl = "{}  · {}".format(lbl, c + 1)
+                dis_lbl = lbl + "  · " + str(c + 1)
                 label_to_gid[dis_lbl] = gid
 
         choices = list(label_to_gid.keys())
@@ -963,7 +932,7 @@ def render_clients_tab():
         for c in inactive:
             _client_row_icons(c["name"], c.get("name_norm", ""), c["id"], active=False)
 
-    st.markdown('<div id="report_anchor"></div>', unsafe_allow_html=True)
+    st.markdown("<div id='report_anchor'></div>", unsafe_allow_html=True)
     if report_norm_qp:
         display_name = next(
             (c["name"] for c in all_clients if c.get("name_norm") == report_norm_qp),
@@ -973,12 +942,7 @@ def render_clients_tab():
         _render_client_report_view(display_name, report_norm_qp)
         if want_scroll:
             st.components.v1.html(
-                """
-                <script>
-                  const el = parent.document.getElementById("report_anchor");
-                  if (el) { el.scrollIntoView({behavior: "smooth", block: "start"}); }
-                </script>
-                """,
+                "<script>var el=parent.document.getElementById('report_anchor');if(el){el.scrollIntoView({behavior:'smooth',block:'start'});}</script>",
                 height=0,
             )
         _qp_set(report=report_norm_qp)
