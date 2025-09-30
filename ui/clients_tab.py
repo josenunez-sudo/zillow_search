@@ -1,5 +1,6 @@
-# ui/clients_tab.py
-# -*- coding: utf-8 -*-
+# ui/clients_tab_impl.py
+# Full Clients tab implementation (moved out of clients_tab.py for safety)
+
 import os
 import re
 import io
@@ -9,16 +10,17 @@ from typing import List, Dict, Any, Optional, Tuple
 
 import streamlit as st
 
-# --- Safe supabase import (module loads even if supabase is not installed) ---
+# --- Make supabase import SAFE so the module can import even if package is missing ---
 try:
     from supabase import create_client, Client
 except Exception:
     create_client = None
-    Client = object  # type: ignore
+    class Client:  # type: ignore
+        pass
 
 DEBUG_REPORT = False  # set True if you want to see per-row debug info
 
-# ================= Basics =================
+# ================= Basics (pure helpers; safe at import time) =================
 def _norm_tag(s: str) -> str:
     return re.sub(r"\s+", " ", (s or "").strip()).lower()
 
@@ -27,16 +29,20 @@ def _fmt_ts_date_tag(ts: Any) -> str:
     if ts is None or str(ts).strip() == "":
         return ""
     raw = str(ts).strip()
+
+    # epoch seconds/millis
     try:
         if raw.isdigit():
             val = int(raw)
-            if val > 10_000_000_000:  # ms
+            if val > 10000000000:  # ms
                 d = datetime.utcfromtimestamp(val / 1000.0)
             else:
                 d = datetime.utcfromtimestamp(val)
             return d.strftime("%Y%m%d")
     except Exception:
         pass
+
+    # ISO
     try:
         d = datetime.fromisoformat(raw.replace("Z", "+00:00"))
         return d.strftime("%Y%m%d")
@@ -59,12 +65,15 @@ def _pick_timestamp_date_tag(row: Dict[str, Any]) -> str:
         tag = _fmt_ts_date_tag(row.get(k))
         if tag:
             return tag
+
+    # fallback: campaign that is a pure 8-digit date
     camp = (row.get("campaign") or "").strip()
     if re.fullmatch(r"\d{8}", camp):
         return camp
+
     return ""
 
-# ------------- Property/address normalization -------------
+# ------------- Property slug normalization (strong & symmetric) -------------
 _STTYPE = {
     "street":"st","st":"st","st.":"st",
     "avenue":"ave","ave":"ave","ave.":"ave","av":"ave",
@@ -78,12 +87,9 @@ _STTYPE = {
     "highway":"hwy","hwy":"hwy",
     "parkway":"pkwy","pkwy":"pkwy",
     "circle":"cir","cir":"cir",
-    "square":"sq","sq":"sq"
+    "square":"sq","sq":"sq",
 }
-_DIR = {
-    "north":"n","n":"n","south":"s","s":"s","east":"e","e":"e","west":"w","w":"w",
-    "n.":"n","s.":"s","e.":"e","w.":"w"
-}
+_DIR = {"north":"n","n":"n","south":"s","s":"s","east":"e","e":"e","west":"w","w":"w","n.":"n","s.":"s","e.":"e","w.":"w"}
 
 def _token_norm(tok: str) -> str:
     t = tok.lower().strip(" .,#")
@@ -117,151 +123,45 @@ def _address_text_from_url(url: str) -> str:
     if m: return re.sub(r"[-+]", " ", m.group(1)).title()
     return ""
 
-# ====== Address parsing (handles comma/no-comma) ======
-STATE_2 = r"(?:A[LKZR]|C[AOT]|D[EC]|F[LM]|G[AU]|H[IW]|I[ADLN]|K[SY]|L[A]|M[ADEINOST]|N[CDEHJMVY]|O[HKR]|P[A]|R[IL]|S[CD]|T[NX]|UT|V[AIT]|W[AIVY])"
-
-def _split_addr(addr: str) -> Tuple[str, str, str, str]:
-    """
-    Split into (street, city, state, zip) for lines with or without commas.
-    """
-    a = (addr or "").strip()
-    if not a:
-        return "", "", "", ""
-    a = re.sub(r"\s+", " ", a)
-
-    if "," in a:
-        parts = [p.strip() for p in a.split(",")]
-        street = parts[0] if parts else ""
-        rest = " ".join(parts[1:]).strip()
-        m = re.search(rf"\b({STATE_2})\b(?:\s+(\d{{5}}(?:-\d{{4})?))?\s*$", rest, re.I)
-        state = (m.group(1) if m else "").upper()
-        zipc  = (m.group(2) if (m and m.lastindex and m.lastindex >= 2) else "")
-        city  = rest[:m.start()].strip() if m else rest
-        return street, city, state, zipc
-
-    m2 = re.search(rf"\b({STATE_2})\b(?:\s+(\d{{5}}(?:-\d{{4})?))?\s*$", a, re.I)
-    state = (m2.group(1) if m2 else "").upper()
-    zipc  = (m2.group(2) if (m2 and m2.lastindex and m2.lastindex >= 2) else "")
-    head = a[:m2.start()].strip() if m2 else a
-
-    m3 = re.match(r"^\s*\d+\s+.*$", head)
-    if m3:
-        mtype = re.search(
-            r"\b(st|street|ave|avenue|rd|road|dr|drive|ln|lane|blvd|boulevard|ct|court|pl|place|ter|terrace|hwy|highway|pkwy|parkway|cir|circle|sq|square)\b\.?",
-            head, re.I
-        )
-        street = head[:mtype.end()] if mtype else head
-        city = head[len(street):].strip()
-        return street.strip(), city, state, zipc
-
-    return head, "", state, zipc
-
 def _street_only(addr: str) -> str:
-    s, _, _, _ = _split_addr(addr)
-    s = re.sub(r"\b(?:apt|unit|suite|ste|lot|#)\s*[A-Za-z0-9\-]*\s*$", "", s, flags=re.I).strip()
-    return s
+    a = (addr or "").strip()
+    if not a: return ""
+    # if commas exist, take first segment
+    if "," in a:
+        a = a.split(",")[0].strip()
+    # drop trailing unit bits
+    a = re.sub(r"\b(?:apt|unit|suite|ste|lot|#)\s*[A-Za-z0-9\-]*\s*$", "", a, flags=re.I)
+    a = re.sub(r"\s+", " ", a).strip()
+    return a
 
 def _street_slug(addr: str) -> str:
     return _norm_slug_from_text(_street_only(addr))
 
-def _city_slug(addr: str) -> str:
-    _, c, _, _ = _split_addr(addr)
-    return _norm_slug_from_text(c)
-
-def _state2(addr: str) -> str:
-    _, _, stt, _ = _split_addr(addr)
-    return (stt or "").upper()
-
-def _zip5(addr: str) -> str:
-    _, _, _, z = _split_addr(addr)
-    m = re.match(r"^(\d{5})", z or "")
-    return m.group(1) if m else ""
-
-# ---- Candidate keys per row (most specific -> least) ----
-def _candidate_keys(row: Dict[str, Any]) -> List[str]:
+def _property_key(row: Dict[str, Any]) -> str:
+    """
+    Build a stable key; order of preference:
+    1) Zillow slug    2) canonical   3) zpid   4) street-only slug   5) normalized URL
+    """
     url = (row.get("url") or "").strip()
     addr = (row.get("address") or "").strip() or _address_text_from_url(url)
 
-    sslug = _street_slug(addr)
-    cslug = _city_slug(addr)
-    st2   = _state2(addr)
-    z5    = _zip5(addr)
-
-    keys: List[str] = []
+    zslug = _norm_slug_from_url(url)
+    if zslug:
+        return "zslug::" + zslug
 
     canon = (row.get("canonical") or "").strip().lower()
-    if canon: keys.append("canon::" + canon)
+    if canon:
+        return "canon::" + canon
 
     zpid = (row.get("zpid") or "").strip()
-    if zpid: keys.append("zpid::" + zpid)
+    if zpid:
+        return "zpid::" + zpid
 
-    zslug = _norm_slug_from_url(url)
-    if zslug: keys.append("zslug::" + zslug)
-
-    if sslug and z5:
-        keys.append("addrzip::{}::{}".format(sslug, z5))
-    if sslug and cslug and st2:
-        keys.append("addrcs::{}::{}::{}".format(sslug, cslug, st2))
-    if sslug and cslug and not st2:
-        keys.append("addrc::{}::{}".format(sslug, cslug))
+    sslug = _street_slug(addr)
     if sslug:
-        keys.append("addr::{}".format(sslug))
+        return "addr::" + sslug
 
-    if url:
-        keys.append("url::" + url.lower())
-
-    out: List[str] = []
-    seen = set()
-    for kk in keys:
-        if kk and kk not in seen:
-            seen.add(kk)
-            out.append(kk)
-    return out
-
-def _best_ts(row: Dict[str, Any]) -> datetime:
-    tag = _pick_timestamp_date_tag(row)
-    if tag:
-        try:
-            return datetime.strptime(tag, "%Y%m%d")
-        except Exception:
-            pass
-    try:
-        return datetime.fromisoformat((row.get("sent_at") or "").replace("Z", "+00:00"))
-    except Exception:
-        return datetime.min
-
-def _dedupe_by_property(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """
-    Group rows by ANY overlapping candidate key.
-    """
-    key_to_gid: Dict[str, str] = {}
-    gid_best: Dict[str, Dict[str, Any]] = {}
-
-    def pick_gid(cands: List[str]) -> Optional[str]:
-        for c in cands:
-            if c in key_to_gid:
-                return key_to_gid[c]
-        return None
-
-    def make_gid(cands: List[str]) -> str:
-        for c in cands:
-            if c:
-                return c
-        return "gid::{}".format(len(gid_best) + 1)
-
-    for r in rows:
-        cands = _candidate_keys(r)
-        gid = pick_gid(cands)
-        if not gid:
-            gid = make_gid(cands)
-        for c in cands:
-            if c and c not in key_to_gid:
-                key_to_gid[c] = gid
-        cur = gid_best.get(gid)
-        if (not cur) or (_best_ts(r) > _best_ts(cur)):
-            gid_best[gid] = r
-
-    return list(gid_best.values())
+    return "url::" + url.lower()
 
 # ================= Query params helpers =================
 def _qp_get(name, default=None):
@@ -277,66 +177,11 @@ def _qp_get(name, default=None):
 
 def _qp_set(**kwargs):
     try:
-        if kwargs:
-            st.query_params.update(kwargs)
-        else:
-            st.query_params.clear()
+        if kwargs: st.query_params.update(kwargs)
+        else:      st.query_params.clear()
     except Exception:
-        if kwargs:
-            st.experimental_set_query_params(**kwargs)
-        else:
-            st.experimental_set_query_params()
-
-# ================= Lazy Streamlit bits (run-time only) =================
-def _inject_css_once():
-    if st.session_state.get("__clients_css_injected__"):
-        return
-    st.session_state["__clients_css_injected__"] = True
-    st.markdown(
-        """
-        <style>
-        :root { --row-border:#e2e8f0; --ink:#0f172a; --muted:#475569; }
-        html[data-theme="dark"], .stApp [data-theme="dark"] {
-          --row-border:#0b1220; --ink:#f8fafc; --muted:#cbd5e1;
-        }
-        .client-row { display:flex; align-items:center; justify-content:space-between; padding:10px 8px; border-bottom:1px solid var(--row-border); }
-        .client-left { display:flex; align-items:center; gap:8px; min-width:0; }
-        .client-name { font-weight:700; color:var(--ink); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
-
-        .pill {
-          font-size:11px; font-weight:800; padding:2px 10px; border-radius:999px;
-          background:#f1f5f9; color:#0f172a; border:1px solid #cbd5e1; display:inline-block;
-        }
-        html[data-theme="dark"] .pill { background:#111827; color:#e5e7eb; border-color:#374151; }
-        .pill.active {
-          background: linear-gradient(180deg, #dcfce7 0%, #bbf7d0 100%);
-          color:#166534; border:1px solid rgba(5,150,105,.35);
-        }
-        html[data-theme="dark"] .pill.active {
-          background: linear-gradient(180deg, #064e3b 0%, #065f46 100%);
-          color:#a7f3d0; border-color:rgba(167,243,208,.35);
-        }
-        .pill.inactive { opacity: 0.95; }
-
-        .section-rule { border-bottom:1px solid var(--row-border); margin:8px 0 6px 0; }
-        .meta-chip { display:inline-block; font-size:11px; font-weight:800; padding:2px 6px; border-radius:999px; margin-left:8px; background:#eef2ff; color:#1e3a8a; border:1px solid #c7d2fe; }
-        .date-badge { display:inline-block; font-size:11px; font-weight:800; padding:2px 6px; border-radius:999px; margin-left:8px; background:#e0f2fe; color:#075985; border:1px solid #7dd3fc; }
-        html[data-theme="dark"] .date-badge { background:#0b1220; color:#7dd3fc; border-color:#164e63; }
-        .toured-badge { display:inline-block; font-size:11px; font-weight:800; padding:2px 6px; border-radius:999px; margin-left:8px; background:#fee2e2; color:#991b1b; border:1px solid #fecaca; }
-        html[data-theme="dark"] .toured-badge { background:#7f1d1d; color:#fecaca; border-color:#ef4444; }
-        </style>
-        """,
-        unsafe_allow_html=True,
-    )
-
-def _safe_rerun():
-    try:
-        st.rerun()
-    except Exception:
-        try:
-            st.experimental_rerun()
-        except Exception:
-            pass
+        if kwargs: st.experimental_set_query_params(**kwargs)
+        else:      st.experimental_set_query_params()
 
 # ============== Supabase (lazy + safe) ==============
 @st.cache_resource(show_spinner=False)
@@ -353,40 +198,27 @@ def get_supabase() -> Optional["Client"]:
         return None
 
 def _sb_ok(SUPABASE) -> bool:
-    try:
-        return bool(SUPABASE)
-    except Exception:
-        return False
+    try: return bool(SUPABASE)
+    except Exception: return False
 
 # ============== DB helpers (lazy supabase handle) ==============
 @st.cache_data(ttl=60, show_spinner=False)
 def fetch_clients(include_inactive: bool = False) -> List[Dict[str, Any]]:
     SUPABASE = get_supabase()
-    if not _sb_ok(SUPABASE):
-        return []
+    if not _sb_ok(SUPABASE): return []
     try:
-        rows = (
-            SUPABASE.table("clients")
-            .select("id,name,name_norm,active")
-            .order("name", desc=False)
-            .execute()
-            .data
-            or []
-        )
-        return [r for r in rows if r.get("active")] if not include_inactive else rows
+        rows = SUPABASE.table("clients").select("id,name,name_norm,active").order("name", desc=False).execute().data or []
+        return ([r for r in rows if r.get("active")] if not include_inactive else rows)
     except Exception:
         return []
 
 def _invalidate_clients_cache():
-    try:
-        fetch_clients.clear()  # type: ignore[attr-defined]
-    except Exception:
-        pass
+    try: fetch_clients.clear()  # type: ignore[attr-defined]
+    except Exception: pass
 
 def toggle_client_active(client_id: int, new_active: bool):
     SUPABASE = get_supabase()
-    if not _sb_ok(SUPABASE) or not client_id:
-        return False, "Not configured"
+    if not _sb_ok(SUPABASE) or not client_id: return False, "Not configured"
     try:
         SUPABASE.table("clients").update({"active": new_active}).eq("id", client_id).execute()
         _invalidate_clients_cache()
@@ -396,19 +228,10 @@ def toggle_client_active(client_id: int, new_active: bool):
 
 def rename_client(client_id: int, new_name: str):
     SUPABASE = get_supabase()
-    if not _sb_ok(SUPABASE) or not client_id or not (new_name or "").strip():
-        return False, "Bad input"
+    if not _sb_ok(SUPABASE) or not client_id or not (new_name or "").strip(): return False, "Bad input"
     try:
         new_norm = _norm_tag(new_name)
-        existing = (
-            SUPABASE.table("clients")
-            .select("id")
-            .eq("name_norm", new_norm)
-            .limit(1)
-            .execute()
-            .data
-            or []
-        )
+        existing = SUPABASE.table("clients").select("id").eq("name_norm", new_norm).limit(1).execute().data or []
         if existing and existing[0]["id"] != client_id:
             return False, "A client with that (normalized) name already exists."
         SUPABASE.table("clients").update({"name": new_name.strip(), "name_norm": new_norm}).eq("id", client_id).execute()
@@ -419,8 +242,7 @@ def rename_client(client_id: int, new_name: str):
 
 def delete_client(client_id: int):
     SUPABASE = get_supabase()
-    if not _sb_ok(SUPABASE) or not client_id:
-        return False, "Not configured"
+    if not _sb_ok(SUPABASE) or not client_id: return False, "Not configured"
     try:
         SUPABASE.table("clients").delete().eq("id", client_id).execute()
         _invalidate_clients_cache()
@@ -429,7 +251,7 @@ def delete_client(client_id: int):
         return False, str(e)
 
 def upsert_client(name: str, active: bool = True):
-    """Insert-or-update a client by normalized name (used by Run tab Add new client)."""
+    """Insert-or-update a client by normalized name, used by Run tab's 'Add new client…' flow."""
     SUPABASE = get_supabase()
     if not _sb_ok(SUPABASE):
         return False, "Not configured"
@@ -438,15 +260,7 @@ def upsert_client(name: str, active: bool = True):
         return False, "Name required"
     try:
         norm = _norm_tag(name)
-        existing = (
-            SUPABASE.table("clients")
-            .select("id")
-            .eq("name_norm", norm)
-            .limit(1)
-            .execute()
-            .data
-            or []
-        )
+        existing = SUPABASE.table("clients").select("id").eq("name_norm", norm).limit(1).execute().data or []
         if existing:
             cid = existing[0]["id"]
             SUPABASE.table("clients").update({"name": name, "active": active}).eq("id", cid).execute()
@@ -460,60 +274,45 @@ def upsert_client(name: str, active: bool = True):
 @st.cache_data(ttl=120, show_spinner=False)
 def fetch_sent_for_client(client_norm: str, limit: int = 5000):
     SUPABASE = get_supabase()
-    if not (_sb_ok(SUPABASE) and client_norm.strip()):
-        return []
+    if not (_sb_ok(SUPABASE) and client_norm.strip()): return []
     try:
+        # include 'id' so we can delete rows precisely
         cols = "id,url,address,sent_at,campaign,mls_id,canonical,zpid"
-        resp = (
-            SUPABASE.table("sent")
-            .select(cols)
-            .eq("client", client_norm.strip())
-            .order("sent_at", desc=True)
-            .limit(limit)
-            .execute()
-        )
+        resp = SUPABASE.table("sent").select(cols)\
+            .eq("client", client_norm.strip())\
+            .order("sent_at", desc=True)\
+            .limit(limit).execute()
         return resp.data or []
     except Exception:
         return []
 
 @st.cache_data(ttl=120, show_spinner=False)
 def fetch_tour_norm_slugs_for_client(client_norm: str) -> set:
-    """
-    Return a set of street-only keys so toured tags align with dedupe.
-    """
+    """Return street-level keys for toured properties so we match dedupe logic."""
     SUPABASE = get_supabase()
-    if not (_sb_ok(SUPABASE) and client_norm.strip()):
-        return set()
+    if not (_sb_ok(SUPABASE) and client_norm.strip()): return set()
     try:
         tq = SUPABASE.table("tours").select("id").eq("client", client_norm).limit(5000).execute()
         ids = [t["id"] for t in (tq.data or [])]
-        if not ids:
-            return set()
-        sq = (
-            SUPABASE.table("tour_stops")
-            .select("address,address_slug")
-            .in_("tour_id", ids)
-            .limit(50000)
-            .execute()
-        )
+        if not ids: return set()
+        sq = SUPABASE.table("tour_stops").select("address,address_slug").in_("tour_id", ids).limit(50000).execute()
         stops = (sq.data or [])
         out: set = set()
         for s in stops:
             raw = s.get("address_slug") or s.get("address") or ""
-            if raw:
-                sslug = _street_slug(raw)
-                if sslug:
-                    out.add("addr::" + sslug)
+            if not raw: 
+                continue
+            sslug = _street_slug(raw)
+            if sslug:
+                out.add("addr::" + sslug)
         return out
     except Exception:
         return set()
 
 # ---- Sent-delete helpers ----
 def _invalidate_sent_cache():
-    try:
-        fetch_sent_for_client.clear()  # type: ignore[attr-defined]
-    except Exception:
-        pass
+    try: fetch_sent_for_client.clear()  # type: ignore[attr-defined]
+    except Exception: pass
 
 def _delete_sent_rows_by_ids(ids: List[int]) -> Tuple[bool, str]:
     SUPABASE = get_supabase()
@@ -526,41 +325,61 @@ def _delete_sent_rows_by_ids(ids: List[int]) -> Tuple[bool, str]:
     except Exception as e:
         return False, str(e)
 
-def _collect_ids_for_property(client_norm: str, all_sent_rows: List[Dict[str, Any]], gid: str) -> List[int]:
-    """Return all 'sent.id' that match the same-property group id for this client."""
-    gid_map: Dict[str, str] = {}
-
-    def pick_gid(cands: List[str]) -> Optional[str]:
-        for c in cands:
-            if c in gid_map:
-                return gid_map[c]
-        return None
-
-    for r in all_sent_rows:
-        cands = _candidate_keys(r)
-        g = pick_gid(cands) or (cands[0] if cands else None)
-        if not g:
-            continue
-        for c in cands:
-            if c not in gid_map:
-                gid_map[c] = g
-
-    out_ids: List[int] = []
-    for r in all_sent_rows:
-        try:
-            cands = _candidate_keys(r)
-            g = None
-            for c in cands:
-                if c in gid_map:
-                    g = gid_map[c]
-                    break
-            if g == gid and r.get("id"):
-                out_ids.append(int(r["id"]))
-        except Exception:
-            continue
-    return out_ids
-
 # ================= UI bits =================
+def _inject_css_once():
+    if st.session_state.get("__clients_css_injected__"):
+        return
+    st.session_state["__clients_css_injected__"] = True
+    st.markdown("""
+    <style>
+    :root { --row-border:#e2e8f0; --ink:#0f172a; --muted:#475569; }
+    html[data-theme="dark"], .stApp [data-theme="dark"] {
+      --row-border:#0b1220; --ink:#f8fafc; --muted:#cbd5e1;
+    }
+    .client-row { display:flex; align-items:center; justify-content:space-between; padding:10px 8px; border-bottom:1px solid var(--row-border); }
+    .client-left { display:flex; align-items:center; gap:8px; min-width:0; }
+    .client-name { font-weight:700; color:var(--ink); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+    .pill {
+      font-size:11px; font-weight:800; padding:2px 10px; border-radius:999px;
+      background:#f1f5f9; color:#0f172a; border:1px solid #cbd5e1; display:inline-block;
+    }
+    html[data-theme="dark"] .pill { background:#111827; color:#e5e7eb; border-color:#374151; }
+    .pill.active {
+      background: linear-gradient(180deg, #dcfce7 0%, #bbf7d0 100%);
+      color:#166534; border:1px solid rgba(5,150,105,.35);
+    }
+    html[data-theme="dark"] .pill.active {
+      background: linear-gradient(180deg, #064e3b 0%, #065f46 100%);
+      color:#a7f3d0; border-color:rgba(167,243,208,.35);
+    }
+    .pill.inactive { opacity: 0.95; }
+
+    .section-rule { border-bottom:1px solid var(--row-border); margin:8px 0 6px 0; }
+
+    .date-badge {
+      display:inline-block; font-size:11px; font-weight:800;
+      padding:2px 6px; border-radius:999px; margin-left:8px;
+      background:#e0f2fe; color:#075985; border:1px solid #7dd3fc;
+    }
+    html[data-theme="dark"] .date-badge {
+      background:#0b1220; color:#7dd3fc; border-color:#164e63;
+    }
+
+    .toured-badge {
+      display:inline-block; font-size:11px; font-weight:800;
+      padding:2px 6px; border-radius:999px; margin-left:8px;
+      background:#fee2e2; color:#991b1b; border:1px solid #fecaca;
+    }
+    html[data-theme="dark"] .toured-badge { background:#7f1d1d; color:#fecaca; border-color:#ef4444; }
+    </style>
+    """, unsafe_allow_html=True)
+
+def _safe_rerun():
+    try: st.rerun()
+    except Exception:
+        try: st.experimental_rerun()
+        except Exception: pass
+
 def _client_row_icons(name: str, norm: str, cid: int, active: bool):
     col_name, col_rep, col_ren, col_tog, col_del, col_sp = st.columns([8, 1, 1, 1, 1, 2])
 
@@ -568,32 +387,27 @@ def _client_row_icons(name: str, norm: str, cid: int, active: bool):
         status_class = "active" if active else "inactive"
         status_text  = "active" if active else "inactive"
         st.markdown(
-            "<span class='client-name'>{nm}</span> <span class='pill {cls}'>{txt}</span>".format(
-                nm=escape(name), cls=status_class, txt=status_text
+            "<span class='client-name'>{}</span> <span class='pill {}'>{}</span>".format(
+                escape(name), status_class, status_text
             ),
-            unsafe_allow_html=True,
+            unsafe_allow_html=True
         )
 
     with col_rep:
-        if st.button("Open", key="rep_{0}".format(cid), help="Open report"):
+        if st.button("▦", key="rep_{}".format(cid), help="Open report"):
             st.session_state["__active_tab__"] = "Clients"
             _qp_set(report=norm, scroll="1")
             _safe_rerun()
 
     with col_ren:
-        if st.button("Rename", key="rn_btn_{0}".format(cid), help="Rename"):
-            st.session_state["__edit_{0}"] = True
+        if st.button("✎", key="rn_btn_{}".format(cid), help="Rename"):
+            st.session_state["__edit_{}".format(cid)] = True
 
     with col_tog:
-        if st.button("Toggle", key="tg_{0}".format(cid), help=("Deactivate" if active else "Activate")):
+        if st.button("⟳", key="tg_{}".format(cid), help=("Deactivate" if active else "Activate")):
             try:
                 SUPABASE = get_supabase()
-                rows = (
-                    []
-                    if not _sb_ok(SUPABASE)
-                    else SUPABASE.table("clients").select("active").eq("id", cid).limit(1).execute().data
-                    or []
-                )
+                rows = [] if not _sb_ok(SUPABASE) else SUPABASE.table("clients").select("active").eq("id", cid).limit(1).execute().data or []
                 cur = rows[0]["active"] if rows else active
                 toggle_client_active(cid, (not cur))
             except Exception:
@@ -602,42 +416,53 @@ def _client_row_icons(name: str, norm: str, cid: int, active: bool):
             _safe_rerun()
 
     with col_del:
-        if st.button("Delete", key="del_{0}".format(cid), help="Delete"):
-            st.session_state["__del_{0}"] = True
+        if st.button("⌫", key="del_{}".format(cid), help="Delete"):
+            st.session_state["__del_{}".format(cid)] = True
 
-    if st.session_state.get("__edit_{0}".format(cid)):
+    if st.session_state.get("__edit_{}".format(cid)):
         st.markdown("<div class='section-rule'></div>", unsafe_allow_html=True)
-        new_name = st.text_input("New name", value=name, key="rn_val_{0}".format(cid))
+        new_name = st.text_input("New name", value=name, key="rn_val_{}".format(cid))
         cc1, cc2 = st.columns([0.2, 0.2])
-        if cc1.button("Save", key="rn_save_{0}".format(cid)):
+        if cc1.button("Save", key="rn_save_{}".format(cid)):
             ok, msg = rename_client(cid, new_name)
-            if not ok:
-                st.warning(msg)
-            st.session_state["__edit_{0}"] = False
+            if not ok: st.warning(msg)
+            st.session_state["__edit_{}".format(cid)] = False
             st.session_state["__active_tab__"] = "Clients"
             _safe_rerun()
-        if cc2.button("Cancel", key="rn_cancel_{0}".format(cid)):
-            st.session_state["__edit_{0}"] = False
+        if cc2.button("Cancel", key="rn_cancel_{}".format(cid)):
+            st.session_state["__edit_{}".format(cid)] = False
 
-    if st.session_state.get("__del_{0}".format(cid)):
+    if st.session_state.get("__del_{}".format(cid)):
         st.markdown("<div class='section-rule'></div>", unsafe_allow_html=True)
         dc1, dc2 = st.columns([0.25, 0.25])
-        if dc1.button("Confirm delete", key="del_yes_{0}".format(cid)):
+        if dc1.button("Confirm delete", key="del_yes_{}".format(cid)):
             delete_client(cid)
-            st.session_state["__del_{0}"] = False
+            st.session_state["__del_{}".format(cid)] = False
             st.session_state["__active_tab__"] = "Clients"
             _safe_rerun()
-        if dc2.button("Cancel", key="del_no_{0}".format(cid)):
-            st.session_state["__del_{0}"] = False
+        if dc2.button("Cancel", key="del_no_{}".format(cid)):
+            st.session_state["__del_{}".format(cid)] = False
 
     st.markdown("<div class='section-rule'></div>", unsafe_allow_html=True)
 
-def _render_client_report_view(client_display_name: str, client_norm: str):
-    st.markdown("### Report for {nm}".format(nm=escape(client_display_name)), unsafe_allow_html=True)
+def _dedupe_by_property(rows: List[Dict[str,Any]]) -> List[Dict[str,Any]]:
+    def ts(row):
+        try: return datetime.fromisoformat((row.get("sent_at") or "").replace("Z","+00:00"))
+        except Exception: return datetime.min
+    best: Dict[str, Dict[str,Any]] = {}
+    for r in rows:
+        key = _property_key(r)
+        if key not in best or ts(r) > ts(best[key]):
+            best[key] = r
+    return list(best.values())
 
-    colX, _ = st.columns([1, 3])
+def _render_client_report_view(client_display_name: str, client_norm: str):
+    _inject_css_once()
+    st.markdown("### Report for {}".format(escape(client_display_name)), unsafe_allow_html=True)
+
+    colX, _ = st.columns([1,3])
     with colX:
-        if st.button("Close report", key="__close_report_{0}".format(client_norm)):
+        if st.button("Close report", key="__close_report_{}".format(client_norm)):
             st.session_state["__active_tab__"] = "Clients"
             _qp_set()
             _safe_rerun()
@@ -647,69 +472,51 @@ def _render_client_report_view(client_display_name: str, client_norm: str):
         st.info("No listings have been sent to this client yet.")
         return
 
-    tour_street_keys = fetch_tour_norm_slugs_for_client(client_norm)
+    tour_norm_keys = fetch_tour_norm_slugs_for_client(client_norm)
 
     # Filters
     seen_camps: List[str] = []
     for r in sent_rows:
         c = (r.get("campaign") or "").strip()
-        if c not in seen_camps:
-            seen_camps.append(c)
-    labels = ["All campaigns"] + [("no campaign" if c == "" else c) for c in seen_camps]
-    keys = [None] + seen_camps
+        if c not in seen_camps: seen_camps.append(c)
+    labels = ["All campaigns"] + [("— no campaign —" if c=="" else c) for c in seen_camps]
+    keys   = [None] + seen_camps
 
     colF1, colF2, colF3 = st.columns([1.2, 1.8, 1])
     with colF1:
-        i = st.selectbox(
-            "Filter by campaign",
-            list(range(len(labels))),
-            format_func=lambda j: labels[j],
-            index=0,
-            key="__camp_{0}".format(client_norm),
-        )
+        i = st.selectbox("Filter by campaign", list(range(len(labels))),
+                         format_func=lambda j: labels[j], index=0, key="__camp_{}".format(client_norm))
         sel_camp = keys[i]
     with colF2:
-        q = st.text_input(
-            "Search address / MLS / URL",
-            value="",
-            placeholder="e.g. 407 Woodall, 2501234, /homedetails/",
-            key="__q_{0}".format(client_norm),
-        )
+        q = st.text_input("Search address / MLS / URL", value="",
+                          placeholder="e.g. 407 Woodall, 2501234, /homedetails/",
+                          key="__q_{}".format(client_norm))
         qn = (q or "").strip().lower()
     with colF3:
-        st.caption("{n} total logged".format(n=len(sent_rows)))
+        st.caption("{} total logged".format(len(sent_rows)))
 
     def _match(row) -> bool:
         if sel_camp is not None and (row.get("campaign") or "").strip() != sel_camp:
             return False
-        if not qn:
-            return True
-        return (
-            qn in (row.get("address", "").lower())
-            or qn in (row.get("mls_id", "").lower())
-            or qn in (row.get("url", "").lower())
-        )
+        if not qn: return True
+        return (qn in (row.get("address","").lower())
+                or qn in (row.get("mls_id","").lower())
+                or qn in (row.get("url","").lower()))
 
     filtered = [r for r in sent_rows if _match(r)]
-    deduped = _dedupe_by_property(filtered)
-    st.caption(
-        "{n} unique listing{pl} (deduped by property)".format(
-            n=len(deduped), pl=("s" if len(deduped) != 1 else "")
-        )
-    )
+    deduped  = _dedupe_by_property(filtered)
+    st.caption("{} unique listing{} (deduped by property)".format(len(deduped), "" if len(deduped)!=1 else "s"))
 
+    # Build Markdown bullet list with inline HTML chips/badges
     md_lines: List[str] = []
     for r in deduped:
-        url = (r.get("url") or "").strip()
+        url  = (r.get("url") or "").strip()
         addr = (r.get("address") or "").strip() or _address_text_from_url(url) or "Listing"
-
-        # DATE tag (YYYYMMDD)
         date_tag = _pick_timestamp_date_tag(r)
 
-        # Toured badge: compare on street-only key
-        sslug = _street_slug(addr)
-        street_key = "addr::" + sslug if sslug else ""
-        toured = street_key in tour_street_keys
+        # toured: compare via street-only key so cosmetic differences don't duplicate
+        street_key = "addr::" + _street_slug(addr) if addr else ""
+        toured = street_key in tour_norm_keys
 
         meta: List[str] = []
         if date_tag:
@@ -719,19 +526,12 @@ def _render_client_report_view(client_display_name: str, client_norm: str):
 
         debug_html = ""
         if DEBUG_REPORT:
-            debug_html = (
-                " <span style='font-size:10px;opacity:.7'>(dbg date_tag={dt}, key={k}, toured={t})</span>".format(
-                    dt=escape(date_tag or "-"),
-                    k=escape(street_key or "-"),
-                    t=("yes" if toured else "no"),
-                )
+            debug_html = " <span style='font-size:10px;opacity:.7'>(key={}, toured={})</span>".format(
+                escape(street_key), "yes" if toured else "no"
             )
 
-        line = "- <a href=\"{u}\" target=\"_blank\" rel=\"noopener\">{a}</a> {meta}{dbg}".format(
-            u=escape(url),
-            a=escape(addr),
-            meta=" ".join(meta),
-            dbg=debug_html,
+        line = "- <a href=\"{}\" target=\"_blank\" rel=\"noopener\">{}</a> {}{}".format(
+            escape(url), escape(addr), " ".join(meta), debug_html
         )
         md_lines.append(line)
 
@@ -741,68 +541,62 @@ def _render_client_report_view(client_display_name: str, client_norm: str):
 
     st.markdown("\n".join(md_lines), unsafe_allow_html=True)
 
-    # ---- Manage sent listings (delete as groups)
-    groups: Dict[str, str] = {}
-    gid_rows: Dict[str, List[Dict[str, Any]]] = {}
+    # ---- Manage sent listings (delete) ----
+    propkey_to_label: Dict[str, str] = {}
+    propkey_to_ids: Dict[str, List[int]] = {}
 
-    def _pick_gid(cands: List[str]) -> Optional[str]:
-        for c in cands:
-            if c in groups:
-                return groups[c]
-        return None
+    for r in deduped:
+        url  = (r.get("url") or "").strip()
+        addr = (r.get("address") or "").strip() or _address_text_from_url(url) or "Listing"
+        key  = _property_key(r)
+        propkey_to_label[key] = addr
 
-    for r in filtered:
-        cands = _candidate_keys(r)
-        gid = _pick_gid(cands) or (cands[0] if cands else None)
-        if not gid:
-            continue
-        for c in cands:
-            groups.setdefault(c, gid)
-        gid_rows.setdefault(gid, []).append(r)
-
-    gid_label: Dict[str, str] = {}
-    for gid, rows_for_gid in gid_rows.items():
-        best = max(rows_for_gid, key=_best_ts)
-        url = (best.get("url") or "").strip()
-        addr = (best.get("address") or "").strip() or _address_text_from_url(url) or "Listing"
-        gid_label[gid] = addr
+    for key in list(propkey_to_label.keys()):
+        ids: List[int] = []
+        for rr in sent_rows:
+            try:
+                if _property_key(rr) == key and rr.get("id"):
+                    ids.append(int(rr["id"]))
+            except Exception:
+                continue
+        propkey_to_ids[key] = ids
 
     with st.expander("Manage sent listings (delete)"):
-        label_to_gid: Dict[str, str] = {}
+        # Disambiguate duplicate labels by suffixing counter
+        label_to_key: Dict[str, str] = {}
         counts: Dict[str, int] = {}
-        for gid, lbl in gid_label.items():
+        for k, lbl in propkey_to_label.items():
             c = counts.get(lbl, 0)
             counts[lbl] = c + 1
             if c == 0:
-                label_to_gid[lbl] = gid
+                label_to_key[lbl] = k
             else:
                 dis_lbl = "{}  · {}".format(lbl, c + 1)
-                label_to_gid[dis_lbl] = gid
+                label_to_key[dis_lbl] = k
 
-        choices = list(label_to_gid.keys())
+        choices = list(label_to_key.keys())
         to_delete = st.multiselect(
             "Select properties to delete (removes all 'sent' rows for those properties for this client):",
-            options=choices,
+            options=choices
         )
 
         if st.button("Delete selected properties", type="primary", use_container_width=False):
             ids: List[int] = []
             for lbl in to_delete:
-                gid = label_to_gid[lbl]
-                ids.extend(_collect_ids_for_property(client_norm, sent_rows, gid))
+                key = label_to_key[lbl]
+                ids.extend(propkey_to_ids.get(key, []))
             ids = sorted(set(ids))
             ok, msg = _delete_sent_rows_by_ids(ids)
             if ok:
-                st.success(
-                    "Deleted {n} sent row(s) across {m} propert{y}.".format(
-                        n=len(ids), m=len(to_delete), y=("y" if len(to_delete) == 1 else "ies")
-                    )
-                )
+                st.success("Deleted {} sent row(s) across {} propert{}.".format(
+                    len(ids), len(to_delete), "y" if len(to_delete)==1 else "ies"
+                ))
                 st.session_state["__active_tab__"] = "Clients"
                 _safe_rerun()
             else:
-                st.error("Delete failed: {0}".format(msg))
+                st.error("Delete failed: {}".format(msg))
 
+    # Export (deduped)
     with st.expander("Export filtered (deduped)"):
         import pandas as pd
         buf = io.StringIO()
@@ -810,47 +604,40 @@ def _render_client_report_view(client_display_name: str, client_norm: str):
         st.download_button(
             "Download CSV",
             data=buf.getvalue(),
-            file_name="client_report_{nm}_{ts}.csv".format(
-                nm=client_norm, ts=datetime.utcnow().strftime("%Y%m%d%H%M%S")
-            ),
+            file_name="client_report_{}_{}.csv".format(client_norm, datetime.utcnow().strftime("%Y%m%d%H%M%S")),
             mime="text/csv",
-            use_container_width=False,
+            use_container_width=False
         )
 
-# ============== Public entry (call this from app.py) ==============
+# ============== Public entry (call this from wrapper) ==============
 def render_clients_tab():
     _inject_css_once()
 
     st.subheader("Clients")
-    st.caption("Use Open to open an inline report; Rename; Toggle; Delete.")
+    st.caption("Use ▦ to open an inline report; ✎ rename; ⟳ toggle active; ⌫ delete.")
 
     report_norm_qp = _qp_get("report", "")
-    want_scroll = _qp_get("scroll", "") in ("1", "true", "yes")
+    want_scroll    = _qp_get("scroll", "") in ("1","true","yes")
 
     all_clients = fetch_clients(include_inactive=True)
-    active = [c for c in all_clients if c.get("active")]
+    active   = [c for c in all_clients if c.get("active")]
     inactive = [c for c in all_clients if not c.get("active")]
 
     colA, colB = st.columns(2)
     with colA:
         st.markdown("### Active", unsafe_allow_html=True)
-        if not active:
-            st.write("_No active clients_")
+        if not active: st.write("_No active clients_")
         for c in active:
-            _client_row_icons(c["name"], c.get("name_norm", ""), c["id"], active=True)
+            _client_row_icons(c["name"], c.get("name_norm",""), c["id"], active=True)
     with colB:
         st.markdown("### Inactive", unsafe_allow_html=True)
-        if not inactive:
-            st.write("_No inactive clients_")
+        if not inactive: st.write("_No inactive clients_")
         for c in inactive:
-            _client_row_icons(c["name"], c.get("name_norm", ""), c["id"], active=False)
+            _client_row_icons(c["name"], c.get("name_norm",""), c["id"], active=False)
 
     st.markdown('<div id="report_anchor"></div>', unsafe_allow_html=True)
     if report_norm_qp:
-        display_name = next(
-            (c["name"] for c in all_clients if c.get("name_norm") == report_norm_qp),
-            report_norm_qp,
-        )
+        display_name = next((c["name"] for c in all_clients if c.get("name_norm")==report_norm_qp), report_norm_qp)
         st.markdown("---")
         _render_client_report_view(display_name, report_norm_qp)
         if want_scroll:
@@ -860,7 +647,6 @@ def render_clients_tab():
                   const el = parent.document.getElementById("report_anchor");
                   if (el) { el.scrollIntoView({behavior: "smooth", block: "start"}); }
                 </script>
-                """,
-                height=0,
+                """, height=0
             )
-        _qp_set(report=report_norm_qp)
+            _qp_set(report=report_norm_qp)
