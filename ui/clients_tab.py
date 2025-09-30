@@ -1,5 +1,7 @@
 # ui/clients_tab.py
 # -*- coding: utf-8 -*-
+from __future__ import annotations
+
 import os
 import re
 import io
@@ -154,6 +156,7 @@ def _split_addr(addr: str) -> Tuple[str, str, str, str]:
     if not a:
         return "", "", "", ""
     a = re.sub(r"\s+", " ", a)
+    head = a  # ensure 'head' is always initialized
 
     if "," in a:
         parts = [p.strip() for p in a.split(",")]
@@ -281,7 +284,9 @@ def _canonical_display_address(addr: str, url: str = "") -> str:
     if st2:
         tail.append(st2)
     if z:
-        tail.append(re.match(r"^\d{5}", z).group(0) if re.match(r"^\d{5}", z or "") else "")
+        m = re.match(r"^\d{5}", z or "")
+        if m:
+            tail.append(m.group(0))
     if tail:
         parts.append(" ".join([p for p in tail if p]))
     # Insert commas appropriately
@@ -415,7 +420,7 @@ def _inject_css_once():
         return
     st.session_state["__clients_css_injected__"] = True
     st.markdown(
-        """
+        r"""
         <style>
         :root { --row-border:#e2e8f0; --ink:#0f172a; --muted:#475569; }
         html[data-theme="dark"], .stApp [data-theme="dark"] {
@@ -462,7 +467,7 @@ def _safe_rerun():
 
 # ============== Supabase (lazy + safe) ==============
 @st.cache_resource(show_spinner=False)
-def get_supabase() -> Optional["Client"]:
+def get_supabase() -> Optional[Client]:
     if create_client is None:
         return None
     try:
@@ -474,7 +479,7 @@ def get_supabase() -> Optional["Client"]:
     except Exception:
         return None
 
-def _sb_ok(SUPABASE) -> bool:
+def _sb_ok(SUPABASE: Any) -> bool:
     try:
         return bool(SUPABASE)
     except Exception:
