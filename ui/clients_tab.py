@@ -1,4 +1,6 @@
 # ui/clients_tab.py
+# -*- coding: utf-8 -*-
+
 import os, re, io
 from datetime import datetime
 from html import escape
@@ -20,7 +22,7 @@ DEBUG_REPORT = False  # set True if you want to see per-row debug info
 def _norm_tag(s: str) -> str:
     return re.sub(r"\s+", " ", (s or "").strip()).lower()
 
-def _fmt_ts_date_tag(ts: Any) -> str:
+def _fmt_ts_date_tag(ts: str) -> str:
     """Return YYYYMMDD from epoch/ISO-ish strings; '' if cannot parse."""
     if ts is None or str(ts).strip() == "":
         return ""
@@ -69,7 +71,7 @@ def _pick_timestamp_date_tag(row: Dict[str, Any]) -> str:
 
     return ""
 
-# ------------- Property slug normalization (strong & symmetric) -------------
+# ------------- Property/address normalization (strong & symmetric) -------------
 _STTYPE = {
     "street":"st","st":"st","st.":"st",
     "avenue":"ave","ave":"ave","ave.":"ave","av":"ave",
@@ -91,7 +93,7 @@ def _token_norm(tok: str) -> str:
     t = tok.lower().strip(" .,#")
     if t in _STTYPE: return _STTYPE[t]
     if t in _DIR:    return _DIR[t]
-    if t in {"apt","unit","ste","lot"}: return ""
+    if t in {"apt","unit","ste","suite","lot","#"}: return ""
     return re.sub(r"[^a-z0-9-]", "", t)
 
 def _norm_slug_from_text(text: str) -> str:
@@ -119,16 +121,168 @@ def _address_text_from_url(url: str) -> str:
     if m: return re.sub(r"[-+]", " ", m.group(1)).title()
     return ""
 
+# ====== Address parsing (handles comma/no-comma) ======
+STATE_2 = r"(?:A[LKZR]|C[AOT]|D[EC]|F[LM]|G[AU]|H[IW]|I[ADLN]|K[SY]|L[A]|M[ADEINOST]|N[CDEHJMVY]|O[HKR]|P[A]|R[IL]|S[CD]|T[NX]|UT|V[AIT]|W[AIVY])"
+
+def _split_addr(addr: str) -> Tuple[str, str, str, str]:
+    """
+    Split into (street, city, state, zip) for lines with or without commas.
+    """
+    a = (addr or "").strip()
+    if not a:
+        return "", "", "", ""
+    a = re.sub(r"\s+", " ", a)
+
+    if "," in a:
+        parts = [p.strip() for p in a.split(",")]
+        street = parts[0] if parts else ""
+        rest = " ".join(parts[1:]).strip()
+        m = re.search(rf"\b({STATE_2})\b(?:\s+(\d{{5}}(?:-\d{{4})?))?\s*$", rest, re.I)
+        state = (m.group(1) if m else "").upper()
+        zipc  = (m.group(2) if (m and m.lastindex and m.lastindex >= 2) else "")
+        city  = rest[:m.start()].strip() if m else rest
+        return street, city, state, zipc
+
+    m2 = re.search(rf"\b({STATE_2})\b(?:\s+(\d{{5}}(?:-\d{{4})?))?\s*$", a, re.I)
+    state = (m2.group(1) if m2 else "").upper()
+    zipc  = (m2.group(2) if (m2 and m2.lastindex and m2.lastindex >= 2) else "")
+    head = a[:m2.start()].strip() if m2 else a
+
+    m3 = re.match(r"^\s*\d+\s+.*$", head)
+    if m3:
+        mtype = re.search(
+            r"\b(st|street|ave|avenue|rd|road|dr|drive|ln|lane|blvd|boulevard|ct|court|pl|place|ter|terrace|hwy|highway|pkwy|parkway|cir|circle|sq|square)\b\.?",
+            head, re.I
+        )
+        street = head[:mtype.end()] if mtype else head
+        city = head[len(street):].strip()
+        return street.strip(), city, state, zipc
+
+    return head, "", state, zipc
+
+def _strip_unit_tail(street: str) -> str:
+    return re.sub(r"\b(?:apt|unit|suite|ste|lot|#)\s*[A-Za-z0-9\-]*\s*$", "", street or "", flags=re.I).strip()
+
+def _canonicalize_street(street: str) -> str:
+    """
+    Canonical display: number + DIR + Name + TYPE (abbrev), e.g. 'E Jackson St'
+    """
+    s = _strip_unit_tail(street or "")
+    s = re.sub(r"\s+", " ", s).strip().strip(",")
+    if not s:
+        return ""
+    parts = s.split()
+    num = parts[0] if parts and parts[0].isdigit() else ""
+    idx = 1 if num else 0
+
+    lead_dir = ""
+    if idx < len(parts) and parts[idx].lower().strip(".,") in _DIR:
+        lead_dir = _DIR[parts[idx].lower().strip(".,")]
+        idx += 1
+
+    # detect street type at end
+    st_type = ""
+    tail_dir = ""
+    j = len(parts) - 1
+    if j >= idx:
+        last = parts[j].lower().strip(".,")
+        if last in _DIR:
+            tail_dir = _DIR[last]
+            j -= 1
+            last = parts[j].lower().strip(".,") if j >= idx else ""
+        if last in _STTYPE:
+            st_type = _STTYPE[last]
+            j -= 1
+
+    core_tokens = [re.sub(r"[^\w-]", "", t) for t in parts[idx:j+1] if t]
+    # Title case core (keep small words lowercase except first)
+    small = {"of","and","the","at","in","on"}
+    core_disp = []
+    for k, tok in enumerate(core_tokens):
+        if k > 0 and tok.lower() in small:
+            core_disp.append(tok.lower())
+        else:
+            core_disp.append(tok[:1].upper() + tok[1:].lower())
+
+    disp: List[str] = []
+    if num: disp.append(num)
+    if lead_dir: disp.append(lead_dir.upper())
+    if core_disp: disp.append(" ".join(core_disp))
+    if st_type: disp.append(st_type.upper())
+    elif tail_dir: disp.append(tail_dir.upper())
+    return " ".join(disp).strip()
+
+def _street_only(addr: str) -> str:
+    street, _, _, _ = _split_addr(addr)
+    return _canonicalize_street(street)
+
+def _city_title(city: str) -> str:
+    c = (city or "").strip()
+    if not c: return ""
+    parts = re.split(r"\s+", c.replace("-", " "))
+    small = {"of","and","the","at","in","on"}
+    out = []
+    for i, p in enumerate(parts):
+        if i > 0 and p.lower() in small:
+            out.append(p.lower())
+        else:
+            out.append(p[:1].upper() + p[1:].lower())
+    return " ".join(out)
+
+def _canonical_display_address(addr: str, url: str = "") -> str:
+    """ '<CanonStreet>, City, ST ZIP' when available; falls back safely. """
+    raw = (addr or "").strip() or _address_text_from_url(url) or ""
+    street, city, st2, z = _split_addr(raw)
+    c_street = _street_only(street)
+    parts = []
+    if c_street: parts.append(c_street)
+    if city: parts.append(_city_title(city))
+    tail = []
+    if st2: tail.append(st2.upper())
+    if z:
+        m = re.match(r"^\d{5}", z)
+        if m: tail.append(m.group(0))
+    if tail: parts.append(" ".join(tail))
+    if not parts:
+        return raw or "Listing"
+    if len(parts) >= 3:
+        return f"{parts[0]}, {parts[1]}, {parts[2]}"
+    if len(parts) == 2:
+        return f"{parts[0]}, {parts[1]}"
+    return parts[0]
+
+# ---- Property key (FIXED: prefer street-only slug; fall back to URL/canon/zpid) ----
 def _property_key(row: Dict[str, Any]) -> str:
+    """
+    Primary: street-only normalized slug (most stable across formats).
+    Fallbacks: URL slug, canonical, zpid, then raw URL.
+    """
     url = (row.get("url") or "").strip()
     addr = (row.get("address") or "").strip() or _address_text_from_url(url)
-    norm_pslug = _norm_slug_from_url(url) or _norm_slug_from_text(addr)
-    if norm_pslug:
-        return "normslug::" + norm_pslug
+
+    # 1) Primary — street-only slug
+    try:
+        street = _street_only(addr)
+        street_slug = _norm_slug_from_text(street)
+    except Exception:
+        street_slug = ""
+
+    if street_slug:
+        return "addr::" + street_slug
+
+    # 2) Fallbacks — only if street couldn't be derived
+    zslug = _norm_slug_from_url(url)
+    if zslug:
+        return "zslug::" + zslug
+
     canon = (row.get("canonical") or "").strip().lower()
-    if canon: return "canon::" + canon
+    if canon:
+        return "canon::" + canon
+
     zpid = (row.get("zpid") or "").strip()
-    if zpid: return "zpid::" + zpid
+    if zpid:
+        return "zpid::" + zpid
+
     return "url::" + (url.lower())
 
 def _qp_get(name, default=None):
@@ -312,6 +466,9 @@ def fetch_sent_for_client(client_norm: str, limit: int = 5000):
 
 @st.cache_data(ttl=120, show_spinner=False)
 def fetch_tour_norm_slugs_for_client(client_norm: str) -> set:
+    """
+    Return street-only slugs so 'Toured' aligns with dedupe.
+    """
     SUPABASE = get_supabase()
     if not (_sb_ok(SUPABASE) and client_norm.strip()): return set()
     try:
@@ -322,10 +479,12 @@ def fetch_tour_norm_slugs_for_client(client_norm: str) -> set:
         stops = (sq.data or [])
         out: set = set()
         for s in stops:
-            if s.get("address_slug"):
-                out.add(_norm_slug_from_text(s["address_slug"]))
-            elif s.get("address"):
-                out.add(_norm_slug_from_text(s["address"]))
+            raw = s.get("address_slug") or s.get("address") or ""
+            if raw:
+                street = _street_only(raw)
+                slug = _norm_slug_from_text(street)
+                if slug:
+                    out.add(slug)
         return out
     except Exception:
         return set()
@@ -474,13 +633,7 @@ def _render_client_report_view(client_display_name: str, client_norm: str):
     deduped  = _dedupe_by_property(filtered)
     st.caption(f"{len(deduped)} unique listing{'s' if len(deduped)!=1 else ''} (deduped by property)")
 
-    def chip(t: Any) -> str:
-        if t is None: return ""
-        s = str(t).strip()
-        if not s: return ""
-        return f"<span class='meta-chip'>{escape(s)}</span>"
-
-    # Build Markdown bullet list with inline HTML chips/badges
+    # Build Markdown bullet list with inline HTML chips/badges (avoids raw </li> showing)
     md_lines: List[str] = []
     for r in deduped:
         url  = (r.get("url") or "").strip()
@@ -489,9 +642,9 @@ def _render_client_report_view(client_display_name: str, client_norm: str):
         # Single DATE tag (YYYYMMDD)
         date_tag = _pick_timestamp_date_tag(r)
 
-        # Toured badge (once)
-        norm_pslug = _norm_slug_from_url(url) or _norm_slug_from_text(addr)
-        toured = norm_pslug in tour_norm_slugs
+        # Toured badge (use street-only slug, same as dedupe)
+        street_slug = _norm_slug_from_text(_street_only(addr))
+        toured = street_slug in tour_norm_slugs
 
         meta: List[str] = []
         if date_tag:
@@ -504,10 +657,10 @@ def _render_client_report_view(client_display_name: str, client_norm: str):
             debug_html = (
                 " <span style='font-size:10px;opacity:.7'>(dbg "
                 f"date_tag={escape(date_tag or '-')}, camp={(r.get('campaign') or '')}, "
-                f"slug={escape(norm_pslug)}, toured={'yes' if toured else 'no'})</span>"
+                f"slug={escape(street_slug)}, toured={'yes' if toured else 'no'})</span>"
             )
 
-        line = f"- <a href=\"{escape(url)}\" target=\"_blank\" rel=\"noopener\">{escape(addr)}</a> {' '.join(meta)}{debug_html}"
+        line = f"- <a href=\"{escape(url)}\" target=\"_blank\" rel=\"noopener\">{escape(_canonical_display_address(addr, url))}</a> {' '.join(meta)}{debug_html}"
         md_lines.append(line)
 
     if not md_lines:
@@ -525,7 +678,7 @@ def _render_client_report_view(client_display_name: str, client_norm: str):
         url  = (r.get("url") or "").strip()
         addr = (r.get("address") or "").strip() or _address_text_from_url(url) or "Listing"
         key  = _property_key(r)
-        propkey_to_label[key] = addr
+        propkey_to_label[key] = _canonical_display_address(addr, url)
 
     for key in list(propkey_to_label.keys()):
         propkey_to_ids[key] = _collect_ids_for_property(client_norm, sent_rows, key)
@@ -617,4 +770,4 @@ def render_clients_tab():
                 </script>
                 """, height=0
             )
-        _qp_set(report=report_norm_qp)
+            _qp_set(report=report_norm_qp)
