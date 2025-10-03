@@ -3,6 +3,8 @@
 import os
 import sys
 import json
+import traceback
+import importlib
 import streamlit as st
 
 # Path shim (robust for different working dirs/Cloud)
@@ -13,19 +15,52 @@ UI_DIR = os.path.join(HERE, "ui")
 if UI_DIR not in sys.path:
     sys.path.insert(0, UI_DIR)
 
-from core.styles import apply_page_base
-from ui.run_tab import render_run_tab
-from ui.clients_tab import render_clients_tab
+# --- Utilities to surface real errors in the UI ---
+def _show_exc(heading: str, ex: BaseException):
+    st.error(f"{heading}: {type(ex).__name__}")
+    st.code("".join(traceback.format_exception(type(ex), ex, ex.__traceback__)), language="python")
 
-# Import tours tab (package import first; fallback to file import)
+def _safe_import_attr(module_name: str, attr: str, fallback_path: str | None = None):
+    """
+    Try `importlib.import_module(module_name)` and get `attr`.
+    If that fails and fallback_path is given, try loading that file directly.
+    Returns (callable_or_None, error_or_None).
+    """
+    try:
+        mod = importlib.import_module(module_name)
+        try:
+            fn = getattr(mod, attr)
+            return fn, None
+        except Exception as e_attr:
+            return None, e_attr
+    except Exception as e_mod:
+        # Optional file fallback (used for tours_tab historically)
+        if fallback_path:
+            try:
+                import importlib.util
+                spec = importlib.util.spec_from_file_location(module_name.rsplit(".", 1)[-1], fallback_path)
+                mod2 = importlib.util.module_from_spec(spec)
+                assert spec and spec.loader
+                spec.loader.exec_module(mod2)  # type: ignore
+                try:
+                    fn = getattr(mod2, attr)
+                    return fn, None
+                except Exception as e_attr2:
+                    return None, e_attr2
+            except Exception as e_fb:
+                # Return the original error (module import) so the traceback points to the root cause
+                return None, e_mod
+        else:
+            return None, e_mod
+
+# ----- Import base styles early (assumed stable) -----
 try:
-    from ui.tours_tab import render_tours_tab
-except Exception:
-    import importlib.util
-    spec = importlib.util.spec_from_file_location("tours_tab", os.path.join(UI_DIR, "tours_tab.py"))
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)  # type: ignore
-    render_tours_tab = getattr(mod, "render_tours_tab")
+    from core.styles import apply_page_base
+except Exception as e:
+    # If even styles fail, show and continue with minimal page
+    st.set_page_config(page_title="Address Alchemist", page_icon="🏠", layout="wide")
+    _show_exc("import core.styles.apply_page_base", e)
+    apply_page_base = lambda: None  # no-op fallback
 
 # ---------- UI ----------
 apply_page_base()
@@ -39,15 +74,39 @@ tab_run, tab_clients, tab_tours = st.tabs(["Run", "Clients", "Tours"])
 if "__active_tab__" not in st.session_state:
     st.session_state["__active_tab__"] = "Run"
 
+# ---- Lazy, safe import per tab (so errors render in the UI instead of being redacted) ----
 with tab_run:
-    # Do NOT set __active_tab__ here; each tab sets it right before actions that rerun.
-    render_run_tab(state=st.session_state)
+    fn, err = _safe_import_attr("ui.run_tab", "render_run_tab")
+    if err:
+        _show_exc("import ui.run_tab.render_run_tab", err)
+        st.stop()
+    try:
+        fn(state=st.session_state)
+    except Exception as e:
+        _show_exc("render_run_tab()", e)
 
 with tab_clients:
-    render_clients_tab()
+    # IMPORTANT: do NOT import ui.clients_tab at the top of the file
+    fn, err = _safe_import_attr("ui.clients_tab", "render_clients_tab")
+    if err:
+        _show_exc("import ui.clients_tab.render_clients_tab", err)
+    else:
+        try:
+            fn()
+        except Exception as e:
+            _show_exc("render_clients_tab()", e)
 
 with tab_tours:
-    render_tours_tab(state=st.session_state)
+    # Keep historical file-fallback behavior for tours
+    fallback = os.path.join(UI_DIR, "tours_tab.py")
+    fn, err = _safe_import_attr("ui.tours_tab", "render_tours_tab", fallback_path=fallback)
+    if err:
+        _show_exc("import ui.tours_tab.render_tours_tab", err)
+    else:
+        try:
+            fn(state=st.session_state)
+        except Exception as e:
+            _show_exc("render_tours_tab()", e)
 
 # Re-select the remembered tab after reruns while keeping visible order fixed.
 # Hide the tab bar until the correct tab is selected to prevent visible flicker.
