@@ -5,6 +5,9 @@ import sys
 import json
 import traceback
 import importlib
+import importlib.util  # keep this at module level to avoid scoping issues
+from typing import Optional, Tuple, Any, Callable
+
 import streamlit as st
 
 # Path shim (robust for different working dirs/Cloud)
@@ -20,7 +23,7 @@ def _show_exc(heading: str, ex: BaseException):
     st.error(f"{heading}: {type(ex).__name__}")
     st.code("".join(traceback.format_exception(type(ex), ex, ex.__traceback__)), language="python")
 
-def _safe_import_attr(module_name: str, attr: str, fallback_path: str | None = None):
+def _safe_import_attr(module_name: str, attr: str, fallback_path: Optional[str] = None) -> Tuple[Optional[Callable[..., Any]], Optional[BaseException]]:
     """
     Try `importlib.import_module(module_name)` and get `attr`.
     If that fails and fallback_path is given, try loading that file directly.
@@ -34,21 +37,20 @@ def _safe_import_attr(module_name: str, attr: str, fallback_path: str | None = N
         except Exception as e_attr:
             return None, e_attr
     except Exception as e_mod:
-        # Optional file fallback (used for tours_tab historically)
         if fallback_path:
             try:
-                import importlib.util
                 spec = importlib.util.spec_from_file_location(module_name.rsplit(".", 1)[-1], fallback_path)
+                if spec is None or spec.loader is None:
+                    return None, e_mod
                 mod2 = importlib.util.module_from_spec(spec)
-                assert spec and spec.loader
                 spec.loader.exec_module(mod2)  # type: ignore
                 try:
                     fn = getattr(mod2, attr)
                     return fn, None
                 except Exception as e_attr2:
                     return None, e_attr2
-            except Exception as e_fb:
-                # Return the original error (module import) so the traceback points to the root cause
+            except Exception:
+                # Return the original import error so traceback points to the root cause
                 return None, e_mod
         else:
             return None, e_mod
@@ -57,10 +59,10 @@ def _safe_import_attr(module_name: str, attr: str, fallback_path: str | None = N
 try:
     from core.styles import apply_page_base
 except Exception as e:
-    # If even styles fail, show and continue with minimal page
     st.set_page_config(page_title="Address Alchemist", page_icon="🏠", layout="wide")
     _show_exc("import core.styles.apply_page_base", e)
-    apply_page_base = lambda: None  # no-op fallback
+    def apply_page_base():  # no-op fallback
+        pass
 
 # ---------- UI ----------
 apply_page_base()
@@ -79,11 +81,11 @@ with tab_run:
     fn, err = _safe_import_attr("ui.run_tab", "render_run_tab")
     if err:
         _show_exc("import ui.run_tab.render_run_tab", err)
-        st.stop()
-    try:
-        fn(state=st.session_state)
-    except Exception as e:
-        _show_exc("render_run_tab()", e)
+    else:
+        try:
+            fn(state=st.session_state)
+        except Exception as e:
+            _show_exc("render_run_tab()", e)
 
 with tab_clients:
     # IMPORTANT: do NOT import ui.clients_tab at the top of the file
