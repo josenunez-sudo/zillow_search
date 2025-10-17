@@ -1,8 +1,3 @@
-Here’s a **full drop-in replacement** for `ui/run_tab.py` that includes the improved Homespotter/IDX link parsing (redirect chain, query/fragment & base64 payload decoding) and a revamped **Fix properties** section.
-
-> Paste this entire file over your current `ui/run_tab.py`.
-
-```python
 # ui/run_tab.py
 # Run tab with: hyperlinks-only results, clickable thumbnails, TOURED cross-check via Supabase,
 # post-run "Add to client", a bottom "Fix properties" section, and NC forced as the state everywhere.
