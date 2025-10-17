@@ -1,6 +1,6 @@
 # ui/run_tab.py
 # Run tab for Address Alchemist — paste addresses OR arbitrary listing links → Zillow.
-# Exposes: render_run_tab()
+# Exposes: render_run_tab(state=None)
 
 from __future__ import annotations
 
@@ -529,10 +529,10 @@ def results_list_with_copy_all(results: List[Dict[str, Any]]):
 # ---------------------------
 # Main: render_run_tab()
 # ---------------------------
-def render_run_tab():
+def render_run_tab(state: Optional[dict] = None):
     """
     Build the RUN tab UI and logic.
-    Note: Do NOT call st.set_page_config() here; app-level code should do that.
+    Accepts optional `state` to be compatible with app.py calling style.
     """
     st.markdown("### Run")
     st.caption("Paste addresses or **any listing links** (HS/IDX OK) → Zillow link")
