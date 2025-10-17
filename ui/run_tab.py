@@ -1,6 +1,10 @@
 # ui/run_tab.py
 # Run tab — paste addresses or ANY listing links → Zillow /homedetails/ URLs
-# Includes: Homespotter resolver microservice + “Fix properties” tool
+# Improvements:
+# - Homespotter microservice used first.
+# - Robust Homespotter address extraction from JSON & microdata.
+# - Avoids using marketing titles ("4 beds 2 baths...") as street.
+# - City-only fallback builds city search: /homes/<City>-<ST>_rb/ (no more /homes/nc_rb/).
 
 import os, io, re, csv, json, time
 from typing import List, Dict, Any, Optional, Tuple
@@ -108,6 +112,9 @@ def _jsonld_blocks(html: str) -> List[Dict[str, Any]]:
     return out
 
 def extract_address_from_html(html: str) -> Dict[str, str]:
+    """
+    Generic extractor (works for many broker/MLS/IDX pages).
+    """
     out = {"street": "", "city": "", "state": "", "zip": ""}
     if not html:
         return out
@@ -117,7 +124,9 @@ def extract_address_from_html(html: str) -> Dict[str, str]:
     for b in blocks:
         addr = None
         if isinstance(b, dict):
-            addr = b.get("address") or b.get("itemOffered", {}).get("address") if isinstance(b.get("itemOffered"), dict) else b.get("address")
+            if isinstance(b.get("itemOffered"), dict):
+                addr = b["itemOffered"].get("address")
+            addr = addr or b.get("address")
         if isinstance(addr, dict):
             out["street"] = out["street"] or addr.get("streetAddress","")
             out["city"]   = out["city"]   or addr.get("addressLocality","")
@@ -126,7 +135,7 @@ def extract_address_from_html(html: str) -> Dict[str, str]:
             if out["street"] and out["city"] and out["state"]:
                 break
 
-    # Fallback: meta/name/title hints
+    # Fallback: explicit keys
     if not out["street"]:
         m = re.search(r'"streetAddress"\s*:\s*"([^"]+)"', html, re.I); out["street"] = out["street"] or (m.group(1) if m else "")
     if not out["city"]:
@@ -136,18 +145,7 @@ def extract_address_from_html(html: str) -> Dict[str, str]:
     if not out["zip"]:
         m = re.search(r'"postalCode"\s*:\s*"(\d{5}(?:-\d{4})?)"', html, re.I); out["zip"] = out["zip"] or (m.group(1) if m else "")
 
-    # Ultra-fallback from title if it contains a plausible address
-    if not out["street"]:
-        for pat in [
-            r"<meta[^>]+property=['\"]og:title['\"][^>]+content=['\"]([^'\"]+)['\"]",
-            r"<title>\s*([^<]+?)\s*</title>",
-        ]:
-            m = re.search(pat, html, re.I)
-            if m:
-                title = m.group(1)
-                if re.search(r"\b[A-Za-z]{2}\b", title) and re.search(r"\d{5}", title):
-                    out["street"] = title
-                    break
+    # DO NOT use generic titles as a street — they produce junk slugs
     return out
 
 def extract_title_or_desc(html: str) -> str:
@@ -200,7 +198,22 @@ def make_preview_url(url: str) -> str:
 
 # ---------- Address helpers ----------
 DIR_MAP = {'s':'south','n':'north','e':'east','w':'west'}
+ROAD_WORDS = r"(?:st|street|ave|avenue|rd|road|dr|drive|ln|lane|way|blvd|boulevard|ct|court|pl|place|pkwy|parkway|hwy|highway|cir|circle)"
+MARKETING_HINTS = re.compile(r"\b(beds?|baths?|homespotter|for\s*\$|price|mls)\b", re.I)
+
 def _slug(text:str) -> str: return re.sub(r'[^a-z0-9]+', '-', (text or '').lower()).strip('-')
+
+def is_address_like(s: str) -> bool:
+    if not s: return False
+    if MARKETING_HINTS.search(s or ""):
+        return False
+    s2 = s.strip()
+    # number + road word OR comma-separated "..., City, ST ..."
+    if re.search(r"\d{1,6}\s+[\w\.\- ]+\b" + ROAD_WORDS + r"\b", s2, re.I):
+        return True
+    if re.search(r"^[^,]+,\s*[^,]+,\s*[A-Z]{2}(?:\s+\d{5})?$", s2):
+        return True
+    return False
 
 def compose_query_address(street, city, state, zipc, defaults):
     parts = [street]
@@ -228,10 +241,31 @@ def generate_address_variants(street, city, state, zipc, defaults):
         out.append(" ".join(parts))
     return [s for s in dict.fromkeys(out) if s.strip()]
 
+def construct_city_deeplink(city: str, state: str) -> str:
+    city_slug = _slug(city) if city else ""
+    st = (state or "").strip()
+    if city_slug and st:
+        return f"https://www.zillow.com/homes/{city_slug}-{st}_rb/"
+    if st:
+        return f"https://www.zillow.com/homes/{st.lower()}_rb/"
+    return "https://www.zillow.com/homes/"
+
 def construct_deeplink_from_parts(street, city, state, zipc, defaults):
-    c = (city or defaults.get("city","")).strip()
-    st_abbr = (state or defaults.get("state","")).strip()
-    z = (zipc  or defaults.get("zip","")).strip()
+    """
+    Only build a street-based deeplink if we have a *street-like* string.
+    Otherwise, return a **city-only** deeplink (prevents junk slugs like “4-beds-…”).
+    """
+    street = (street or "").strip()
+    city   = (city or "").strip()
+    state  = (state or "").strip()
+    if not is_address_like(street):
+        # City search fallback
+        return construct_city_deeplink(city, state)
+
+    # Build street-based deeplink
+    c = city
+    st_abbr = state
+    z = (zipc or "").strip()
     slug_parts = [street]; loc_parts = [p for p in [c, st_abbr] if p]
     if loc_parts: slug_parts.append(", ".join(loc_parts))
     if z:
@@ -336,6 +370,93 @@ def resolve_hs_service(source_url: str):
     except Exception as e:
         return None, None, f"error:{type(e).__name__}"
 
+# ---------- EXTRA: Homespotter-specific HTML address extractor ----------
+def _extract_hs_address(html: str) -> Dict[str, str]:
+    """
+    Try hard to get a proper street address from Homespotter pages.
+    We avoid using marketing titles (beds/baths/price) as street.
+    """
+    out = {"street": "", "city": "", "state": "", "zip": ""}
+
+    if not html:
+        return out
+
+    # 1) JSON keys commonly used by Homespotter/IDX
+    key_patterns = [
+        r'"formattedAddress"\s*:\s*"([^"]+)"',
+        r'"addressLine1"\s*:\s*"([^"]+)"',
+        r'"address1"\s*:\s*"([^"]+)"',
+        r'"line1"\s*:\s*"([^"]+)"',
+        r'"street"\s*:\s*"([^"]+)"',
+    ]
+    for pat in key_patterns:
+        m = re.search(pat, html, re.I)
+        if m:
+            cand = m.group(1).strip()
+            if is_address_like(cand):
+                out["street"] = cand
+                break
+            # if it's a whole "123 Main St, Erwin, NC 28339" string, split:
+            if re.search(r",\s*[A-Za-z ]+,\s*[A-Z]{2}", cand):
+                out["street"] = cand
+
+    # City/State/Zip keys
+    city_keys  = [r'"addressLocality"\s*:\s*"([^"]+)"', r'"city"\s*:\s*"([^"]+)"']
+    state_keys = [r'"addressRegion"\s*:\s*"([A-Z]{2})"', r'"state(?:OrProvince)?"\s*:\s*"([A-Z]{2})"']
+    zip_keys   = [r'"postal(?:Code)?"\s*:\s*"(\d{5}(?:-\d{4})?)"']
+
+    for pat in city_keys:
+        m = re.search(pat, html, re.I)
+        if m: out["city"] = out["city"] or m.group(1).strip()
+    for pat in state_keys:
+        m = re.search(pat, html, re.I)
+        if m: out["state"] = out["state"] or m.group(1).strip()
+    for pat in zip_keys:
+        m = re.search(pat, html, re.I)
+        if m: out["zip"] = out["zip"] or m.group(1).strip()
+
+    # 2) Microdata fallbacks
+    if not out["street"]:
+        m = re.search(r'itemprop=["\']streetAddress["\'][^>]*>\s*([^<]+)', html, re.I)
+        if m:
+            cand = m.group(1).strip()
+            if is_address_like(cand):
+                out["street"] = cand
+
+    if not out["city"]:
+        m = re.search(r'itemprop=["\']addressLocality["\'][^>]*>\s*([^<]+)', html, re.I)
+        if m: out["city"] = m.group(1).strip()
+
+    if not out["state"]:
+        m = re.search(r'itemprop=["\']addressRegion["\'][^>]*>\s*([A-Za-z]{2})', html, re.I)
+        if m: out["state"] = m.group(1).strip()
+
+    if not out["zip"]:
+        m = re.search(r'itemprop=["\']postalCode["\'][^>]*>\s*(\d{5}(?:-\d{4})?)', html, re.I)
+        if m: out["zip"] = m.group(1).strip()
+
+    # 3) As a very last resort, parse a “Street, City, ST (ZIP)” from title-like text
+    if not out["street"]:
+        # Never treat marketing titles as street
+        for pat in [r"<meta[^>]+property=['\"]og:title['\"][^>]+content=['\"]([^'\"]+)['\"]",
+                    r"<title>\s*([^<]+?)\s*</title>"]:
+            m = re.search(pat, html, re.I)
+            if not m: 
+                continue
+            title = m.group(1).strip()
+            if MARKETING_HINTS.search(title):
+                continue
+            # Try to split: "123 Main St, Erwin, NC 28339 ..."
+            m2 = re.search(r"^\s*([^,]+),\s*([^,]+),\s*([A-Z]{2})(?:\s+(\d{5}))?", title)
+            if m2:
+                out["street"] = out["street"] or m2.group(1).strip()
+                out["city"]   = out["city"]   or m2.group(2).strip()
+                out["state"]  = out["state"]  or m2.group(3).strip()
+                out["zip"]    = out["zip"]    or (m2.group(4).strip() if m2.group(4) else "")
+                break
+
+    return out
+
 # ---------- Resolve from arbitrary source URL (address-first; HS service first) ----------
 def resolve_from_source_url(source_url: str, defaults: Dict[str,str]) -> Tuple[str, str]:
     """
@@ -357,21 +478,41 @@ def resolve_from_source_url(source_url: str, defaults: Dict[str,str]) -> Tuple[s
         if z:
             return z, (addr or "")
 
-    # 3) Extract address from HTML, then search Zillow by address (no MLS dependency)
+        # If service still didn’t return, run our HS-special extractor
+        hs_addr = _extract_hs_address(html)
+        street = hs_addr.get("street","") or ""
+        city   = hs_addr.get("city","") or ""
+        state  = hs_addr.get("state","") or ""
+        zipc   = hs_addr.get("zip","") or ""
+
+        if is_address_like(street):
+            variants = generate_address_variants(street, city, state, zipc, defaults)
+            z2, _ = resolve_homedetails_with_bing_variants(variants, required_state=(state or None), required_city=(city or None))
+            if z2:
+                return z2, compose_query_address(street, city, state, zipc, defaults)
+            # city-only deeplink if Zillow not found
+            return construct_deeplink_from_parts(street, city, state, zipc, defaults), compose_query_address(street, city, state, zipc, defaults)
+        else:
+            # We have at least city/state? Build a city search deeplink
+            if city or state:
+                return construct_city_deeplink(city, state), compose_query_address("", city, state, zipc, defaults)
+            # If truly nothing, fall through to generic handler
+
+    # 3) Generic page (non-HS)
     addr = extract_address_from_html(html)
     street = addr.get("street","") or ""
     city   = addr.get("city","") or ""
     state  = addr.get("state","") or ""
     zipc   = addr.get("zip","") or ""
-    if street or (city and state):
-        variants = generate_address_variants(street, city, state, zipc, defaults)
+    if is_address_like(street) or (city and state):
+        variants = generate_address_variants(street or "", city, state, zipc, defaults)
         z2, _ = resolve_homedetails_with_bing_variants(variants, required_state=(state or None), required_city=(city or None))
         if z2:
             return z2, compose_query_address(street, city, state, zipc, defaults)
 
-    # 4) Title → Bing (very loose)
+    # 4) Title → Bing (very loose), but DO NOT treat title as street
     title = extract_title_or_desc(html)
-    if title:
+    if title and not MARKETING_HINTS.search(title):
         for q in [f'"{title}" site:zillow.com/homedetails', f'{title} site:zillow.com/homedetails']:
             items = bing_search_items(q)
             for it in (items or []):
@@ -379,12 +520,10 @@ def resolve_from_source_url(source_url: str, defaults: Dict[str,str]) -> Tuple[s
                 if "/homedetails/" in u:
                     return u, (street or title)
 
-    # 5) As a last resort, construct /homes/*_rb deeplink so it at least opens Zillow search
-    if street or city or state or title:
-        deeplink = construct_deeplink_from_parts(street or title or "", city, state, zipc, defaults)
-        return deeplink, compose_query_address(street or title or "", city, state, zipc, defaults)
+    # 5) Fallback: city-only deeplink if we have city/state; else expanded URL
+    if city or state:
+        return construct_city_deeplink(city, state), compose_query_address("", city, state, zipc, defaults)
 
-    # 6) Give up: return the expanded URL
     return final_url, ""
 
 # ---------- Parsers for pasted input ----------
@@ -602,11 +741,15 @@ def render_run_tab(state: dict):
                         "status": "source_url",
                     })
                 else:
-                    # Address-only row → try address search; fallback to /homes/_rb
+                    # Address-only row → try address search; fallback to /homes/_rb (but street-like only)
                     street = row.get("address","") or row.get("full_address","") or ""
                     if street:
                         variants = generate_address_variants(street, "", "", "", defaults)
-                        z2, _ = resolve_homedetails_with_bing_variants(variants) if require_city_state else resolve_homedetails_with_bing_variants(variants, required_state=None, required_city=None)
+                        z2, _ = resolve_homedetails_with_bing_variants(
+                            variants,
+                            required_state=None if not require_city_state else "",
+                            required_city=None if not require_city_state else ""
+                        )
                         if z2:
                             z2 = upgrade_to_homedetails_if_needed(z2)
                             canon, _ = canonicalize_zillow(z2); z2 = canon or z2
@@ -614,7 +757,13 @@ def render_run_tab(state: dict):
                                 "input_address": street, "zillow_url": z2, "preview_url": z2, "display_url": z2, "status":"addr_match"
                             })
                         else:
-                            rb = construct_deeplink_from_parts(street, "", "", "", defaults)
+                            # If no homedetails: build city-only deeplink (if we can parse a city/st from the string)
+                            m = re.search(r",\s*([^,]+),\s*([A-Z]{2})", street)
+                            if m:
+                                city, st_abbr = m.group(1).strip(), m.group(2).strip()
+                                rb = construct_city_deeplink(city, st_abbr)
+                            else:
+                                rb = construct_deeplink_from_parts(street, "", "", "", defaults)
                             results.append({
                                 "input_address": street, "zillow_url": rb, "preview_url": rb, "display_url": rb, "status":"deeplink_fallback"
                             })
