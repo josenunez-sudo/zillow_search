@@ -1,427 +1,336 @@
 # utils/address_parser.py
-# Public API: extract_address(url, parse_html=True, timeout=12.0) and address_as_markdown_link(...)
-# Robust against IDX pages (Homespotter), JSON-LD, microdata, generic JSON blobs, and URL slugs.
+# Public API:
+#   - extract_address(url: str, parse_html: bool = True, timeout: float = 12.0) -> Dict[str, Optional[str]]
+#       Returns: {"full","streetAddress","addressLocality","addressRegion","postalCode","source","url_final"}
+#   - address_to_zillow_rb(addr: Dict[str, Optional[str]], default_state: str = "NC") -> str
+#   - address_as_markdown_link(url: str, label: Optional[str] = None, parse_html: bool = True, timeout: float = 12.0)
+#
+# This module focuses on being resilient for IDX/Homespotter ("l.hms.pt", "idx.homespotter.com") pages.
+# Strategy:
+#   1) Follow redirects to the final URL.
+#   2) Look for a single formatted address string in JSON/script tags.
+#   3) Look for JSON objects with {line1/city/state/zip}, including many variant key names.
+#   4) Probe JSON-LD <script type="application/ld+json"> blocks for an "address" object.
+#   5) Probe microdata via itemprop attributes.
+#   6) Fall back to meta <title> / og:title text parsing.
+#   7) As a last resort, try to reconstruct from URL slug; if still unknown, don't invent a state —
+#      the caller can inject defaults if desired.
+#
+from __future__ import annotations
 
-import re, json
-from typing import Optional, Dict, Tuple
+import re
+import json
+from typing import Dict, Any, Optional, Tuple
 from urllib.parse import urlparse, unquote
+import requests
 
-def _clean(s: Optional[str]) -> Optional[str]:
-    if not s: return s
-    return re.sub(r"\s+", " ", s).strip()
+try:
+    from bs4 import BeautifulSoup  # type: ignore
+except Exception:  # pragma: no cover
+    BeautifulSoup = None  # type: ignore
 
-def _titleish(s: str) -> str:
-    s = s.replace("-", " ")
-    s = re.sub(r"\s+", " ", s).strip()
-    parts = s.split()
-    out = []
-    for p in parts:
-        if re.fullmatch(r"[A-Z]{2}", p):
-            out.append(p)
-        else:
-            out.append(p[:1].upper() + p[1:].lower())
-    return " ".join(out)
+UA_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Cache-Control": "no-cache",
+}
 
-def _normalize(parts: Dict[str, str]) -> Optional[str]:
-    line1 = _clean(parts.get("streetAddress") or parts.get("addressLine1") or parts.get("address") or parts.get("line1"))
-    city  = _clean(parts.get("addressLocality") or parts.get("city"))
-    reg   = _clean(parts.get("addressRegion") or parts.get("region") or parts.get("state"))
-    zipc  = _clean(parts.get("postalCode") or parts.get("zip"))
-    if line1 and city and reg:
-        return f"{line1}, {city}, {reg}{(' ' + zipc) if zipc else ''}"
+def _normalize(d: Dict[str, Optional[str]]) -> Optional[str]:
+    """Return a single 'full' string if we have enough parts; else None."""
+    street = (d.get("streetAddress") or "").strip()
+    city   = (d.get("addressLocality") or "").strip()
+    state  = (d.get("addressRegion") or "").strip()
+    zipc   = (d.get("postalCode") or "").strip()
+    if street and city and state:
+        return f"{street}, {city}, {state}" + (f" {zipc}" if zipc else "")
     return None
 
-def _mk_parts(street_slug: str, city_slug: str, st: str, zipc: str) -> Dict[str, str]:
-    return {
-        "streetAddress": _titleish(street_slug),
-        "addressLocality": _titleish(city_slug),
-        "addressRegion": st.upper(),
-        "postalCode": zipc,
-    }
+def _slugify(s: str) -> str:
+    s = (s or "").lower()
+    s = re.sub(r"[^\w\s,-]", "", s).replace(",", "")
+    s = re.sub(r"\s+", "-", s.strip())
+    return s
 
-# --------- Address text parser (single-string like "123 Main St, City, ST 12345") ---------
-_ADDR_LINE_RE = re.compile(r"(\d{1,7}[^,]+),\s*([A-Za-z .'\-]+),\s*([A-Z]{2})\s*(\d{5}(?:-\d{4})?)?")
-def _pick_address_from_text(txt: str) -> Optional[Dict[str, str]]:
-    m = _ADDR_LINE_RE.search(txt)
-    if not m: return None
-    return {
-        "streetAddress": _titleish(m.group(1)),
-        "addressLocality": _titleish(m.group(2)),
-        "addressRegion": m.group(3),
-        "postalCode": (m.group(4) or "").strip(),
-    }
+SINGLE_STRING_PAT = re.compile(
+    r'(?i)\b(\d{1,6}\s+[A-Za-z0-9\.\-\' ]+(?:Street|St|Avenue|Ave|Road|Rd|Boulevard|Blvd|Drive|Dr|Court|Ct|Lane|Ln|Way|Terrace|Ter|Place|Pl|Highway|Hwy|Pkwy|Parkway|Circle|Cir)\b[^,]*,\s*[A-Za-z\.\-\' ]+?,\s*[A-Za-z]{2}(?:\s+\d{5}(?:-\d{4})?)?)\b'
+)
 
-# -------------------- URL slug parsers (no HTML needed) --------------------
+def _pick_address_from_text(text: str) -> Optional[Dict[str, str]]:
+    """Parse '123 Main St, City, ST 12345' into components; return None if it doesn't look like an address."""
+    if not text:
+        return None
+    m = re.search(r'^\s*(.+?),\s*([A-Za-z\.\-\' ]+),\s*([A-Za-z]{2})(?:\s+(\d{5}(?:-\d{4})?))?\s*$', text.strip())
+    if not m:
+        m2 = SINGLE_STRING_PAT.search(text)
+        if not m2:
+            return None
+        text = m2.group(1)
+        m = re.search(r'^\s*(.+?),\s*([A-Za-z\.\-\' ]+),\s*([A-Za-z]{2})(?:\s+(\d{5}(?:-\d{4})?))?\s*$', text.strip())
+        if not m:
+            return None
+    street, city, state, zipc = m.group(1), m.group(2), m.group(3), m.group(4) or ""
+    return {"streetAddress": street, "addressLocality": city, "addressRegion": state, "postalCode": zipc}
+
+def _first_match(json_text: str, keys: list[str]) -> Optional[str]:
+    """Return first value for any of the keys in a JSON-ish blob; supports single or double quotes and optional nesting."""
+    if not json_text:
+        return None
+    for k in keys:
+        # direct "key":"value"
+        for pat in (
+            rf'["\']{re.escape(k)}["\']\s*:\s*["\']([^"\']+)["\']',
+            rf'{re.escape(k)}\s*[:=]\s*["\']([^"\']+)["\']',  # sometimes without quotes on key
+        ):
+            m = re.search(pat, json_text, re.I)
+            if m:
+                v = m.group(1).strip()
+                if v:
+                    return v
+    return None
 
 def _addr_from_url_slug(url: str) -> Optional[Dict[str, str]]:
-    p = urlparse(url)
-    host = (p.netloc or "").lower()
-    path = unquote(p.path or "")
-
-    # Zillow
-    m = re.search(r"/homedetails/([\w\-]+)-([a-z ]+)-([a-z]{2})-(\d{5})", path, re.I)
-    if "zillow.com" in host and m:
-        return _mk_parts(m.group(1), m.group(2), m.group(3), m.group(4))
-
-    # Redfin: /NC/Raleigh/721-Currituck-Dr-27609/...
-    if "redfin.com" in host:
-        m = re.search(r"^/([A-Z]{2})/([^/]+)/([\w\-]+)-(\d{5})(?:/|$)", path, re.I)
-        if m:
-            return {
-                "streetAddress": _titleish(m.group(3)),
-                "addressLocality": _titleish(m.group(2)),
-                "addressRegion": m.group(1).upper(),
-                "postalCode": m.group(4),
-            }
-
-    # Trulia
-    if "trulia.com" in host:
-        m = re.search(r"/home/([\w\-]+)-([a-z ]+)-([a-z]{2})-(\d{5})", path, re.I)
-        if m: return _mk_parts(m.group(1), m.group(2), m.group(3), m.group(4))
-
-    # Homes.com
-    if "homes.com" in host:
-        m = re.search(r"/([a-z\-]+)-([a-z]{2})/([\w\-]+)-(\d{5})", path, re.I)
-        if m:
-            return {
-                "streetAddress": _titleish(m.group(3)),
-                "addressLocality": _titleish(m.group(1).replace("-", " ")),
-                "addressRegion": m.group(2).upper(),
-                "postalCode": m.group(4),
-            }
-
-    # Realtor.com usually needs HTML JSON; slug rarely has full address
+    if not url:
+        return None
+    u = unquote(url)
+    m = re.search(r"/homedetails/([^/]+)/\d{6,}_zpid/", u, re.I)
+    if m:
+        t = re.sub(r"[-+]", " ", m.group(1)).strip().title()
+        cand = _pick_address_from_text(t)
+        if cand:
+            return cand
+    m = re.search(r"/homes/([^/_]+)_rb/?", u, re.I)
+    if m:
+        t = re.sub(r"[-+]", " ", m.group(1)).strip().title()
+        cand = _pick_address_from_text(t)
+        if cand:
+            return cand
     return None
 
-# -------------------- HTML-based parsers --------------------
+def _extract_meta_title_desc(soup) -> Optional[str]:
+    # og:title
+    tag = soup.find("meta", attrs={"property":"og:title"})
+    if tag and tag.get("content"): return tag["content"].strip()
+    # twitter:title
+    tag = soup.find("meta", attrs={"name":"twitter:title"})
+    if tag and tag.get("content"): return tag["content"].strip()
+    # description as a fallback
+    tag = soup.find("meta", attrs={"name":"description"})
+    if tag and tag.get("content"): return tag["content"].strip()
+    # title
+    if soup.title and soup.title.string:
+        return soup.title.string.strip()
+    return None
 
-def _addr_from_ld_json(soup) -> Optional[Dict[str, str]]:
-    for tag in soup.find_all("script", type="application/ld+json"):
-        try:
-            data = json.loads(tag.string or tag.text or "{}")
-        except Exception:
+def _addr_from_json_ld(soup) -> Optional[Dict[str, str]]:
+    for tag in soup.find_all("script", attrs={"type":"application/ld+json"}):
+        txt = (tag.string or tag.text or "").strip()
+        if not txt:
             continue
-
-        def find_postal(obj) -> Optional[Dict[str, str]]:
-            if isinstance(obj, dict):
-                if obj.get("@type") in ("PostalAddress", "schema:PostalAddress"):
-                    return {
-                        "streetAddress": obj.get("streetAddress"),
-                        "addressLocality": obj.get("addressLocality"),
-                        "addressRegion": obj.get("addressRegion"),
-                        "postalCode": obj.get("postalCode"),
-                    }
-                for v in obj.values():
-                    got = find_postal(v)
-                    if got: return got
-            elif isinstance(obj, list):
-                for it in obj:
-                    got = find_postal(it)
-                    if got: return got
+        try:
+            blob = json.loads(txt)
+        except Exception:
+            # Sometimes multiple JSON objects without an array wrapper; try to extract the first {...}
+            m = re.search(r"(\{.*\})", txt, re.S)
+            if not m:
+                continue
+            try:
+                blob = json.loads(m.group(1))
+            except Exception:
+                continue
+        def _address_from_obj(obj: Any) -> Optional[Dict[str, str]]:
+            if not isinstance(obj, dict):
+                return None
+            # Direct address
+            addr = obj.get("address")
+            if isinstance(addr, dict):
+                street = addr.get("streetAddress") or ""
+                city   = addr.get("addressLocality") or ""
+                state  = addr.get("addressRegion") or ""
+                zipc   = addr.get("postalCode") or ""
+                if street or city:
+                    return {"streetAddress": street, "addressLocality": city, "addressRegion": state, "postalCode": zipc}
+            # Sometimes under itemOffered.address
+            item = obj.get("itemOffered") if isinstance(obj.get("itemOffered"), dict) else None
+            if item and isinstance(item.get("address"), dict):
+                a = item["address"]
+                return {"streetAddress": a.get("streetAddress",""), "addressLocality": a.get("addressLocality",""),
+                        "addressRegion": a.get("addressRegion",""), "postalCode": a.get("postalCode","")}
             return None
-
-        found = find_postal(data)
-        if found and _normalize(found):
-            return found
+        # object or list
+        if isinstance(blob, dict):
+            cand = _address_from_obj(blob)
+            if cand and _normalize(cand):
+                return cand
+        elif isinstance(blob, list):
+            for o in blob:
+                cand = _address_from_obj(o)
+                if cand and _normalize(cand):
+                    return cand
     return None
 
 def _addr_from_microdata(soup) -> Optional[Dict[str, str]]:
-    # itemprop-based microdata (common on IDX pages)
-    addr_root = soup.select_one('[itemprop="address"]') or soup
-    def _txt(sel):
-        el = addr_root.select_one(sel)
-        return _clean(el.get_text(" ", strip=True)) if el else None
-    parts = {
-        "streetAddress": _txt('[itemprop="streetAddress"]'),
-        "addressLocality": _txt('[itemprop="addressLocality"]'),
-        "addressRegion": _txt('[itemprop="addressRegion"]'),
-        "postalCode": _txt('[itemprop="postalCode"]'),
-    }
-    if _normalize(parts): return parts
+    # Schema.org itemprops
+    street = city = state = zipc = ""
+    for attr, key in (
+        ("itemprop","streetAddress"),
+        ("itemprop","addressLocality"),
+        ("itemprop","addressRegion"),
+        ("itemprop","postalCode"),
+    ):
+        el = soup.find(attrs={attr:key})
+        if not el: continue
+        if key == "streetAddress": street = (el.get_text(" ", strip=True) or "").strip()
+        elif key == "addressLocality": city = (el.get_text(" ", strip=True) or "").strip()
+        elif key == "addressRegion": state = (el.get_text(" ", strip=True) or "").strip()
+        elif key == "postalCode": zipc = (el.get_text(" ", strip=True) or "").strip()
+    if street or (city and state):
+        return {"streetAddress": street, "addressLocality": city, "addressRegion": state, "postalCode": zipc}
     return None
 
-def _first_match(txt: str, keys) -> Optional[str]:
-    for k in keys:
-        m = re.search(rf'"{k}"\s*:\s*"([^"]+)"', txt, re.I)
-        if m:
-            val = _clean(m.group(1))
-            if val: return val
-    return None
-
-def _addr_from_generic_json(soup) -> Optional[Dict[str, str]]:
+def _addr_from_hs_specific(soup) -> Optional[Dict[str, str]]:
     """
-    Generic JSON hunter: scans ANY <script> for common address key patterns.
-    Helps on idx.homespotter.com, MLS/IDX sites without JSON-LD.
-    Enhanced to support single-string "formattedAddress"/"fullAddress" fields.
+    Homespotter/IDX flavors often embed address in window.__INITIAL_STATE__ or similar.
+    We scan scripts explicitly for those first and support many key names.
     """
-    # Wider net of key names used across IDX templates
     street_keys = ["streetAddress","address1","line1","addr1","address_line1","street","addressLine1"]
     city_keys   = ["addressLocality","city","locality","municipality","town","cityName","addressCity","localityName"]
     state_keys  = ["addressRegion","state","stateCode","region","province","stateOrProvince"]
     zip_keys    = ["postalCode","zip","zipCode","postal","postal_code"]
-    full_keys   = ["formattedAddress","displayAddress","fullAddress","address","propertyAddress"]
+    full_keys   = ["formattedAddress","displayAddress","fullAddress","address","propertyAddress","full_address"]
 
-    best = None
     for tag in soup.find_all("script"):
         txt = (tag.string or tag.text or "").strip()
         if not txt:
             continue
 
-        # 0) Try single-string first (formattedAddress etc.)
-        m_full = None
-        for fk in full_keys:
-            m_full = re.search(rf'"{fk}"\s*:\s*"([^"]+)"', txt, re.I)
-            if m_full:
-                cand = _pick_address_from_text(m_full.group(1))
-                if cand and _normalize(cand):
-                    return cand
-
-        # 1) Key-by-key extraction
-        s = _first_match(txt, street_keys)
-        c = _first_match(txt, city_keys)
-        st = _first_match(txt, state_keys)
-        zp = _first_match(txt, zip_keys)
-        # prefer 2-letter state if multiple
-        if st and re.fullmatch(r"[A-Za-z]{2}", st):
-            st = st.upper()
-        if s and c and st:
-            cand = {"streetAddress": s, "addressLocality": c, "addressRegion": st, "postalCode": (zp or "")}
-            if _normalize(cand):
-                # choose the "best" (longest street) if many
-                if not best or len(cand["streetAddress"]) > len(best["streetAddress"]):
-                    best = cand
-    return best
-
-def _addr_from_meta_or_title(soup) -> Optional[Dict[str, str]]:
-    for m in soup.find_all("meta"):
-        k = (m.get("property") or m.get("name") or "").lower()
-        v = _clean(m.get("content"))
-        if not k or not v: continue
-        if k in ("og:title","twitter:title","og:description","twitter:description"):
-            a = _pick_address_from_text(v)
-            if a: return a
-    t = _clean(soup.title.string if soup.title else None)
-    if t:
-        a = _pick_address_from_text(t)
-        if a: return a
-    return None
-
-# Site-hinted JSON (kept from earlier versions for higher precision on big portals)
-def _addr_from_redfin_json(soup) -> Optional[Dict[str, str]]:
-    import re as _re
-    for tag in soup.find_all("script"):
-        txt = tag.string or tag.text or ""
-        if "__REDUX_STATE__" in txt or "propertyInfoStore" in txt:
-            try:
-                m = _re.search(r"__REDUX_STATE__\s*=\s*({.*?})\s*;", txt, _re.S)
-                data = json.loads(m.group(1)) if m else None
-            except Exception:
-                data = None
-            if not data:
-                continue
-            candidates = [
-                data.get("propertyInfo") or {},
-                data.get("listingDetailsStore",{}).get("fullAddress") or {},
-                data.get("propertyInfoStore",{}).get("addressInfo") or {},
-            ]
-            for obj in candidates:
-                parts = {
-                    "streetAddress": obj.get("streetAddress") or obj.get("line1"),
-                    "addressLocality": obj.get("city") or obj.get("addressLocality"),
-                    "addressRegion": obj.get("state") or obj.get("addressRegion"),
-                    "postalCode": obj.get("zip") or obj.get("postalCode"),
-                }
-                if _normalize(parts): return parts
-    return None
-
-def _addr_from_zillow_json(soup) -> Optional[Dict[str, str]]:
-    import re as _re
-    for tag in soup.find_all("script"):
-        txt = tag.string or tag.text or ""
-        if "streetAddress" in txt and "addressLocality" in txt and "addressRegion" in txt:
-            m = _re.search(
-                r'"streetAddress"\s*:\s*"([^"]+)"[^}]*"addressLocality"\s*:\s*"([^"]+)"[^}]*"addressRegion"\s*:\s*"([A-Z]{2})"[^}]*"postalCode"\s*:\s*"([^"]+)"',
-                txt, _re.S
-            )
-            if m:
-                return {
-                    "streetAddress": m.group(1),
-                    "addressLocality": m.group(2),
-                    "addressRegion": m.group(3),
-                    "postalCode": m.group(4),
-                }
-    return None
-
-def _addr_from_realtor_json(soup) -> Optional[Dict[str, str]]:
-    import re as _re
-    for tag in soup.find_all("script"):
-        txt = tag.string or tag.text or ""
-        m = _re.search(
-            r'"address"\s*:\s*{[^}]*"streetAddress"\s*:\s*"([^"]+)"[^}]*"addressLocality"\s*:\s*"([^"]+)"[^}]*"addressRegion"\s*:\s*"([A-Z]{2})"[^}]*("postalCode"\s*:\s*"([^"]+)")?',
-            txt, _re.S
-        )
-        if m:
-            return {
-                "streetAddress": m.group(1),
-                "addressLocality": m.group(2),
-                "addressRegion": m.group(3),
-                "postalCode": (m.group(5) or "").strip(),
-            }
-    return None
-
-# --------- Homespotter/IDX targeted helpers ---------
-
-def _addr_from_homespotter_json(soup) -> Optional[Dict[str, str]]:
-    """
-    Many Homespotter pages (including idx.homespotter.com) expose either:
-      - "formattedAddress":"123 Main St, City, ST 12345"
-      - "displayAddress":"..."
-      - nested address objects with line1/city/state/zipCode
-    We scan scripts explicitly for those first.
-    """
-    # 1) Single string formatted address wins
-    for tag in soup.find_all("script"):
-        txt = (tag.string or tag.text or "").strip()
-        if not txt: continue
-        for key in ("formattedAddress","displayAddress","fullAddress","address"):
-            m = re.search(rf'"{key}"\s*:\s*"([^"]+)"', txt, re.I)
+        # 0) Single-string first (formattedAddress etc.)
+        for key in full_keys:
+            m = re.search(rf'["\']{re.escape(key)}["\']\s*:\s*["\']([^"\']+)["\']', txt, re.I)
             if m:
                 cand = _pick_address_from_text(m.group(1))
                 if cand and _normalize(cand):
                     return cand
 
-    # 2) Object keys (line1/city/state/zip)
-    street_keys = ["line1","address1","streetAddress","addr1","addressLine1"]
-    city_keys   = ["city","addressLocality"]
-    state_keys  = ["state","stateCode","addressRegion"]
-    zip_keys    = ["zip","postalCode","zipCode"]
-    for tag in soup.find_all("script"):
-        txt = (tag.string or tag.text or "").strip()
-        if not txt: continue
+        # 1) Object style keys
         s = _first_match(txt, street_keys)
         c = _first_match(txt, city_keys)
         st = _first_match(txt, state_keys)
         zp = _first_match(txt, zip_keys)
         if st and re.fullmatch(r"[A-Za-z]{2}", st): st = st.upper()
-        if s and c and st:
-            cand = {"streetAddress": s, "addressLocality": c, "addressRegion": st, "postalCode": (zp or "")}
-            if _normalize(cand): return cand
+        if s and (c or st):
+            cand = {"streetAddress": s, "addressLocality": (c or ""),
+                    "addressRegion": (st or ""), "postalCode": (zp or "")}
+            norm = _normalize(cand)
+            if norm:
+                return cand
 
+        # 2) Nested objects: "address": { "line1": "...", "city": "...", ... }
+        for m in re.finditer(r'"address"\s*:\s*\{(.*?)\}', txt, re.S|re.I):
+            inner = m.group(1)
+            s = _first_match(inner, street_keys)
+            c = _first_match(inner, city_keys)
+            st = _first_match(inner, state_keys)
+            zp = _first_match(inner, zip_keys)
+            if st and re.fullmatch(r"[A-Za-z]{2}", st): st = st.upper()
+            if s and (c or st):
+                cand = {"streetAddress": s, "addressLocality": (c or ""),
+                        "addressRegion": (st or ""), "postalCode": (zp or "")}
+                norm = _normalize(cand)
+                if norm:
+                    return cand
     return None
 
-def _mls_id_from_url(u: str) -> Optional[str]:
-    if not u: return None
+def _fetch_html(url: str, timeout: float = 12.0) -> Tuple[str, str, int]:
     try:
-        # .../some-mls-name/10116790?...
-        m = re.search(r'/(\d{6,})(?:[/?#]|$)', u)
-        if m: return m.group(1)
-        m = re.search(r'(?i)(?:mls|listing|id|listing_id)=([A-Za-z0-9\-]{6,})', u)
-        if m: return m.group(1)
+        r = requests.get(url, headers=UA_HEADERS, timeout=timeout, allow_redirects=True)
+        return r.url, (r.text if r.ok else ""), r.status_code
     except Exception:
-        return None
-    return None
-
-# -------------------- Public API --------------------
+        return url, "", 0
 
 def extract_address(url: str, parse_html: bool = True, timeout: float = 12.0) -> Dict[str, Optional[str]]:
     """
-    Resolve a listing URL (incl. short links) to:
-    full, streetAddress, addressLocality, addressRegion, postalCode, source, url_final
+    Expand a URL and try *hard* to extract a postal address from the landing page.
+    Works well with Homespotter IDX links and many other listing providers.
+    Returns a dict containing components and a 'full' normalized string when possible.
     """
-    # Lazy HTTP import
-    try:
-        import requests
-    except Exception:
-        parts = _addr_from_url_slug(url)
-        if parts and _normalize(parts):
-            return {**parts, "full": _normalize(parts), "source": "url-slug", "url_final": url}
-        return {"full": None, "streetAddress": None, "addressLocality": None, "addressRegion": None, "postalCode": None, "source": "unknown", "url_final": url}
+    final_url, html, _ = _fetch_html(url, timeout=timeout)
+    info: Dict[str, Optional[str]] = {
+        "full": None, "streetAddress": None, "addressLocality": None,
+        "addressRegion": None, "postalCode": None, "source": None,
+        "url_final": final_url
+    }
+    if not parse_html or not html or not BeautifulSoup:
+        # URL slug fallback only
+        a = _addr_from_url_slug(final_url)
+        if a and _normalize(a):
+            return {**info, **a, "full": _normalize(a), "source": "url-slug"}
+        return info
 
-    # Follow redirects
-    try:
-        sess = requests.Session()
-        sess.headers.update({
-            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
-            "Accept-Language": "en-US,en;q=0.9",
-        })
-        r = sess.get(url, allow_redirects=True, timeout=timeout)
-        r.raise_for_status()
-        final_url = r.url
-        html_text = r.text
-    except Exception:
-        parts = _addr_from_url_slug(url)
-        if parts and _normalize(parts):
-            return {**parts, "full": _normalize(parts), "source": "url-slug", "url_final": url}
-        return {"full": None, "streetAddress": None, "addressLocality": None, "addressRegion": None, "postalCode": None, "source": "unknown", "url_final": url}
+    soup = BeautifulSoup(html, "html.parser")
 
-    if not parse_html:
-        parts = _addr_from_url_slug(final_url)
-        if parts and _normalize(parts):
-            return {**parts, "full": _normalize(parts), "source": "url-slug", "url_final": final_url}
-        return {"full": None, "streetAddress": None, "addressLocality": None, "addressRegion": None, "postalCode": None, "source": "unknown", "url_final": final_url}
-
-    # BeautifulSoup (lazy)
-    try:
-        from bs4 import BeautifulSoup as _BS
-        soup = _BS(html_text, "html.parser")
-    except Exception:
-        parts = _addr_from_url_slug(final_url)
-        if parts and _normalize(parts):
-            return {**parts, "full": _normalize(parts), "source": "url-slug", "url_final": final_url}
-        return {"full": None, "streetAddress": None, "addressLocality": None, "addressRegion": None, "postalCode": None, "source": "unknown", "url_final": final_url}
-
-    host = (urlparse(final_url).netloc or "").lower()
-
-    # 1) JSON-LD
-    a = _addr_from_ld_json(soup)
+    # 1) Homespotter/IDX scripts (very common)
+    a = _addr_from_hs_specific(soup)
     if a and _normalize(a):
-        return {**a, "full": _normalize(a), "source": "json-ld", "url_final": final_url}
+        return {**info, **a, "full": _normalize(a), "source": "hs-script"}
 
-    # 2) Microdata (itemprop)
+    # 2) JSON-LD
+    a = _addr_from_json_ld(soup)
+    if a and _normalize(a):
+        return {**info, **a, "full": _normalize(a), "source": "json-ld"}
+
+    # 3) Microdata / itemprop
     a = _addr_from_microdata(soup)
     if a and _normalize(a):
-        return {**a, "full": _normalize(a), "source": "microdata", "url_final": final_url}
+        return {**info, **a, "full": _normalize(a), "source": "microdata"}
 
-    # 3) Site-hinted JSON for majors
-    if "redfin.com" in host:
-        a = _addr_from_redfin_json(soup)
-        if a and _normalize(a):
-            return {**a, "full": _normalize(a), "source": "site-json", "url_final": final_url}
-    if "zillow.com" in host:
-        a = _addr_from_zillow_json(soup)
-        if a and _normalize(a):
-            return {**a, "full": _normalize(a), "source": "site-json", "url_final": final_url}
-    if "realtor.com" in host:
-        a = _addr_from_realtor_json(soup)
-        if a and _normalize(a):
-            return {**a, "full": _normalize(a), "source": "site-json", "url_final": final_url}
+    # 4) Meta title/desc
+    t = _extract_meta_title_desc(soup)
+    cand = _pick_address_from_text(t or "")
+    if cand and _normalize(cand):
+        return {**info, **cand, "full": _normalize(cand), "source": "meta-title"}
 
-    # 3.5) Homespotter / IDX targeted
-    if "homespotter" in host:
-        a = _addr_from_homespotter_json(soup)
-        if a and _normalize(a):
-            return {**a, "full": _normalize(a), "source": "homespotter-json", "url_final": final_url}
-
-    # 4) Generic JSON hunter (works for many IDX pages incl. Homespotter)
-    a = _addr_from_generic_json(soup)
-    if a and _normalize(a):
-        return {**a, "full": _normalize(a), "source": "generic-json", "url_final": final_url}
-
-    # 5) Meta/title heuristics
-    a = _addr_from_meta_or_title(soup)
-    if a and _normalize(a):
-        return {**a, "full": _normalize(a), "source": "meta/title", "url_final": final_url}
-
-    # 6) URL slug fallback
+    # 5) URL slug fallback
     a = _addr_from_url_slug(final_url)
     if a and _normalize(a):
-        return {**a, "full": _normalize(a), "source": "url-slug", "url_final": final_url}
+        return {**info, **a, "full": _normalize(a), "source": "url-slug"}
 
-    return {"full": None, "streetAddress": None, "addressLocality": None, "addressRegion": None, "postalCode": None, "source": "unknown", "url_final": final_url}
+    return info
+
+def address_to_zillow_rb(addr: Dict[str, Optional[str]], default_state: str = "NC") -> str:
+    """
+    Build a Zillow /homes/*_rb/ deeplink from parsed components.
+    If street/city are missing, do NOT fabricate them; only append a default state if nothing else is known.
+    """
+    street = (addr.get("streetAddress") or "").strip()
+    city   = (addr.get("addressLocality") or "").strip()
+    state  = (addr.get("addressRegion") or "").strip() or ""
+    zipc   = (addr.get("postalCode") or "").strip()
+
+    parts = []
+    if street:
+        parts.append(street)
+    loc = ", ".join([p for p in [city, (state or "")] if p])
+    if loc:
+        parts.append(loc)
+    if zipc:
+        if parts:
+            parts[-1] = (parts[-1] + f" {zipc}")
+        else:
+            parts.append(zipc)
+
+    if not parts:
+        # Last resort: state-only
+        st = state or default_state
+        return f"https://www.zillow.com/homes/{_slugify(st)}_rb/"
+
+    slug = _slugify(", ".join(parts))
+    return f"https://www.zillow.com/homes/{slug}_rb/"
 
 def address_as_markdown_link(url: str, label: Optional[str] = None, parse_html: bool = True, timeout: float = 12.0) -> Tuple[str, Dict[str, Optional[str]]]:
     info = extract_address(url, parse_html=parse_html, timeout=timeout)
     text = label or info.get("full")
     if not text:
-        text = urlparse(info.get("url_final") or url).netloc or "Listing"
+        netloc = urlparse(info.get("url_final") or url).netloc or "Listing"
+        text = netloc
     return f"[{text}]({info.get('url_final') or url})", info
