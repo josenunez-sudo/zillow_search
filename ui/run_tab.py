@@ -1,8 +1,7 @@
 # ui/run_tab.py
-# Address Alchemist (Run tab only)
+# Address Alchemist — RUN TAB ONLY
 # Paste addresses OR arbitrary listing links (Homespotter/IDX OK) → Zillow.
-# Includes: "Fix links" section; robust Homespotter address extraction;
-# never outputs /homes/nc_rb/; tries to upgrade to /homedetails/..._zpid/.
+# Guarantees: never return HS/IDX link; never produce /homes/nc_rb/; tries to upgrade to /homedetails/..._zpid/.
 
 from __future__ import annotations
 
@@ -33,6 +32,7 @@ AZURE_SEARCH_INDEX    = _get_secret("AZURE_SEARCH_INDEX", "")
 AZURE_SEARCH_KEY      = _get_secret("AZURE_SEARCH_API_KEY", "")
 BING_API_KEY          = _get_secret("BING_API_KEY", "")
 BING_CUSTOM_ID        = _get_secret("BING_CUSTOM_CONFIG_ID", "")
+
 REQUEST_TIMEOUT       = 12
 
 UA_HEADERS = {
@@ -40,17 +40,22 @@ UA_HEADERS = {
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
     "Accept-Language": "en-US,en;q=0.9",
     "Cache-Control": "no-cache",
+    "Referer": "https://www.google.com/",
 }
 
 # ---------------------------
 # HTTP helpers
 # ---------------------------
-def expand_url_and_fetch_html(url: str) -> Tuple[str, str, int]:
+def _get(url: str) -> Tuple[str, str, int]:
     try:
         r = requests.get(url, headers=UA_HEADERS, timeout=REQUEST_TIMEOUT, allow_redirects=True)
         return r.url, (r.text if r.ok else ""), r.status_code
     except Exception:
         return url, "", 0
+
+def expand_url_and_fetch_html(url: str) -> Tuple[str, str, int]:
+    # same as _get but named for clarity
+    return _get(url)
 
 async def _fetch_html_async(client: httpx.AsyncClient, url: str) -> str:
     try:
@@ -62,7 +67,7 @@ async def _fetch_html_async(client: httpx.AsyncClient, url: str) -> str:
     return ""
 
 # ---------------------------
-# Generic parsing utils
+# Parsing utils
 # ---------------------------
 def _jsonld_blocks(html: str) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
@@ -93,9 +98,7 @@ def extract_title_or_desc(html: str) -> str:
     return ""
 
 def _strong_full_address_fallback(html: str) -> Optional[Tuple[str, str, str, str]]:
-    """
-    Greedy fallback to pull '123 Main St, Raleigh, NC 27601' from visible HTML.
-    """
+    # e.g. "123 Main St, Raleigh, NC 27601"
     pat = re.compile(
         r'(\d{1,6}\s+[A-Za-z0-9\.\-\'/ ]+),\s*([A-Za-z\.\-\' ]+),\s*([A-Z]{2})\s*(\d{5}(?:-\d{4})?)',
         re.I
@@ -104,7 +107,6 @@ def _strong_full_address_fallback(html: str) -> Optional[Tuple[str, str, str, st
     if not m:
         return None
     street, city, state, zipc = m.group(1).strip(), m.group(2).strip(), m.group(3).strip(), m.group(4).strip()
-    # Basic sanity — avoid obviously bad captures
     if len(street.split()) < 2:
         return None
     return street, city, state, zipc
@@ -139,11 +141,12 @@ def extract_address_from_html(html: str) -> Dict[str, str]:
     except Exception:
         pass
 
-    # 2) HS/IDX common JSON blobs
+    # 2) HS/IDX common JSON blobs (lots of variants observed)
     blobs = [
         (r'"address(?:Line1|1)?"\s*:\s*"([^"]+)"', "street"),
         (r'"displayAddress"\s*:\s*"([^"]+)"', "street"),
         (r'"fullAddress"\s*:\s*"([^"]+)"', "street"),
+        (r'"formattedAddress"\s*:\s*"([^"]+)"', "street"),
         (r'"address"\s*:\s*"([^"]+)"', "street"),
         (r'"city"\s*:\s*"([^"]+)"', "city"),
         (r'"state(?:OrProvince)?"\s*:\s*"([A-Za-z]{2,})"', "state"),
@@ -194,6 +197,24 @@ def extract_address_from_html(html: str) -> Dict[str, str]:
         out[k] = (out.get(k) or "").strip()
     return out
 
+def _homespotter_like(u: str) -> bool:
+    try:
+        h = (urlparse(u).hostname or "").lower()
+        return any(k in h for k in ("l.hms.pt", "homespotter", "idx.homespotter.com", "hs_"))
+    except Exception:
+        return False
+
+def _alt_variants(u: str) -> List[str]:
+    # Try AMP-like / embed variants that often contain simpler markup with the address
+    qs = ["amp=1", "output=amp", "client=web", "view=embed"]
+    out = []
+    base, html_q = re.sub(r"[?#].*$", "", u), ""
+    for q in qs:
+        out.append(u + (("&" if "?" in u else "?") + q))
+    if not u.endswith("/"):
+        out.append(u + "/")
+    return out
+
 # ---------------------------
 # Zillow helpers
 # ---------------------------
@@ -209,7 +230,6 @@ def canonicalize_zillow(url: str) -> Tuple[str, Optional[str]]:
     return canon, (m_z.group(1) if m_z else None)
 
 def upgrade_to_homedetails_if_needed(url: str) -> str:
-    """Try to upgrade any Zillow page to canonical /homedetails/.../_zpid/ when possible."""
     if not url or "/homedetails/" in url:
         return url
     try:
@@ -356,16 +376,18 @@ def azure_search_first_zillow(query_address):
         return None
     return None
 
+def page_contains_city_state(html:str, city:str=None, state:str=None) -> bool:
+    ok = False
+    if city and re.search(re.escape(city), html, re.I): ok = True
+    if state and re.search(rf'\b{re.escape(state)}\b', html, re.I): ok = True
+    return ok
+
 def confirm_or_resolve_on_page(url:str, required_city:str=None, required_state:str=None):
-    """
-    If we hit a Zillow /homes/*_rb/ page, try to pluck the first /homedetails/ link from it.
-    """
     try:
         r = requests.get(url, headers=UA_HEADERS, timeout=REQUEST_TIMEOUT); r.raise_for_status()
         html = r.text
         if "/homedetails/" in url:
             return url, "homedetails"
-
         if url.endswith("_rb/") and "/homedetails/" not in url:
             cand = re.findall(r'href="(https://www\.zillow\.com/homedetails/[^"]+)"', html)[:12]
             for u in cand:
@@ -380,12 +402,6 @@ def confirm_or_resolve_on_page(url:str, required_city:str=None, required_state:s
         return None, None
     return None, None
 
-def page_contains_city_state(html:str, city:str=None, state:str=None) -> bool:
-    ok = False
-    if city and re.search(re.escape(city), html, re.I): ok = True
-    if state and re.search(rf'\b{re.escape(state)}\b', html, re.I): ok = True
-    return ok
-
 def resolve_homedetails_with_bing_variants(address_variants, required_state=None, required_city=None, delay=0.3, require_match=False):
     if not BING_API_KEY:
         return None, None
@@ -399,8 +415,8 @@ def resolve_homedetails_with_bing_variants(address_variants, required_state=None
         ]
         for q in queries:
             items = bing_search_items(q)
-            for it in items:
-                url = it.get("url") or it.get("link") or ""
+            for it in items or []:
+                url = (it.get("url") or it.get("link") or "").strip()
                 if not url or "zillow.com" not in url: continue
                 if "/homedetails/" not in url and "/homes/" not in url: continue
                 if require_match and not url_matches_city_state(url, required_city, required_state): continue
@@ -441,55 +457,67 @@ def construct_deeplink_from_parts(street, city, state, zipc, defaults):
     return f"https://www.zillow.com/homes/{a}_rb/"
 
 # ---------------------------
-# Source resolver (core)
+# Core resolver
 # ---------------------------
-def resolve_from_source_url(source_url: str, defaults: Dict[str,str]) -> Tuple[str, str]:
+def _extract_address_with_variants(final_url: str, html: str) -> Dict[str, str]:
+    addr = extract_address_from_html(html)
+    if addr.get("street") or addr.get("city") or addr.get("state") or addr.get("zip"):
+        return addr
+
+    # Try alternate variants (AMP/embed) for HS/IDX
+    if _homespotter_like(final_url):
+        for alt in _alt_variants(final_url):
+            try:
+                u2, h2, _ = _get(alt)
+                a2 = extract_address_from_html(h2)
+                if a2.get("street") or a2.get("city") or a2.get("state") or a2.get("zip"):
+                    return a2
+            except Exception:
+                continue
+
+    # Try querystring hints
+    try:
+        q = parse_qs(urlparse(final_url).query)
+        for key in ("address","addr","q","query","location","street"):
+            if q.get(key):
+                candidate = q[key][0]
+                if len(candidate) > 8:
+                    return {"street": candidate, "city":"", "state":"", "zip":""}
+    except Exception:
+        pass
+
+    # Title w/ zip
+    tit = extract_title_or_desc(html)
+    if tit and re.search(r"\d{5}", tit):
+        return {"street": tit, "city":"", "state":"", "zip":""}
+
+    return {"street": "", "city": "", "state": "", "zip": ""}
+
+def resolve_from_source_url(source_url: str, defaults: Dict[str,str]) -> Tuple[str, str, str]:
     """
-    1) Follow shorteners → fetch HTML
-    2) Extract address (HS/IDX-safe)
-    3) Try Azure (optional), then Bing (optional)
-    4) If still nothing, build /homes/<address>_rb/ ONLY when we have street/city, then try to upgrade to /homedetails/
-    5) If we lack address entirely, return the original final URL (no bogus nc_rb)
+    Returns (zillow_url, query_address, status)
+    Status: 'homedetails' | 'variant' | 'deeplink' | 'unresolved'
+    - Never returns a Homespotter/IDX link.
+    - Never returns /homes/nc_rb/.
     """
     final_url, html, _ = expand_url_and_fetch_html(source_url)
 
-    # Zillow already? Normalize/upgrade.
+    # Zillow already? normalize/upgrade and return.
     if "zillow.com" in (final_url or ""):
         cleaned = upgrade_to_homedetails_if_needed(final_url)
-        return cleaned, ""
+        return cleaned, "", "homedetails" if "/homedetails/" in cleaned else "variant"
 
-    # Extract address from HTML
-    addr = extract_address_from_html(html)
-
-    # If still no address, try URL query or meta title
-    if not (addr.get("street") or addr.get("city") or addr.get("state")):
-        try:
-            q = parse_qs(urlparse(final_url).query)
-            for key in ("address","addr","q","query","location","street"):
-                if q.get(key):
-                    candidate = q[key][0]
-                    if len(candidate) > 8:
-                        addr["street"] = candidate
-                        break
-        except Exception:
-            pass
-        if not addr.get("street"):
-            tit = extract_title_or_desc(html)
-            if tit and re.search(r"\d{5}", tit):
-                addr["street"] = tit
-
+    # Hard rule: do not return HS/IDX
+    # Extract address (robust), possibly via alt variants
+    addr = _extract_address_with_variants(final_url, html)
     street = (addr.get("street") or "").strip()
     city   = (addr.get("city") or "").strip()
     state  = (addr.get("state") or "").strip()
     zipc   = (addr.get("zip") or "").strip()
 
-    # If we have nothing, bail out to the original URL (do not create /homes/nc_rb/)
     if not (street or city or state or zipc):
-        return final_url, ""
-
-    # Sensible default if state is still missing
-    if not state and city:
-        state = ""
+        # gated page and no address found → unresolved (return empty, not HS)
+        return "", "", "unresolved"
 
     query_addr = compose_query_address(street, city, state, zipc, defaults)
 
@@ -497,7 +525,8 @@ def resolve_from_source_url(source_url: str, defaults: Dict[str,str]) -> Tuple[s
     if query_addr:
         z = azure_search_first_zillow(query_addr)
         if z and url_matches_city_state(z, city or None, state or None):
-            return upgrade_to_homedetails_if_needed(z), query_addr
+            z = upgrade_to_homedetails_if_needed(z)
+            return z, query_addr, "homedetails" if "/homedetails/" in z else "variant"
 
     # Bing search for /homedetails/ (if key present)
     if street or city:
@@ -510,17 +539,20 @@ def resolve_from_source_url(source_url: str, defaults: Dict[str,str]) -> Tuple[s
             require_match=True
         )
         if zurl:
-            return upgrade_to_homedetails_if_needed(zurl), compose_query_address(street, city, state, zipc, defaults)
+            zurl = upgrade_to_homedetails_if_needed(zurl)
+            return zurl, compose_query_address(street, city, state, zipc, defaults), "homedetails" if "/homedetails/" in zurl else "variant"
 
-    # Last resort: build /homes/<address>_rb/ (ONLY if address info exists), then try to upgrade by scraping results page
+    # Last resort: build /homes/<address>_rb/ ONLY if we truly have address, then try to upgrade
     deeplink = construct_deeplink_from_parts(street, city, state, zipc, defaults)
     if deeplink:
-        # Try to pluck the first homedetails from that results page
         best, _ = confirm_or_resolve_on_page(deeplink, required_city=city or None, required_state=state or None)
-        return (upgrade_to_homedetails_if_needed(best) if best else deeplink), compose_query_address(street, city, state, zipc, defaults)
+        if best:
+            best = upgrade_to_homedetails_if_needed(best)
+            return best, compose_query_address(street, city, state, zipc, defaults), "homedetails" if "/homedetails/" in best else "variant"
+        return deeplink, compose_query_address(street, city, state, zipc, defaults), "deeplink"
 
-    # If we reached here, return the original page we resolved to — better than nc_rb
-    return final_url, ""
+    # Shouldn’t happen, but if no deeplink allowed, mark unresolved
+    return "", "", "unresolved"
 
 # ---------------------------
 # Output helpers
@@ -557,12 +589,13 @@ def results_list_with_copy_all(results: List[Dict[str, Any]]):
     li_html = []
     for r in results:
         href = r.get("preview_url") or r.get("zillow_url") or r.get("display_url") or ""
-        if not href:
-            continue
-        safe_href = escape(href)
-        link_txt = href  # raw URL for clean unfurls
+        label = href if href else "(unresolved)"
+        safe_href = escape(href) if href else "#"
         li_html.append(
-            f'<li style="margin:0.2rem 0;"><a href="{safe_href}" target="_blank" rel="noopener">{escape(link_txt)}</a></li>'
+            f'<li style="margin:0.2rem 0;">' +
+            (f'<a href="{safe_href}" target="_blank" rel="noopener">{escape(label)}</a>' if href else f"{escape(label)}") +
+            ("" if r.get("status") in ("","homedetails","variant","deeplink") else f" <span style='font-size:11px;color:#64748b'>[{escape(r.get('status'))}]</span>") +
+            "</li>"
         )
 
     items_html = "\n".join(li_html) if li_html else "<li>(no results)</li>"
@@ -611,7 +644,7 @@ def results_list_with_copy_all(results: List[Dict[str, Any]]):
 # ---------------------------
 def render_run_tab(state: Optional[dict] = None):
     st.header("Run")
-    st.caption("Paste addresses or **any listing links** (Homespotter/IDX OK) → Zillow")
+    st.caption("Paste addresses or **any listing links** (Homespotter/IDX OK) → Zillow. We’ll never hand back gated HS links.")
 
     col1, col2, col3 = st.columns([1.1, 1, 1.2])
     with col1:
@@ -673,18 +706,19 @@ def render_run_tab(state: Optional[dict] = None):
         for i, row in enumerate(rows_in, start=1):
             val = (row.get("source_or_address") or "").strip()
             if not val:
-                results.append({"input_address":"", "zillow_url":"", "status":"no_input"})
+                results.append({"input_address":"", "zillow_url":"", "preview_url":"", "status":"no_input"})
                 prog.progress(i/total, text=f"Processed {i}/{total}")
                 continue
 
             if re.match(r"^[a-z]+://", val):  # URL path
-                zurl, used_addr = resolve_from_source_url(val, defaults)
+                zurl, used_addr, stat = resolve_from_source_url(val, defaults)
+                # Never return Homespotter; if unresolved, leave url empty
                 preview = make_preview_url(zurl) if zurl else ""
                 results.append({
                     "input_address": used_addr or "",
                     "zillow_url": zurl,
                     "preview_url": preview,
-                    "status": ""
+                    "status": stat
                 })
             else:  # Freeform address → build deeplink only when we have useful text
                 street = val
@@ -693,7 +727,7 @@ def render_run_tab(state: Optional[dict] = None):
                     "input_address": val,
                     "zillow_url": deeplink or "",
                     "preview_url": make_preview_url(deeplink) if deeplink else "",
-                    "status": "deeplink_fallback" if deeplink else "no_address"
+                    "status": "deeplink" if deeplink else "unresolved"
                 })
             prog.progress(i/total, text=f"Resolved {i}/{total}")
         prog.progress(1.0, text="Done")
@@ -719,37 +753,47 @@ def render_run_tab(state: Optional[dict] = None):
     # =========================
     st.divider()
     st.subheader("Fix links")
-    st.caption("Paste **any** listing links (HS/IDX/Zillow). I’ll output clean canonical Zillow links. No more `/homes/nc_rb/`.")
+    st.caption("Paste HS/IDX/Zillow links. Returns clean Zillow links. If a link can’t be resolved (gated), it’s marked `(unresolved)` — we won’t hand back HS links.")
     fix_text = st.text_area("Links to fix", height=120, key="fix_area")
     if st.button("🔧 Fix / Re-run links"):
         lines = [l.strip() for l in (fix_text or "").splitlines() if l.strip()]
         fixed: List[str] = []
+        annotated: List[str] = []
         prog = st.progress(0, text="Fixing…")
         for i, u in enumerate(lines, start=1):
-            best = u
+            final = ""
             try:
-                # If it's Zillow already, upgrade if possible
                 if "zillow.com" in u:
-                    best = upgrade_to_homedetails_if_needed(u) or u
+                    final = upgrade_to_homedetails_if_needed(u) or ""
                 else:
-                    # Resolve from source (Homespotter/IDX → Zillow)
-                    z, _addr = resolve_from_source_url(u, {"city":"", "state":"", "zip":""})
-                    best = z or u
-                    if best:
-                        best = upgrade_to_homedetails_if_needed(best) or best
+                    z, _addr, stat = resolve_from_source_url(u, {"city":"", "state":"", "zip":""})
+                    final = upgrade_to_homedetails_if_needed(z) if z else ""
+                # Guard against bogus deeplinks
+                if final.endswith("/homes/_rb/") or final.endswith("/homes/nc_rb/"):
+                    final = ""
             except Exception:
-                pass
-            # Never let an empty deeplink through
-            if best.endswith("/homes/_rb/") or best.endswith("/homes/nc_rb/"):
-                best = u
-            fixed.append(best)
+                final = ""
+
+            if final:
+                fixed.append(final)
+                annotated.append(final)
+            else:
+                annotated.append(f"{u}  (unresolved)")
+
             prog.progress(i/len(lines), text=f"Fixed {i}/{len(lines)}")
         prog.progress(1.0, text="Done")
 
-        st.markdown("**Fixed links**")
-        items = "\n".join([f"- [{escape(x)}]({escape(x)})" for x in fixed])
-        st.markdown(items, unsafe_allow_html=True)
-        st.text_area("Copy clean list", value="\n".join(fixed) + "\n", height=140, label_visibility="collapsed")
+        st.markdown("**Resolved**")
+        if fixed:
+            items = "\n".join([f"- [{escape(x)}]({escape(x)})" for x in fixed])
+            st.markdown(items, unsafe_allow_html=True)
+            st.text_area("Copy clean list", value="\n".join(fixed) + "\n", height=140, label_visibility="collapsed")
+        else:
+            st.write("_None_")
+
+        st.markdown("**All (with status)**")
+        items2 = "\n".join([f"- {escape(x)}" for x in annotated])
+        st.markdown(items2, unsafe_allow_html=True)
 
 # Allow running directly
 if __name__ == "__main__":
