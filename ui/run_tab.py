@@ -1,11 +1,11 @@
 # ui/run_tab.py
-# Simple + mobile-friendly:
+# Mobile-friendly link resolver with thumbnails:
 # - Paste addresses or listing links (incl. Homespotter)
-# - Upload MLS CSVs (auto-detect common "address"/"street/city/state/zip"/"url" columns)
-# - No Bing/Azure dependency
-# - If Homespotter: call HS_ADDRESS_RESOLVER_URL /resolve?u=... to pull the address
-# - Build Zillow /homes/<slug>_rb/ deeplinks, then try to upgrade to /homedetails/ via canonical link
-# - "Fix properties" section to normalize any pasted Zillow links
+# - Upload MLS CSV (URL or address columns auto-detected; optional photo column)
+# - Uses HS_ADDRESS_RESOLVER_URL microservice for Homespotter when set
+# - Builds Zillow /homes/<slug>_rb/ and upgrades to /homedetails/ when possible
+# - Shows an Images section for quick visual confirmation
+# - Includes "Fix properties" tool
 
 import os, re, io, csv, json
 from typing import List, Dict, Any, Optional, Tuple
@@ -15,7 +15,7 @@ import requests
 import streamlit as st
 import streamlit.components.v1 as components
 
-# Optional: single-line address normalization if you have it installed
+# Optional address normalization
 try:
     import usaddress
 except Exception:
@@ -31,6 +31,7 @@ def _get_secret(key: str, default: str = "") -> str:
     return str(os.getenv(key, default)).strip()
 
 HS_RESOLVER = _get_secret("HS_ADDRESS_RESOLVER_URL", "").rstrip("/")
+GOOGLE_MAPS_API_KEY = _get_secret("GOOGLE_MAPS_API_KEY", "")
 
 REQUEST_TIMEOUT = 12
 UA_HEADERS = {
@@ -208,16 +209,86 @@ def upgrade_to_homedetails_if_needed(url: str) -> str:
         if not r.ok:
             return url
         html = r.text or ""
-        # Look for a direct homedetails link or canonical tag
+        # Direct homedetails link
         m = re.search(r'href=["\'](https://www\.zillow\.com/homedetails/[^"\']+)["\']', html, re.I)
         if m:
             return m.group(1)
+        # Canonical
         m = re.search(r'rel=["\']canonical["\'][^>]+href=["\'](https://www\.zillow\.com/homedetails/[^"\']+)["\']', html, re.I)
         if m:
             return m.group(1)
     except Exception:
         pass
     return url
+
+# ---------- Image helpers ----------
+def extract_zillow_first_image(html: str) -> Optional[str]:
+    if not html:
+        return None
+    for target_w in ("1152","960","768","1536"):
+        m = re.search(
+            rf"<img[^>]+src=['\"](https://photos\.zillowstatic\.com/fp/[^'\" ]+-cc_ft_{target_w}\.(?:jpg|webp))['\"]",
+            html, re.I
+        )
+        if m: return m.group(1)
+    m = re.search(r"<meta[^>]+property=['\"]og:image['\"][^>]+content=['\"]([^'\"]+)['\"]", html, re.I)
+    if m: return m.group(1)
+    m = re.search(r"(https://photos\.zillowstatic\.com/fp/\S+-cc_ft_\d+\.(jpg|webp))", html, re.I)
+    return m.group(1) if m else None
+
+def picture_for_result_with_log(query_address: str, zurl: str, csv_photo_url: Optional[str] = None):
+    """
+    Returns (image_url_or_None, log_dict)
+    Priority: CSV-provided photo > Zillow hero/meta > Google Street View (if key) > None
+    """
+    log = {
+        "url": zurl, "csv_provided": bool(csv_photo_url), "stage": None,
+        "status_code": None, "html_len": None, "selected": None, "errors": []
+    }
+
+    def _ok(u: Optional[str]) -> bool:
+        return isinstance(u, str) and u.startswith(("http://","https://","data:"))
+
+    # 1) CSV photo (if provided)
+    if csv_photo_url and _ok(csv_photo_url):
+        log["stage"] = "csv_photo"; log["selected"] = csv_photo_url
+        return csv_photo_url, log
+
+    # 2) Zillow hero/meta if homedetails
+    if zurl and "/homedetails/" in zurl:
+        try:
+            r = requests.get(zurl, headers=UA_HEADERS, timeout=REQUEST_TIMEOUT)
+            log["status_code"] = r.status_code
+            if r.ok:
+                html = r.text
+                log["html_len"] = len(html)
+                zfirst = extract_zillow_first_image(html)
+                if zfirst:
+                    log["stage"] = "zillow_hero"; log["selected"] = zfirst
+                    return zfirst, log
+        except Exception as e:
+            log["errors"].append(f"fetch_err:{e!r}")
+
+    # 3) Google Street View fallback
+    try:
+        key = GOOGLE_MAPS_API_KEY
+        if key and query_address:
+            from urllib.parse import quote_plus
+            loc = quote_plus(query_address)
+            sv = f"https://maps.googleapis.com/maps/api/streetview?size=640x400&location={loc}&key={key}"
+            log["stage"] = "street_view"; log["selected"] = sv
+            return sv, log
+        else:
+            if not key: log["errors"].append("no_google_maps_key")
+    except Exception as e:
+        log["errors"].append(f"sv_err:{e!r}")
+
+    log["stage"] = "none"
+    return None, log
+
+@st.cache_data(ttl=900, show_spinner=False)
+def get_thumbnail_and_log(query_address: str, zurl: str, csv_photo_url: Optional[str]):
+    return picture_for_result_with_log(query_address, zurl, csv_photo_url)
 
 # ---------- Homespotter microservice ----------
 def resolve_hs_address_via_service(hs_url: str) -> Optional[Dict[str, Any]]:
@@ -292,6 +363,9 @@ CITY_KEYS  = {"city","municipality","town"}
 STATE_KEYS = {"state","st","province","region"}
 ZIP_KEYS   = {"zip","zip code","postal code","postalcode","zip_code","postal_code"}
 
+# Allow CSV-provided photo columns to drive the image
+PHOTO_KEYS = {"photo","image","photo url","image url","picture","thumbnail","thumb","img","img url","img_url"}
+
 def norm_key(k: str) -> str:
     return re.sub(r"\s+"," ", (k or "").strip().lower())
 
@@ -335,8 +409,7 @@ def compose_address_from_row(row: Dict[str, Any], default_state: str = "NC") -> 
 
 def parse_csv_uploaded(file, default_state: str = "NC") -> List[Dict[str, str]]:
     """
-    Returns list of dicts with either {"url": "..."} OR {"address": "..."}.
-    Tries URL-like fields first; otherwise composes address from components.
+    Returns list of dicts with either {"url": "..."} OR {"address": "..."} (+ optional "photo")
     """
     rows: List[Dict[str, str]] = []
     try:
@@ -350,13 +423,22 @@ def parse_csv_uploaded(file, default_state: str = "NC") -> List[Dict[str, str]]:
                 if norm_key(k) in URL_KEYS and is_probable_url(v):
                     url = v.strip()
                     break
+            photo = get_first_by_keys(row, PHOTO_KEYS)
+
             if url:
-                rows.append({"url": url})
+                item = {"url": url}
+                if photo:
+                    item["photo"] = photo
+                rows.append(item)
                 continue
+
             # Else: compose address from columns
             addr = compose_address_from_row(row, default_state)
             if addr:
-                rows.append({"address": addr})
+                item = {"address": addr}
+                if photo:
+                    item["photo"] = photo
+                rows.append(item)
     except Exception:
         pass
     return rows
@@ -378,19 +460,24 @@ def _list_to_rows(text: str, default_state: str = "NC") -> List[Dict[str, str]]:
             rows = []
             for r in reader:
                 row = {k: ("" if v is None else str(v)) for k, v in r.items()}
-                # URL field?
                 url = ""
                 for k, v in row.items():
                     if norm_key(k) in URL_KEYS and is_probable_url(v):
                         url = v.strip()
                         break
+                photo = get_first_by_keys(row, PHOTO_KEYS)
+
                 if url:
-                    rows.append({"url": url})
+                    item = {"url": url}
+                    if photo: item["photo"] = photo
+                    rows.append(item)
                     continue
-                # Or compose address
+
                 addr = compose_address_from_row(row, default_state)
                 if addr:
-                    rows.append({"address": addr})
+                    item = {"address": addr}
+                    if photo: item["photo"] = photo
+                    rows.append(item)
             if rows:
                 return rows
         except Exception:
@@ -496,16 +583,48 @@ def build_export_payload(urls: List[str], fmt: str) -> Tuple[bytes, str, str]:
         body = "\n".join([u for u in urls if u]) + ("\n" if urls else "")
         return body.encode("utf-8"), "text/plain", "txt"
 
+# ---------- Thumbnails UI ----------
+def _thumb_cell(url: str, addr: str, csv_photo: Optional[str]) -> str:
+    img, _log = get_thumbnail_and_log(addr or "", url or "", csv_photo)
+    safe_u = re.sub(r'"', "&quot;", (url or ""))
+    if img:
+        safe_img = re.sub(r'"', "&quot;", img)
+        return f'''
+        <div style="border:1px solid rgba(0,0,0,.08);border-radius:14px;padding:8px;margin-bottom:10px">
+          <a href="{safe_u}" target="_blank" rel="noopener">
+            <img src="{safe_img}" alt="thumbnail" style="width:100%;height:auto;border-radius:12px"/>
+          </a>
+          <div style="font-size:12px;opacity:.8;margin-top:6px">{(addr or "")}</div>
+        </div>'''
+    return f'''
+    <div style="border:1px solid rgba(0,0,0,.08);border-radius:14px;padding:8px;margin-bottom:10px">
+      <a href="{safe_u}" target="_blank" rel="noopener">{safe_u}</a>
+      <div style="font-size:12px;opacity:.8;margin-top:6px">{(addr or "")}</div>
+    </div>'''
+
+def _thumbnails_grid(results: List[Dict[str, Any]], columns: int = 3):
+    if not results:
+        return
+    cols = st.columns(columns)
+    for i, r in enumerate(results):
+        url = r.get("zurl") or ""
+        addr = r.get("addr") or ""
+        csv_photo = r.get("csv_photo") or None
+        html = _thumb_cell(url, addr, csv_photo)
+        with cols[i % columns]:
+            st.markdown(html, unsafe_allow_html=True)
+
 # ---------- Main render ----------
 def render_run_tab(state):  # keep this signature for your app loader
     st.header("Run")
 
-    # Options
-    colA, colB = st.columns(2)
+    colA, colB, colC = st.columns([1,1,1])
     with colA:
         default_state = st.text_input("Default state (if missing)", value="NC")
     with colB:
         show_preview = st.checkbox("Show preview of paste", value=True)
+    with colC:
+        show_images = st.checkbox("Show images", value=True)
 
     # Paste + CSV
     st.caption("Paste *addresses or listing links* and/or upload an **MLS CSV**.")
@@ -529,31 +648,39 @@ def render_run_tab(state):  # keep this signature for your app loader
             st.warning("Nothing to process.")
             return
 
-        # Heads-up if resolver missing (only warn once here)
         if not HS_RESOLVER:
             st.info("Homespotter resolver not configured (HS_ADDRESS_RESOLVER_URL). Homespotter links will be handled via basic HTML parsing only.")
 
         all_rows = pasted_rows + csv_rows
+        results: List[Dict[str, Any]] = []  # each: {"zurl","addr","csv_photo"}
         urls_out: List[str] = []
 
         prog = st.progress(0, text="Resolving…")
         total = len(all_rows) if all_rows else 1
 
         for i, r in enumerate(all_rows, start=1):
+            csv_photo = r.get("photo") or None
             if r.get("url"):
-                z, _addr = resolve_from_source_url(r["url"], state_default=(default_state or "NC"))
-                urls_out.append(z or r["url"])
+                z, addr = resolve_from_source_url(r["url"], state_default=(default_state or "NC"))
+                z = z or r["url"]
+                results.append({"zurl": z, "addr": addr, "csv_photo": csv_photo})
+                urls_out.append(z)
             else:
                 addr = (r.get("address") or "").strip()
                 if addr:
                     z = "https://www.zillow.com/homes/" + zillow_slugify(addr) + "_rb/"
                     z = upgrade_to_homedetails_if_needed(z)
+                    results.append({"zurl": z, "addr": addr, "csv_photo": csv_photo})
                     urls_out.append(z)
             prog.progress(i/total, text=f"Resolved {i}/{total}")
         prog.progress(1.0, text="Done")
 
         st.subheader("Results")
         results_list_with_copy_all(urls_out)
+
+        if show_images:
+            st.markdown("#### Images")
+            _thumbnails_grid(results, columns=3)
 
         st.markdown("**Download**")
         fmt = st.selectbox("Format", ["txt","csv","md","html"], index=0, key="dl_fmt")
