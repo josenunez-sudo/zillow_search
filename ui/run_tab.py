@@ -1,11 +1,10 @@
 # ui/run_tab.py
-# Address Alchemist (simplified, mobile friendly)
-# - Paste addresses AND arbitrary listing links → clean Zillow links
-# - Prefers HS resolver microservice (HS_ADDRESS_RESOLVER_URL) for Homespotter links
+# Address Alchemist — CSV-hardened + HS resolver + HTML parse → clean Zillow links
+# - Robust CSV upload (encoding + delimiter sniffing + MLS column mapping)
+# - Paste addresses OR links
+# - Microservice first for Homespotter (HS_ADDRESS_RESOLVER_URL), else HTML parse
 # - No Bing/Azure dependency
-# - CSV upload preserved
-# - Image preview preserved
-# - "Fix properties" section restored
+# - Image preview + Fix properties restored
 # - Entry point: render_run_tab(state=None)
 
 import os, io, re, csv, json, time
@@ -47,6 +46,36 @@ URL_KEYS = {
 }
 
 PHOTO_KEYS = {"photo","image","photo url","image url","picture","thumbnail","thumb","img","img url","img_url"}
+
+# ----- MLS address field name vocab -----
+ADDR_PRIMARY = {
+    "full address","address","property address","property_address","site address","site_address",
+    "listing address","listing_address","location","street address","street_address"
+}
+NUM_KEYS   = {"street #","street number","street_no","streetnum","house_number","number","streetnumber","address number","addressnumber"}
+NAME_KEYS  = {
+    "street name","street","st name","st_name","road","rd","avenue","ave","blvd","boulevard",
+    "drive","dr","lane","ln","way","terrace","ter","court","ct","place","pl","parkway","pkwy",
+    "square","sq","circle","cir","highway","hwy","route","rt"
+}
+SUF_KEYS   = {"suffix","st suffix","street suffix","suffix1","suffix2","street_type","street type","post type","posttype"}
+PREDIR_KEYS= {"pre dir","predir","street predirectional","streetnamepredirectional","street name pre directional"}
+POSTDIR_KEYS= {"post dir","postdir","street postdirectional","streetnamepostdirectional","street name post directional"}
+UNIT_KEYS  = {"unit","apt","apartment","suite","ste","unit #","unit number","apt #","apt number","aptnum","unitnum"}
+CITY_KEYS  = {"city","municipality","town","place name","placename"}
+STATE_KEYS = {"state","st","province","region","state name","statename"}
+ZIP_KEYS   = {"zip","zip code","postal code","postalcode","zip_code","postal_code","zip5","zipcode"}
+
+def norm_key(k:str) -> str:
+    return re.sub(r"\s+"," ", (k or "").strip().lower())
+
+def get_first_by_keys(row: Dict[str, Any], keys) -> str:
+    for k in row.keys():
+        if norm_key(k) in keys:
+            v = str(row[k]).strip()
+            if v:
+                return v
+    return ""
 
 # =========================
 # HTTP + HTML helpers
@@ -93,7 +122,7 @@ def _is_homespotter_like(u: str) -> bool:
 
 def resolve_hs_address_via_service(source_url: str) -> Optional[Dict[str, Any]]:
     """
-    Call your Cloudflare/Worker (or other) resolver to get { ok, address{street,city,state,zip}, zillow_candidate? }.
+    Call your Cloudflare/Worker resolver to get { ok, address{street,city,state,zip}, zillow_candidate? }.
     """
     if not (HS_ADDRESS_RESOLVER_URL and source_url):
         return None
@@ -431,10 +460,18 @@ def _rows_from_paste(text: str) -> List[Dict[str, Any]]:
     # Try CSV first (requires a header line with a delimiter)
     try:
         sample = text.splitlines()
-        if len(sample) >= 2 and ("," in sample[0] or "\t" in sample[0] or ";" in sample[0]):
+        if len(sample) >= 2 and ("," in sample[0] or "\t" in sample[0] or ";" in sample[0] or "|" in sample[0]):
             # auto-detect delimiter
-            dialect = csv.Sniffer().sniff(sample[0])
-            reader = csv.DictReader(io.StringIO(text), dialect=dialect)
+            try:
+                dialect = csv.Sniffer().sniff("\n".join(sample[:3]))
+                reader = csv.DictReader(io.StringIO(text), dialect=dialect)
+            except Exception:
+                # fallback delimiter guess
+                delim = max([(",", sample[0].count(",")),
+                             ("\t", sample[0].count("\t")),
+                             (";", sample[0].count(";")),
+                             ("|", sample[0].count("|"))], key=lambda x:x[1])[0]
+                reader = csv.DictReader(io.StringIO(text), delimiter=delim)
             rows = [dict(r) for r in reader]
             if rows:
                 return rows
@@ -453,27 +490,126 @@ def _rows_from_paste(text: str) -> List[Dict[str, Any]]:
             rows.append({"address": s})
     return rows
 
-def norm_key(k:str) -> str:
-    return re.sub(r"\s+"," ", (k or "").strip().lower())
+# =========================
+# Robust CSV upload handling
+# =========================
 
-def get_first_by_keys(row: Dict[str, Any], keys) -> str:
-    for k in row.keys():
-        if norm_key(k) in keys:
-            v = str(row[k]).strip()
-            if v:
-                return v
-    return ""
+def _decode_bytes_safely(b: bytes) -> str:
+    # Try common encodings used by MLS exports
+    for enc in ("utf-8-sig","utf-16","cp1252","latin-1"):
+        try:
+            return b.decode(enc)
+        except Exception:
+            continue
+    # last resort
+    return b.decode("utf-8", errors="replace")
 
-def detect_source_url(row: Dict[str, Any]) -> Optional[str]:
-    # honor explicit URL columns first
-    for k, v in row.items():
-        if norm_key(k) in URL_KEYS and is_probable_url(str(v)):
-            return str(v).strip()
-    # fallback shortcuts
-    for k in ("url","source","href","link"):
-        if is_probable_url(str(row.get(k, ""))):
-            return str(row.get(k)).strip()
-    return None
+def _guess_delimiter(header_line: str) -> str:
+    cand = [(",", header_line.count(",")),
+            ("\t", header_line.count("\t")),
+            (";", header_line.count(";")),
+            ("|", header_line.count("|"))]
+    cand.sort(key=lambda x: x[1], reverse=True)
+    return cand[0][0] if cand and cand[0][1] > 0 else ","
+
+def _read_csv_anyhow(uploaded_bytes: bytes) -> List[Dict[str, Any]]:
+    """
+    Extremely robust CSV reader for MLS exports.
+    - Detect encoding + delimiter
+    - Handle weird quoting / stray characters
+    """
+    text = _decode_bytes_safely(uploaded_bytes)
+    # Normalize newlines & strip nulls
+    text = text.replace("\r\n", "\n").replace("\r", "\n").replace("\x00", "")
+    lines = text.split("\n")
+    if not lines or not lines[0].strip():
+        return []
+
+    header = lines[0]
+    try:
+        dialect = csv.Sniffer().sniff("\n".join(lines[:5]))
+        reader = csv.DictReader(io.StringIO(text), dialect=dialect)
+    except Exception:
+        delim = _guess_delimiter(header)
+        reader = csv.DictReader(io.StringIO(text), delimiter=delim)
+
+    rows: List[Dict[str, Any]] = []
+    for r in reader:
+        try:
+            rows.append({k: (v if v is not None else "") for k, v in r.items()})
+        except Exception:
+            # row-level fallback (skip malformed row)
+            continue
+    return rows
+
+def _compose_address_from_row(row: Dict[str, Any]) -> str:
+    """
+    Build one-line address from many MLS-style columns.
+    """
+    n = { norm_key(k): (str(v).strip() if v is not None else "") for k, v in row.items() }
+
+    # Full address column wins
+    for k in n.keys():
+        if k in ADDR_PRIMARY and n[k]:
+            return n[k]
+
+    num    = get_first_by_keys(n, NUM_KEYS)
+    predir = get_first_by_keys(n, PREDIR_KEYS)
+    name   = get_first_by_keys(n, NAME_KEYS)
+    suf    = get_first_by_keys(n, SUF_KEYS)
+    postdir= get_first_by_keys(n, POSTDIR_KEYS)
+    unit   = get_first_by_keys(n, UNIT_KEYS)
+    city   = get_first_by_keys(n, CITY_KEYS)
+    state  = get_first_by_keys(n, STATE_KEYS)
+    zipc   = get_first_by_keys(n, ZIP_KEYS)
+
+    street_bits = [x for x in [num, predir, name, suf, postdir] if x]
+    street = " ".join(street_bits).strip()
+    if unit:
+        street = (street + f" {unit}").strip()
+
+    parts = [street]
+    loc   = ", ".join([p for p in [city, state] if p])
+    if loc:
+        parts.append(loc)
+    if zipc:
+        if parts:
+            parts[-1] = (parts[-1] + f" {zipc}").strip()
+        else:
+            parts.append(zipc)
+
+    return " ".join([p for p in parts if p]).strip()
+
+def normalize_csv_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Ensure each row has either 'url' or 'address'.
+    """
+    out: List[Dict[str, Any]] = []
+    for r in rows:
+        d = dict(r)  # copy
+        # Prefer explicit URL columns
+        u = None
+        for k in d.keys():
+            if norm_key(k) in URL_KEYS and is_probable_url(str(d[k])):
+                u = str(d[k]).strip()
+                break
+        if u:
+            out.append({"url": u, **d})
+            continue
+
+        # else compose address
+        addr = _compose_address_from_row(d)
+        if addr:
+            out.append({"address": addr, **d})
+            continue
+
+        # last resort: if there's a single non-empty field, treat as address
+        non_empty = [str(v).strip() for v in d.values() if str(v).strip()]
+        if len(non_empty) == 1 and not is_probable_url(non_empty[0]):
+            out.append({"address": non_empty[0], **d})
+        else:
+            out.append(d)  # we’ll handle empties later
+    return out
 
 # =========================
 # Resolution pipeline
@@ -521,7 +657,9 @@ def resolve_from_source_url(source_url: str, state_default: str = "NC") -> Tuple
         inferred = " ".join([x for x in [street, city, state, zipc] if x])
         return z, inferred
 
-    # Fallback: give expanded URL back (don't return root /homes/)
+    # Fallback: give expanded URL back (avoid returning root /homes/)
+    if re.match(r"^https?://(www\.)?zillow\.com/homes/?$", final_url.strip("/"), re.I):
+        return source_url, ""  # keep original if Zillow root
     return final_url, ""
 
 def process_row(row: Dict[str, Any], state_default: str = "NC") -> Dict[str, Any]:
@@ -529,23 +667,30 @@ def process_row(row: Dict[str, Any], state_default: str = "NC") -> Dict[str, Any
     If the row contains a URL → resolve_from_source_url.
     If it's an address → build a safe Zillow deeplink & upgrade if possible.
     """
-    src_url = detect_source_url(row)
+    # Prefer URL if present
+    src_url = None
+    for k, v in row.items():
+        if norm_key(k) in URL_KEYS and is_probable_url(str(v)):
+            src_url = str(v).strip()
+            break
+
+    # Or constructed 'address'
+    addr_val = (row.get("address") or row.get("full_address") or "").strip()
+
     photo   = get_first_by_keys(row, PHOTO_KEYS)
 
     # URL path
     if src_url:
         zurl, inferred = resolve_from_source_url(src_url, state_default=state_default)
         return {
-            "input_address": inferred or (row.get("address") or "").strip(),
+            "input_address": inferred or addr_val,
             "zillow_url": zurl,
             "status": ("ok" if zurl else "no_address_found"),
             "csv_photo": photo,
         }
 
     # Address path
-    addr = (row.get("address") or row.get("full_address") or "").strip()
-    # Try to pull city/state/zip if present in the same string
-    parsed = _parse_us_address_loose(addr) or {"street": addr, "city": "", "state": state_default, "zip": ""}
+    parsed = _parse_us_address_loose(addr_val) or {"street": addr_val, "city": "", "state": state_default, "zip": ""}
     z = zillow_deeplink_from_addr(parsed.get("street",""), parsed.get("city",""), parsed.get("state",""), parsed.get("zip",""))
     if z:
         z = upgrade_to_homedetails_if_needed(z)
@@ -658,11 +803,16 @@ def thumbnails_grid(results: List[Dict[str, Any]], columns: int = 3):
 def render_run_tab(state: dict | None = None):
     st.header("Address Alchemist")
 
-    # Mobile-friendly, minimal controls
     st.write("Paste addresses or **any listing links** (Homespotter, IDX, etc.). I’ll return clean Zillow links.")
+    if not HS_ADDRESS_RESOLVER_URL:
+        st.caption("Resolver: ⚠️ missing HS_ADDRESS_RESOLVER_URL (set in `.streamlit/secrets.toml`).")
 
     with st.container():
-        paste = st.text_area("Paste addresses or links (one per line)", height=160, placeholder="407 E Woodall St, Smithfield, NC 27577\nhttps://idx.homespotter.com/hs_triangle/tmlspar/10127718")
+        paste = st.text_area(
+            "Paste addresses or links (one per line)",
+            height=160,
+            placeholder="407 E Woodall St, Smithfield, NC 27577\nhttps://idx.homespotter.com/hs_triangle/tmlspar/10127718"
+        )
 
     csv_file = st.file_uploader("Upload CSV (optional)", type=["csv"])
 
@@ -675,17 +825,23 @@ def render_run_tab(state: dict | None = None):
     if run_btn:
         rows_in: List[Dict[str, Any]] = []
 
-        # Parse CSV first (if provided)
+        # Parse CSV first (if provided) — robust
         if csv_file is not None:
             try:
-                content = csv_file.getvalue().decode("utf-8-sig", errors="replace")
-                reader = list(csv.DictReader(io.StringIO(content)))
-                rows_in.extend(reader)
+                file_bytes = csv_file.getvalue()
+                raw_rows = _read_csv_anyhow(file_bytes)
+                rows_in.extend(normalize_csv_rows(raw_rows))
+                st.caption(f"CSV: read **{len(raw_rows)}** rows, normalized to **{len(rows_in)}** items.")
             except Exception as e:
                 st.warning(f"CSV read error: {e}")
 
         # Parse pasted
-        rows_in.extend(_rows_from_paste(paste or ""))
+        pasted_rows = _rows_from_paste(paste or "")
+        if pasted_rows:
+            # normalize pasted-CSV too (when user pasted a CSV blob)
+            if isinstance(pasted_rows[0], dict):
+                pasted_rows = normalize_csv_rows(pasted_rows)
+            rows_in.extend(pasted_rows)
 
         if not rows_in:
             st.warning("Nothing to process.")
@@ -698,8 +854,7 @@ def render_run_tab(state: dict | None = None):
             res = process_row(row, state_default="NC")  # default NC if state missing
             results.append(res)
             prog.progress(i/total, text=f"Resolved {i}/{total}")
-            # light politeness for rate limits
-            time.sleep(0.05)
+            time.sleep(0.03)  # light politeness
 
         prog.progress(1.0, text="Done")
 
