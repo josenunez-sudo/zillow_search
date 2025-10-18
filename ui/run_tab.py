@@ -1,17 +1,25 @@
 # ui/run_tab.py
-# Minimal, mobile-friendly Run tab:
-# - Paste addresses OR links (incl. Homespotter short links)
-# - If Homespotter, call HS_ADDRESS_RESOLVER_URL /resolve?u=...
-# - Build a Zillow /homes/<slug>_rb/ deeplink from the address
-# - Try to upgrade rb → /homedetails/ if the page shows a canonical homedetails link
-# - "Fix links" section to normalize any pasted Zillow links
+# Simple + mobile-friendly:
+# - Paste addresses or listing links (incl. Homespotter)
+# - Upload MLS CSVs (auto-detect common "address"/"street/city/state/zip"/"url" columns)
+# - No Bing/Azure dependency
+# - If Homespotter: call HS_ADDRESS_RESOLVER_URL /resolve?u=... to pull the address
+# - Build Zillow /homes/<slug>_rb/ deeplinks, then try to upgrade to /homedetails/ via canonical link
+# - "Fix properties" section to normalize any pasted Zillow links
 
 import os, re, io, csv, json
 from typing import List, Dict, Any, Optional, Tuple
+from urllib.parse import urlparse, quote_plus, unquote
+
 import requests
 import streamlit as st
 import streamlit.components.v1 as components
-from urllib.parse import quote_plus, urlparse, unquote
+
+# Optional: single-line address normalization if you have it installed
+try:
+    import usaddress
+except Exception:
+    usaddress = None
 
 # ---------- Config / Secrets ----------
 def _get_secret(key: str, default: str = "") -> str:
@@ -22,8 +30,7 @@ def _get_secret(key: str, default: str = "") -> str:
         pass
     return str(os.getenv(key, default)).strip()
 
-HS_RESOLVER = _get_secret("HS_ADDRESS_RESOLVER_URL", "")
-HS_RESOLVER = HS_RESOLVER.rstrip("/") if HS_RESOLVER else ""
+HS_RESOLVER = _get_secret("HS_ADDRESS_RESOLVER_URL", "").rstrip("/")
 
 REQUEST_TIMEOUT = 12
 UA_HEADERS = {
@@ -52,7 +59,7 @@ def expand_url_and_fetch_html(url: str) -> Tuple[str, str, int]:
     except Exception:
         return url, "", 0
 
-# ---------- Address extractors ----------
+# ---------- HTML → address ----------
 def _jsonld_blocks(html: str) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
     if not html:
@@ -90,16 +97,16 @@ def extract_address_from_html(html: str) -> Dict[str, str]:
         for blk in _jsonld_blocks(html):
             if not isinstance(blk, dict):
                 continue
-            addr = blk.get("address") or blk.get("itemOffered", {}).get("address") if isinstance(blk.get("itemOffered"), dict) else blk.get("address")
+            addr = blk.get("address")
+            if not addr and isinstance(blk.get("itemOffered"), dict):
+                addr = blk["itemOffered"].get("address")
             if isinstance(addr, dict):
                 out["street"] = out["street"] or (addr.get("streetAddress") or "").strip()
                 out["city"]   = out["city"]   or (addr.get("addressLocality") or "").strip()
-                # Sometimes addressRegion contains "NC", or addressCountry mistakenly used
                 st_or_cty = (addr.get("addressRegion") or addr.get("addressCountry") or "").strip()
                 if st_or_cty and not out["state"]:
                     out["state"] = st_or_cty[:2].upper()
                 out["zip"]    = out["zip"]    or (addr.get("postalCode") or "").strip()
-                # If we already have a decent address, stop early
                 if out["street"] and (out["city"] or out["state"]):
                     break
     except Exception:
@@ -133,7 +140,7 @@ def extract_address_from_html(html: str) -> Dict[str, str]:
         m = re.search(r'itemprop=["\']postalCode["\'][^>]*>\s*(\d{5}(?:-\d{4})?)', html, re.I)
         if m: out["zip"] = m.group(1).strip()
 
-    # Fallback from <title> / og:title when it clearly looks like an address
+    # Fallback from <title> / og:title when it looks like an address
     if not out["street"]:
         for pat in [
             r"<meta[^>]+property=['\"]og:title['\"][^>]+content=['\"]([^'\"]+)['\"]",
@@ -215,7 +222,7 @@ def upgrade_to_homedetails_if_needed(url: str) -> str:
 # ---------- Homespotter microservice ----------
 def resolve_hs_address_via_service(hs_url: str) -> Optional[Dict[str, Any]]:
     """
-    Call your Cloudflare Worker (or any microservice) that returns:
+    Call your Worker/Tunnel that returns:
     { ok: true, address: {street,city,state,zip}, zillow_candidate?: "https://www.zillow.com/homes/<slug>_rb/" }
     """
     if not (HS_RESOLVER and hs_url):
@@ -228,18 +235,18 @@ def resolve_hs_address_via_service(hs_url: str) -> Optional[Dict[str, Any]]:
         return None
     return None
 
-# ---------- Core: resolve any input into a Zillow URL ----------
+# ---------- Resolution core ----------
 def resolve_from_source_url(source_url: str, state_default: str = "NC") -> Tuple[str, str]:
     """
     Returns (zillow_url, inferred_address_text)
-    - If Homespotter link and your resolver is configured, use it first.
-    - Else expand and parse HTML for address; build a Zillow /homes/<slug>_rb/ deeplink.
-    - Try to upgrade to /homedetails/ if canonical exists.
+    - If Homespotter link and resolver is configured, use it first
+    - Else, expand and parse HTML for address; build a Zillow /homes/<slug>_rb/ deeplink
+    - Then try to upgrade to /homedetails/ if the page exposes canonical
     """
     if not source_url:
         return "", ""
 
-    # 0) Homespotter → call microservice first
+    # Homespotter → service first
     if _is_homespotter_like(source_url) and HS_RESOLVER:
         data = resolve_hs_address_via_service(source_url)
         if data and data.get("ok"):
@@ -249,63 +256,147 @@ def resolve_from_source_url(source_url: str, state_default: str = "NC") -> Tuple
             city   = (a.get("city") or "").strip()
             state  = (a.get("state") or "").strip() or state_default
             zipc   = (a.get("zip") or "").strip()
-
             zurl = z or zillow_deeplink_from_addr(street, city, state, zipc)
             zurl = upgrade_to_homedetails_if_needed(zurl)
             inferred = " ".join([x for x in [street, city, state, zipc] if x])
             return zurl, inferred
 
-    # 1) Expand the URL and fetch the page
+    # Generic page parse
     final_url, html, _ = expand_url_and_fetch_html(source_url)
-
-    # 2) Parse address off the page
     addr = extract_address_from_html(html)
     street = (addr.get("street") or "").strip()
     city   = (addr.get("city") or "").strip()
     state  = (addr.get("state") or "").strip() or state_default
     zipc   = (addr.get("zip") or "").strip()
 
-    # 3) Build a Zillow deeplink (even if partial address)
     if street or city or state or zipc:
         z = zillow_deeplink_from_addr(street, city, state, zipc)
         z = upgrade_to_homedetails_if_needed(z)
         inferred = " ".join([x for x in [street, city, state, zipc] if x])
         return z, inferred
 
-    # 4) Fallback: just return the expanded URL (no parsing)
+    # Fallback
     return final_url, ""
 
-# ---------- UI helpers ----------
-def _list_to_rows(text: str) -> List[Dict[str, str]]:
+# ---------- Input parsing ----------
+URL_KEYS = {"url","link","source url","source_url","listing url","listing_url","property url","property_url","href"}
+
+ADDR_PRIMARY = {"full_address","address","property address","property_address","site address","site_address",
+                "street address","street_address","listing address","listing_address","location"}
+NUM_KEYS   = {"street #","street number","street_no","streetnum","house_number","number","streetnumber"}
+NAME_KEYS  = {"street name","street","st name","st_name","road","rd","avenue","ave","blvd","boulevard",
+              "drive","dr","lane","ln","way","terrace","ter","court","ct","place","pl","parkway","pkwy",
+              "square","sq","circle","cir","highway","hwy","route","rt"}
+SUF_KEYS   = {"suffix","st suffix","street suffix","suffix1","suffix2","street_type","street type"}
+CITY_KEYS  = {"city","municipality","town"}
+STATE_KEYS = {"state","st","province","region"}
+ZIP_KEYS   = {"zip","zip code","postal code","postalcode","zip_code","postal_code"}
+
+def norm_key(k: str) -> str:
+    return re.sub(r"\s+"," ", (k or "").strip().lower())
+
+def get_first_by_keys(row: Dict[str, Any], keys_set) -> str:
+    for k, v in row.items():
+        if norm_key(k) in keys_set:
+            s = str(v).strip() if v is not None else ""
+            if s:
+                return s
+    return ""
+
+def compose_address_from_row(row: Dict[str, Any], default_state: str = "NC") -> str:
     """
-    Accept CSV with header (url or address), OR plain text (one URL/address per line).
+    Build a single-line address from possible CSV columns.
+    """
+    n = { norm_key(k): (str(v).strip() if v is not None else "") for k, v in row.items() }
+
+    # Full-address style field?
+    for k in list(n.keys()):
+        if k in ADDR_PRIMARY and n[k]:
+            return n[k]
+
+    # Components
+    num   = get_first_by_keys(n, NUM_KEYS)
+    name  = get_first_by_keys(n, NAME_KEYS)
+    suf   = get_first_by_keys(n, SUF_KEYS)
+    city  = get_first_by_keys(n, CITY_KEYS)
+    state = get_first_by_keys(n, STATE_KEYS) or default_state
+    zipc  = get_first_by_keys(n, ZIP_KEYS)
+
+    street = " ".join([x for x in [num, name, suf] if x]).strip()
+    parts = [street]
+    if city or state:
+        parts.append(", ".join([p for p in [city, state] if p]))
+    if zipc:
+        if parts:
+            parts[-1] = (parts[-1] + f" {zipc}").strip()
+        else:
+            parts.append(zipc)
+    return re.sub(r"\s+"," ", ", ".join([p for p in parts if p]).strip())
+
+def parse_csv_uploaded(file, default_state: str = "NC") -> List[Dict[str, str]]:
+    """
+    Returns list of dicts with either {"url": "..."} OR {"address": "..."}.
+    Tries URL-like fields first; otherwise composes address from components.
+    """
+    rows: List[Dict[str, str]] = []
+    try:
+        text = file.getvalue().decode("utf-8-sig")
+        reader = csv.DictReader(io.StringIO(text))
+        for raw in reader:
+            row = {k: ("" if v is None else str(v)) for k, v in raw.items()}
+            # URL first (any of URL_KEYS)
+            url = ""
+            for k, v in row.items():
+                if norm_key(k) in URL_KEYS and is_probable_url(v):
+                    url = v.strip()
+                    break
+            if url:
+                rows.append({"url": url})
+                continue
+            # Else: compose address from columns
+            addr = compose_address_from_row(row, default_state)
+            if addr:
+                rows.append({"address": addr})
+    except Exception:
+        pass
+    return rows
+
+def _list_to_rows(text: str, default_state: str = "NC") -> List[Dict[str, str]]:
+    """
+    Accept CSV-like text with header (url/address), or plain text (one URL/address per line).
     """
     text = (text or "").strip()
     if not text:
         return []
 
-    # Try CSV first if it looks like CSV
+    # CSV path (quick sniff)
     lines = text.splitlines()
     if len(lines) >= 2 and ("," in lines[0] or "\t" in lines[0]):
         try:
             dialect = csv.Sniffer().sniff(lines[0])
             reader = csv.DictReader(io.StringIO(text), dialect=dialect)
-            out = []
+            rows = []
             for r in reader:
-                # field name could be 'url' or 'address' or similar
-                row = {k.lower(): (str(v).strip() if v is not None else "") for k, v in r.items()}
-                url = row.get("url") or row.get("link") or row.get("source_url") or ""
-                addr = row.get("address") or row.get("full_address") or ""
+                row = {k: ("" if v is None else str(v)) for k, v in r.items()}
+                # URL field?
+                url = ""
+                for k, v in row.items():
+                    if norm_key(k) in URL_KEYS and is_probable_url(v):
+                        url = v.strip()
+                        break
                 if url:
-                    out.append({"url": url})
-                elif addr:
-                    out.append({"address": addr})
-            if out:
-                return out
+                    rows.append({"url": url})
+                    continue
+                # Or compose address
+                addr = compose_address_from_row(row, default_state)
+                if addr:
+                    rows.append({"address": addr})
+            if rows:
+                return rows
         except Exception:
             pass
 
-    # Plain lines
+    # Plain list
     out: List[Dict[str, str]] = []
     for ln in lines:
         s = ln.strip()
@@ -314,15 +405,36 @@ def _list_to_rows(text: str) -> List[Dict[str, str]]:
         if is_probable_url(s):
             out.append({"url": s})
         else:
+            # optional normalize with usaddress
+            if usaddress:
+                try:
+                    parts, _ = usaddress.tag(s)
+                    street = " ".join([
+                        parts.get("AddressNumber",""),
+                        parts.get("StreetNamePreDirectional",""),
+                        parts.get("StreetName",""),
+                        parts.get("StreetNamePostType",""),
+                        parts.get("OccupancyType",""),
+                        parts.get("OccupancyIdentifier",""),
+                    ]).strip()
+                    city  = parts.get("PlaceName","")
+                    state = parts.get("StateName","") or default_state
+                    zipc  = parts.get("ZipCode","")
+                    s = ", ".join([p for p in [street, ", ".join([p for p in [city, state] if p])] if p])
+                    if zipc:
+                        s = (s + f" {zipc}").strip()
+                except Exception:
+                    pass
             out.append({"address": s})
     return out
 
-def _result_item_html(url: str, badge: str = "") -> str:
+# ---------- Output helpers ----------
+def _result_item_html(url: str) -> str:
     u = (url or "").strip()
     if not u:
         return ""
     esc = re.sub(r'"', "&quot;", u)
-    return f'<li style="margin:0.25rem 0;"><a href="{esc}" target="_blank" rel="noopener">{esc}</a>{badge}</li>'
+    return f'<li style="margin:0.25rem 0;"><a href="{esc}" target="_blank" rel="noopener">{esc}</a></li>'
 
 def results_list_with_copy_all(urls: List[str]):
     items_html = "\n".join(_result_item_html(u) for u in urls if u)
@@ -361,46 +473,105 @@ def results_list_with_copy_all(urls: List[str]):
     """
     components.html(html, height=min(700, 40 * max(1, len(urls)) + 30), scrolling=False)
 
+def build_export_payload(urls: List[str], fmt: str) -> Tuple[bytes, str, str]:
+    """
+    Returns (data_bytes, mime, default_ext)
+    """
+    fmt = (fmt or "txt").lower()
+    if fmt == "csv":
+        buf = io.StringIO()
+        w = csv.writer(buf)
+        w.writerow(["url"])
+        for u in urls:
+            if u:
+                w.writerow([u])
+        return buf.getvalue().encode("utf-8"), "text/csv", "csv"
+    elif fmt == "md":
+        body = "\n".join([f"- {u}" for u in urls if u]) + ("\n" if urls else "")
+        return body.encode("utf-8"), "text/markdown", "md"
+    elif fmt == "html":
+        body = "<ul>\n" + "\n".join([f'<li><a href="{u}" target="_blank" rel="noopener">{u}</a></li>' for u in urls if u]) + "\n</ul>\n"
+        return body.encode("utf-8"), "text/html", "html"
+    else:
+        body = "\n".join([u for u in urls if u]) + ("\n" if urls else "")
+        return body.encode("utf-8"), "text/plain", "txt"
+
 # ---------- Main render ----------
 def render_run_tab(state):  # keep this signature for your app loader
     st.header("Run")
 
-    # Paste area
-    st.caption("Paste *addresses* or *listing links* (Homespotter, IDX, MLS, etc.). I’ll output clean Zillow links.")
-    paste = st.text_area("Input", height=180, placeholder="407 E Woodall St, Smithfield, NC 27577\nhttps://l.hms.pt/...\nhttps://idx.homespotter.com/hs_triangle/tmlspar/10127718")
+    # Options
+    colA, colB = st.columns(2)
+    with colA:
+        default_state = st.text_input("Default state (if missing)", value="NC")
+    with colB:
+        show_preview = st.checkbox("Show preview of paste", value=True)
 
-    # Run
+    # Paste + CSV
+    st.caption("Paste *addresses or listing links* and/or upload an **MLS CSV**.")
+    paste = st.text_area("Paste", height=160, placeholder="407 E Woodall St, Smithfield, NC 27577\nhttps://l.hms.pt/...\nhttps://idx.homespotter.com/hs_triangle/tmlspar/10127718", label_visibility="collapsed")
+    file = st.file_uploader("Upload CSV", type=["csv"], accept_multiple_files=False)
+
+    pasted_rows = _list_to_rows(paste, default_state=default_state) if paste.strip() else []
+    csv_rows = parse_csv_uploaded(file, default_state=default_state) if file else []
+
+    if show_preview:
+        cnt_paste = len(pasted_rows)
+        cnt_csv = len(csv_rows)
+        bits = []
+        if cnt_paste: bits.append(f"**{cnt_paste}** pasted")
+        if cnt_csv:   bits.append(f"**{cnt_csv}** from CSV")
+        if bits:
+            st.caption(" • ".join(bits))
+
     if st.button("🚀 Resolve", type="primary", use_container_width=True):
-        rows = _list_to_rows(paste)
-        if not rows:
+        if not pasted_rows and not csv_rows:
             st.warning("Nothing to process.")
             return
 
+        # Heads-up if resolver missing (only warn once here)
+        if not HS_RESOLVER:
+            st.info("Homespotter resolver not configured (HS_ADDRESS_RESOLVER_URL). Homespotter links will be handled via basic HTML parsing only.")
+
+        all_rows = pasted_rows + csv_rows
         urls_out: List[str] = []
-        for r in rows:
+
+        prog = st.progress(0, text="Resolving…")
+        total = len(all_rows) if all_rows else 1
+
+        for i, r in enumerate(all_rows, start=1):
             if r.get("url"):
-                z, _addr = resolve_from_source_url(r["url"], state_default="NC")
+                z, _addr = resolve_from_source_url(r["url"], state_default=(default_state or "NC"))
                 urls_out.append(z or r["url"])
             else:
-                # Address line → Zillow deeplink
                 addr = (r.get("address") or "").strip()
                 if addr:
-                    # very light guess: try to split pieces; you can hook usaddress here if you want
-                    # but we’ll just produce a slug from the full line
                     z = "https://www.zillow.com/homes/" + zillow_slugify(addr) + "_rb/"
                     z = upgrade_to_homedetails_if_needed(z)
                     urls_out.append(z)
+            prog.progress(i/total, text=f"Resolved {i}/{total}")
+        prog.progress(1.0, text="Done")
 
         st.subheader("Results")
         results_list_with_copy_all(urls_out)
 
+        st.markdown("**Download**")
+        fmt = st.selectbox("Format", ["txt","csv","md","html"], index=0, key="dl_fmt")
+        data, mime, ext = build_export_payload(urls_out, fmt)
+        st.download_button(
+            "Download",
+            data=data,
+            file_name=f"resolved_links.{ext}",
+            mime=mime,
+            use_container_width=True,
+        )
+
     st.divider()
 
-    # ---------- Fix links section ----------
+    # ---------- Fix links ----------
     st.subheader("Fix properties")
-    st.caption("Paste Zillow links (/homes/*_rb/ or anything). I’ll output clean canonical **/homedetails/** URLs.")
+    st.caption("Paste any listing links. I’ll output clean canonical **/homedetails/** Zillow URLs when possible.")
     fix_text = st.text_area("Links to fix", height=120, key="fix_area")
-
     if st.button("🔧 Fix / Re-run links"):
         lines = [l.strip() for l in (fix_text or "").splitlines() if l.strip()]
         fixed: List[str] = []
@@ -409,11 +580,9 @@ def render_run_tab(state):  # keep this signature for your app loader
         for i, u in enumerate(lines, start=1):
             best = u
             try:
-                # If it's a non-Zillow source, try to resolve to Zillow first
                 if "zillow.com" not in (best or ""):
                     z, _addr = resolve_from_source_url(best, state_default="NC")
                     best = z or best
-                # Then upgrade to homedetails if possible
                 best = upgrade_to_homedetails_if_needed(best)
             except Exception:
                 pass
@@ -426,6 +595,6 @@ def render_run_tab(state):  # keep this signature for your app loader
         st.markdown(items, unsafe_allow_html=True)
         st.text_area("Copy clean list", value="\n".join(fixed) + "\n", height=140, label_visibility="collapsed")
 
-# Allow running this module directly for quick local checks
+# Allow running this module directly for local checks
 if __name__ == "__main__":
     render_run_tab({})
