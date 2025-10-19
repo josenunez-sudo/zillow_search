@@ -1,7 +1,9 @@
 # ui/run_tab.py
-# Streamlit "Run" tab — paste addresses and listing links (incl. Homespotter) → Zillow links.
-# CSV upload supported. Microservice-first resolver for Homespotter. Lightweight, mobile-friendly.
-# This version avoids bad outputs like .../homes/nc_rb/ or nc-nc_rb by requiring a real address.
+# Mobile-friendly "Run" tab — paste addresses or listing links (incl. Homespotter) → Zillow links
+# - Stronger Homespotter scraping (normal + AMP + JSON variants)
+# - Optional city-level fallback (avoids blank results)
+# - CSV upload preserved
+# - Preview thumbnails preserved
 
 import os, io, re, csv, json
 from typing import List, Dict, Any, Optional, Tuple
@@ -65,6 +67,9 @@ def _jsonloads_silent(s: str):
     except Exception:
         return None
 
+def _clean(s: Optional[str]) -> str:
+    return re.sub(r"\s+", " ", (s or "").strip())
+
 JSONLD_RE = re.compile(r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>(.*?)</script>', re.I | re.S)
 
 def _jsonld_blocks(html: str) -> List[Dict[str, Any]]:
@@ -78,9 +83,6 @@ def _jsonld_blocks(html: str) -> List[Dict[str, Any]]:
         elif isinstance(data, dict):
             out.append(data)
     return out
-
-def _clean(s: Optional[str]) -> str:
-    return re.sub(r"\s+", " ", (s or "").strip())
 
 def extract_address_from_html(html: str) -> Dict[str, str]:
     """
@@ -114,7 +116,7 @@ def extract_address_from_html(html: str) -> Dict[str, str]:
         (r'"addressLocality"\s*:\s*"([^"]+)"', "city"),
         (r'"addressRegion"\s*:\s*"([A-Za-z]{2})"', "state"),
         (r'"postalCode"\s*:\s*"(\d{5}(?:-\d{4})?)"', "zip"),
-        (r'"street"\s*:\s*"([^"]+)"', "street"),
+        (r'"address1"\s*:\s*"([^"]+)"', "street"),
         (r'"city"\s*:\s*"([^"]+)"', "city"),
         (r'"state(?:OrProvince)?"\s*:\s*"([A-Za-z]{2})"', "state"),
         (r'"postal(?:Code)?"\s*:\s*"(\d{5}(?:-\d{4})?)"', "zip"),
@@ -124,7 +126,7 @@ def extract_address_from_html(html: str) -> Dict[str, str]:
         if m and not out.get(key):
             out[key] = _clean(m.group(1))[:2] if key == "state" else _clean(m.group(1))
 
-    # 3) Meta/title with full-line address
+    # 3) Title/description fallback with full-line address
     if not out.get("street"):
         for rx in [
             r"<meta[^>]+property=['\"]og:title['\"][^>]+content=['\"]([^'\"]+)['\"]",
@@ -151,37 +153,28 @@ def extract_address_from_html(html: str) -> Dict[str, str]:
 
     return out
 
+# Freeform address splitter (lightweight)
 ADDR_TAIL_ZIP = re.compile(r"(,?\s*)\b(\d{5})(-\d{4})?\b\s*$")
 ADDR_TAIL_STATE = re.compile(r"(,?\s*)\b([A-Za-z]{2})\b\s*$")
 
 def parse_freeform_address_components(s: str, default_state: str = "NC") -> Tuple[str, str, str, str]:
-    """
-    Very light freeform parser. Input like:
-      '407 E Woodall St, Smithfield, NC 27577'
-      '4 beds 2 baths for $265000 in Erwin, NC'
-    Returns (street, city, state, zip) — any may be "".
-    """
     s0 = _clean(s)
     if not s0:
         return "", "", "", ""
 
-    # remove ZIP at end
     zipc = ""
     m = ADDR_TAIL_ZIP.search(s0)
     if m:
         zipc = m.group(2)
         s0 = s0[:m.start()].strip(", ")
 
-    # remove state at end
     state = ""
     m = ADDR_TAIL_STATE.search(s0)
     if m:
         state = m.group(2).upper()
         s0 = s0[:m.start()].strip(", ")
 
-    # split by commas for street/city guess
     parts = [p.strip() for p in s0.split(",") if p.strip()]
-
     street = ""
     city = ""
 
@@ -189,55 +182,58 @@ def parse_freeform_address_components(s: str, default_state: str = "NC") -> Tupl
         street = parts[0]
         city = parts[1]
     elif len(parts) == 1:
-        # Heuristic: if it starts with number, assume street
         if re.match(r"^\d+\b", parts[0]):
             street = parts[0]
         else:
             city = parts[0]
 
-    # final clean-ups
     if not state:
         state = default_state
-    # If the "street" looks like just the state token, drop it
     if street.upper() == state:
         street = ""
-    # If the "city" is the same as state, drop it
     if city.upper() == state:
         city = ""
 
     return street, city, state, zipc
 
-def build_zillow_deeplink(street: str, city: str, state: str, zipc: str, default_state: str = "NC") -> Optional[str]:
+def build_zillow_deeplink(street: str, city: str, state: str, zipc: str, default_state: str = "NC",
+                          allow_city_fallback: bool = True) -> Optional[str]:
     """
     Compose a Zillow /homes/..._rb/ URL from address components.
-    IMPORTANT: If we only know the state (no street/city/zip), return None to avoid '.../homes/nc_rb/'.
-    Also dedupe cases like street 'NC' + state 'NC' (which yielded nc-nc).
+    - If we have street, include it.
+    - If we don't have street but do have city+state, return city-level page *iff allow_city_fallback=True*.
+    - Avoid returning state-only pages (like /homes/nc_rb/).
     """
     street = _clean(street)
     city   = _clean(city)
     state  = (_clean(state) or default_state).upper()
     zipc   = _clean(zipc)
 
-    # Nothing but state? don't build.
+    # State-only? No good.
     if not street and not city and not zipc:
         return None
 
-    # Avoid duplicate 'NC' pieces
     tokens: List[str] = []
     if street and street.upper() != state:
         tokens.append(street)
-    loc = " ".join([p for p in [city, state] if p]).strip()
-    if loc and loc.upper() != state.upper():
-        tokens.append(loc)
-    elif city or state:
-        tokens.append(loc)  # at least state present with city possibly empty
+    if city or state:
+        loc = " ".join([p for p in [city, state] if p]).strip()
+        if loc and loc.upper() != state.upper():
+            tokens.append(loc)
+        else:
+            tokens.append(state)
 
     if zipc:
         tokens.append(zipc)
 
-    # As a final guard: if tokens collapsed to just the state, abort
+    # If we ended up with just state and city missing and allow_city_fallback is False → abort
     joined = ", ".join([t for t in tokens if t])
-    if not joined or joined.strip().upper() == state:
+    only_state = (joined.strip().upper() == state)
+    only_city_state = (not street) and (city and state)
+
+    if only_state:
+        return None
+    if only_city_state and not allow_city_fallback:
         return None
 
     s = joined.lower()
@@ -248,12 +244,10 @@ def build_zillow_deeplink(street: str, city: str, state: str, zipc: str, default
 def is_bad_nc_only(u: Optional[str]) -> bool:
     if not u:
         return True
-    return bool(re.search(r"/homes/(nc(?:-nc){0,3})_rb/?$", u, re.I))
+    # state-only patterns like /homes/nc_rb/ or nc-nc_rb
+    return bool(re.search(r"/homes/(?:[a-z]{2}(?:-[a-z]{2}){0,3})_rb/?$", u, re.I))
 
 def upgrade_to_homedetails_if_needed(url: str) -> str:
-    """
-    Try to turn an /homes/..._rb/ link into /homedetails/.../_zpid/ by scanning the RB page for a homedetails href.
-    """
     if not url or "/homedetails/" in url or "/homes/" not in url:
         return url or ""
     try:
@@ -300,10 +294,6 @@ def make_preview_url(url: str) -> str:
     return canon or upgraded or base
 
 def picture_for_result(query_address: str, zurl: str, csv_photo_url: Optional[str] = None) -> Optional[str]:
-    """
-    Try CSV photo -> Zillow og:image -> Google Street View (requires key) -> None
-    (We don't fetch Zillow hero sizes here to keep it lightweight.)
-    """
     def _ok(u: Optional[str]) -> bool:
         return isinstance(u, str) and (u.startswith("http://") or u.startswith("https://") or u.startswith("data:"))
 
@@ -328,61 +318,164 @@ def picture_for_result(query_address: str, zurl: str, csv_photo_url: Optional[st
     return None
 
 # =========================
+# Homespotter extraction (no microservice)
+# =========================
+
+NEXT_DATA_RE = re.compile(r'<script[^>]+id=["\']__NEXT_DATA__["\'][^>]*>(.*?)</script>', re.I | re.S)
+INITIAL_STATE_RE = re.compile(r'window\.__INITIAL_STATE__\s*=\s*(\{.*?\});', re.I | re.S)
+
+def _extract_hs_address_from_any_html(html: str) -> Dict[str, str]:
+    """
+    Try really hard to get address from a Homespotter/IDX HTML blob:
+    - JSON-LD
+    - __NEXT_DATA__
+    - window.__INITIAL_STATE__
+    - common keys (address1/city/state/postalCode)
+    - og:title/title/description heuristics
+    """
+    # 1) JSON-LD pass
+    addr = extract_address_from_html(html)
+    if addr.get("street") or (addr.get("city") and addr.get("state")):
+        return addr
+
+    # 2) __NEXT_DATA__
+    m = NEXT_DATA_RE.search(html)
+    if m:
+        obj = _jsonloads_silent(m.group(1))
+        if isinstance(obj, dict):
+            blob = json.dumps(obj)
+            # look for common address keys inside the JSON text
+            addr2 = extract_address_from_html(blob)
+            if addr2.get("street") or (addr2.get("city") and addr2.get("state")):
+                return addr2
+
+    # 3) __INITIAL_STATE__
+    m = INITIAL_STATE_RE.search(html)
+    if m:
+        blob = m.group(1)
+        addr3 = extract_address_from_html(blob)
+        if addr3.get("street") or (addr3.get("city") and addr3.get("state")):
+            return addr3
+
+    # 4) last ditch: og:title/title/description with city/state
+    return extract_address_from_html(html)
+
+def _fetch_hs_variants(u: str) -> List[Tuple[str, str]]:
+    """
+    Try fetching the base URL plus AMP-ish variants that often include structured data.
+    Returns list of (final_url, html).
+    """
+    tried: List[Tuple[str, str]] = []
+    # base
+    fu, html, _ = expand_url_and_fetch_html(u)
+    tried.append((fu, html))
+
+    # ?amp=1
+    try:
+        fu2, html2, _ = expand_url_and_fetch_html(u + ("&amp=1" if "?" in u else "?amp=1"))
+        if html2 and len(html2) > 100:
+            tried.append((fu2, html2))
+    except Exception:
+        pass
+
+    # /amp
+    try:
+        if not fu.endswith("/"):
+            fu_amp_url = fu + "/amp"
+        else:
+            fu_amp_url = fu + "amp"
+        fu3, html3, _ = expand_url_and_fetch_html(fu_amp_url)
+        if html3 and len(html3) > 100:
+            tried.append((fu3, html3))
+    except Exception:
+        pass
+
+    return tried
+
+def resolve_hs_without_service(u: str, default_state: str, allow_city_fallback: bool) -> Tuple[str, str, str]:
+    """
+    Fully local resolution for Homespotter (no microservice).
+    Returns (best_zillow, addr_text, status)
+    """
+    variants = _fetch_hs_variants(u)
+    street = city = state = zipc = ""
+    for _url, html in variants:
+        a = _extract_hs_address_from_any_html(html)
+        if a.get("street") or (a.get("city") and a.get("state")):
+            street = a.get("street", "") or street
+            city   = a.get("city", "") or city
+            state  = a.get("state", "") or state
+            zipc   = a.get("zip", "") or zipc
+            if street and city and state:
+                break  # good enough
+
+    addr_text = " ".join([p for p in [street, city, state or default_state, zipc] if p]).strip()
+    deeplink = build_zillow_deeplink(street, city, state or default_state, zipc,
+                                     default_state=default_state,
+                                     allow_city_fallback=allow_city_fallback) or ""
+
+    status = "ok" if deeplink else "no_address"
+    if deeplink:
+        deeplink = upgrade_to_homedetails_if_needed(deeplink)
+        canon, _ = canonicalize_zillow(deeplink)
+        deeplink = canon or deeplink
+        # Guard against state-only fallout:
+        if is_bad_nc_only(deeplink):
+            deeplink = ""
+            status = "city_only_blocked"
+
+    return deeplink, addr_text, status
+
+# =========================
 # Resolver integrations
 # =========================
 
-def resolve_hs_to_zillow(url: str, default_state: str = "NC") -> Tuple[str, str]:
+def resolve_hs_to_zillow(u: str, default_state: str, allow_city_fallback: bool) -> Tuple[str, str, str]:
     """
-    Calls the microservice to render a Homespotter page, pull the address (and components),
-    and build a Zillow link. Returns (best_zillow_url, address_text).
+    Try microservice first (if configured), else local Homespotter resolver.
+    Returns (best_zillow, addr_text, status)
     """
-    if not HS_ADDRESS_RESOLVER_URL:
-        return "", ""
+    if HS_ADDRESS_RESOLVER_URL:
+        try:
+            r = requests.get(HS_ADDRESS_RESOLVER_URL, params={"u": u}, timeout=REQUEST_TIMEOUT)
+            if r.ok:
+                data = r.json()
+                street = _clean(data.get("street") or data.get("address1") or data.get("line1"))
+                city   = _clean(data.get("city") or data.get("locality"))
+                state  = _clean(data.get("state") or data.get("region") or default_state)
+                zipc   = _clean(data.get("zip") or data.get("postal") or data.get("postal_code"))
+                addr_text = _clean(data.get("address_text") or " ".join([p for p in [street, city, state, zipc] if p]))
 
-    try:
-        r = requests.get(HS_ADDRESS_RESOLVER_URL, params={"u": url}, timeout=REQUEST_TIMEOUT)
-        if not r.ok:
-            return "", ""
-        data = r.json()
+                z_canon = _clean(data.get("zillow_canonical"))
+                z_rb    = _clean(data.get("zillow_deeplink"))
+                best = z_canon or z_rb
 
-        # Accept flexible field names from the microservice
-        street = _clean(data.get("street") or data.get("address1") or data.get("line1"))
-        city   = _clean(data.get("city") or data.get("locality"))
-        state  = _clean(data.get("state") or data.get("region") or default_state)
-        zipc   = _clean(data.get("zip") or data.get("postal") or data.get("postal_code"))
+                if not best:
+                    if not (street or city or zipc):
+                        p_street, p_city, p_state, p_zip = parse_freeform_address_components(addr_text, default_state=default_state)
+                        street, city, state, zipc = street or p_street, city or p_city, state or p_state, zipc or p_zip
+                    best = build_zillow_deeplink(street, city, state or default_state, zipc,
+                                                 default_state=default_state,
+                                                 allow_city_fallback=allow_city_fallback) or ""
 
-        addr_text = _clean(data.get("address_text") or " ".join([p for p in [street, city, state, zipc] if p]))
+                if best:
+                    best = upgrade_to_homedetails_if_needed(best)
+                    canon, _ = canonicalize_zillow(best)
+                    best = canon or best
+                    if is_bad_nc_only(best):
+                        best = ""
 
-        z_canon = _clean(data.get("zillow_canonical"))
-        z_rb    = _clean(data.get("zillow_deeplink"))
+                return best, addr_text, ("ok" if best else "addr_but_no_street")
+        except Exception:
+            pass
 
-        best = z_canon or z_rb
+    # fallback: local
+    return resolve_hs_without_service(u, default_state, allow_city_fallback)
 
-        # If service didn't give a Zillow link, build from address components/text
-        if not best:
-            if not (street or city or zipc):
-                # parse any freeform address_text
-                p_street, p_city, p_state, p_zip = parse_freeform_address_components(addr_text, default_state=default_state)
-                street, city, state, zipc = street or p_street, city or p_city, state or p_state, zipc or p_zip
-            built = build_zillow_deeplink(street, city, state or default_state, zipc, default_state=default_state)
-            best = built or ""
-
-        # Upgrade / sanitize
-        if best:
-            best = upgrade_to_homedetails_if_needed(best)
-            canon, _ = canonicalize_zillow(best)
-            best = canon or best
-            if is_bad_nc_only(best):
-                best = ""
-
-        return best, addr_text
-    except Exception:
-        return "", ""
-
-def resolve_generic_url(source_url: str, default_state: str = "NC") -> Tuple[str, str]:
+def resolve_generic_url(source_url: str, default_state: str, allow_city_fallback: bool) -> Tuple[str, str]:
     """
     Expand an arbitrary URL, try to scrape an address, build Zillow RB deeplink, then try to upgrade to homedetails.
-    Returns (zillow_url, address_text). If we only have state → returns ("","") to avoid .../homes/nc_rb/.
+    Returns (zillow_url, address_text).
     """
     final_url, html, _ = expand_url_and_fetch_html(source_url)
     addr = extract_address_from_html(html)
@@ -394,11 +487,12 @@ def resolve_generic_url(source_url: str, default_state: str = "NC") -> Tuple[str
     addr_text = " ".join([p for p in [street, city, state, zipc] if p]).strip()
 
     if not (street or city or zipc):
-        # parse any title-ish address again (best-effort)
         p_street, p_city, p_state, p_zip = parse_freeform_address_components(addr_text, default_state=default_state)
         street, city, state, zipc = street or p_street, city or p_city, state or p_state, zipc or p_zip
 
-    deeplink = build_zillow_deeplink(street, city, state, zipc, default_state=default_state) or ""
+    deeplink = build_zillow_deeplink(street, city, state, zipc,
+                                     default_state=default_state,
+                                     allow_city_fallback=allow_city_fallback) or ""
     if deeplink:
         deeplink = upgrade_to_homedetails_if_needed(deeplink)
         canon, _ = canonicalize_zillow(deeplink)
@@ -428,18 +522,13 @@ def get_first_by_keys(row: Dict[str, Any], keys) -> str:
     return ""
 
 def rows_from_paste(text: str) -> List[Dict[str, Any]]:
-    """
-    Accept CSV with headers or loose lines (one per line: URL or address).
-    """
     text = (text or "").strip()
     if not text:
         return []
-
     # Try CSV
     try:
         lines = text.splitlines()
         if len(lines) >= 2 and ("," in lines[0] or "\t" in lines[0] or ";" in lines[0]):
-            # auto-detect delimiter
             dialect = csv.Sniffer().sniff(lines[0])
             reader = csv.DictReader(io.StringIO(text), dialect=dialect)
             rows = [dict(r) for r in reader]
@@ -447,7 +536,6 @@ def rows_from_paste(text: str) -> List[Dict[str, Any]]:
                 return rows
     except Exception:
         pass
-
     # Simple lines
     out: List[Dict[str, Any]] = []
     for ln in text.splitlines():
@@ -470,10 +558,12 @@ def _results_list_with_copy_all(results: List[Dict[str, Any]]):
         href = r.get("preview_url") or r.get("zillow_url") or r.get("display_url") or ""
         if not href:
             continue
+        status = r.get("status") or ""
+        badge = f' <span style="font-size:11px;color:#64748b;">({escape(status)})</span>' if status else ""
         safe_href = escape(href)
         link_txt = href
         li_html.append(
-            f'<li style="margin:0.2rem 0;"><a href="{safe_href}" target="_blank" rel="noopener">{escape(link_txt)}</a></li>'
+            f'<li style="margin:0.2rem 0;"><a href="{safe_href}" target="_blank" rel="noopener">{escape(link_txt)}</a>{badge}</li>'
         )
     items_html = "\n".join(li_html) if li_html else "<li>(no results)</li>"
 
@@ -534,18 +624,19 @@ def _thumbnails_grid(results: List[Dict[str, Any]], columns: int = 2):
 
 def render_run_tab(state: Optional[dict] = None):
     st.header("Run")
-    if not HS_ADDRESS_RESOLVER_URL:
-        st.warning("Homespotter resolver: **HS_ADDRESS_RESOLVER_URL** not set. Homespotter links will not be auto-resolved.", icon="⚠️")
 
     st.markdown("Paste **addresses** or **listing links** (Homespotter, etc.). Upload CSVs too.")
     paste = st.text_area("Paste here (one per line)", height=160,
                          placeholder="e.g.\n407 E Woodall St, Smithfield, NC 27577\nhttps://l.hms.pt/...\nhttps://idx.homespotter.com/hs_triangle/tmlspar/10127718")
 
-    upcol1, upcol2 = st.columns([1,1])
+    upcol1, upcol2, upcol3 = st.columns([1,1,1])
     with upcol1:
         csv_file = st.file_uploader("Upload CSV (address or url column)", type=["csv"])
     with upcol2:
         try_homedetails = st.checkbox("Try to upgrade to /homedetails/", value=True)
+    with upcol3:
+        allow_city_fallback = st.checkbox("Allow city-level fallback", value=True,
+                                          help="If we can’t get a street, return /homes/<city>-<state>_rb/ instead of nothing.")
 
     # Parse rows from paste
     rows_in: List[Dict[str, Any]] = rows_from_paste(paste)
@@ -554,7 +645,6 @@ def render_run_tab(state: Optional[dict] = None):
     if csv_file is not None:
         try:
             content = csv_file.getvalue().decode("utf-8-sig")
-            # Detect delimiter safely
             try:
                 sample = content.splitlines()[0]
                 dialect = csv.Sniffer().sniff(sample)
@@ -565,7 +655,6 @@ def render_run_tab(state: Optional[dict] = None):
         except Exception as e:
             st.error(f"CSV parse error: {e}")
 
-    # Run
     if st.button("🚀 Run", type="primary", use_container_width=True):
         if not rows_in:
             st.info("Nothing to process.")
@@ -587,41 +676,47 @@ def render_run_tab(state: Optional[dict] = None):
             csv_photo = get_first_by_keys(row, PHOTO_KEYS)
             input_address = ""
             best = ""
+            status = ""
 
             if src_url:
                 if _is_homespotter_like(src_url):
-                    z, addr = resolve_hs_to_zillow(src_url, default_state=DEFAULT_STATE)
-                    # If service returned no Zillow but we did get an address, build from that address
-                    if not z and addr:
-                        stt, cty, sta, zc = parse_freeform_address_components(addr, default_state=DEFAULT_STATE)
-                        z = build_zillow_deeplink(stt, cty, sta or DEFAULT_STATE, zc, default_state=DEFAULT_STATE) or ""
-                    # If still nothing, generic scrape attempt
-                    if not z:
-                        z2, addr2 = resolve_generic_url(src_url, default_state=DEFAULT_STATE)
+                    z, addr, stt = resolve_hs_to_zillow(src_url, default_state=DEFAULT_STATE, allow_city_fallback=allow_city_fallback)
+                    if (not z) and addr:
+                        s1, c1, s2, zc = parse_freeform_address_components(addr, default_state=DEFAULT_STATE)
+                        z = build_zillow_deeplink(s1, c1, s2 or DEFAULT_STATE, zc,
+                                                  default_state=DEFAULT_STATE,
+                                                  allow_city_fallback=allow_city_fallback) or ""
+                    if (not z):
+                        z2, addr2 = resolve_generic_url(src_url, default_state=DEFAULT_STATE, allow_city_fallback=allow_city_fallback)
                         if z2:
                             z, addr = z2, (addr or addr2)
                     input_address = addr
                     best = z or ""
+                    status = stt or ("ok" if best else "no_address")
                 else:
-                    z, addr = resolve_generic_url(src_url, default_state=DEFAULT_STATE)
+                    z, addr = resolve_generic_url(src_url, default_state=DEFAULT_STATE, allow_city_fallback=allow_city_fallback)
                     input_address = addr
                     best = z or ""
+                    status = "ok" if best else "no_address"
             else:
                 # pure address row
                 raw_addr = get_first_by_keys(row, ADDR_KEYS) or (row.get("address") or "")
                 input_address = raw_addr
-                stt, cty, sta, zc = parse_freeform_address_components(raw_addr, default_state=DEFAULT_STATE)
-                z = build_zillow_deeplink(stt, cty, sta or DEFAULT_STATE, zc, default_state=DEFAULT_STATE) or ""
+                s1, c1, s2, zc = parse_freeform_address_components(raw_addr, default_state=DEFAULT_STATE)
+                z = build_zillow_deeplink(s1, c1, s2 or DEFAULT_STATE, zc,
+                                          default_state=DEFAULT_STATE,
+                                          allow_city_fallback=allow_city_fallback) or ""
                 best = z
+                status = "ok" if best else "no_address"
 
-            # Upgrade / sanitize
             if try_homedetails and best:
                 best = upgrade_to_homedetails_if_needed(best)
             if best:
                 canon, _ = canonicalize_zillow(best)
                 best = canon or best
             if is_bad_nc_only(best):
-                best = ""  # drop useless /homes/nc... links
+                # If we got only a state page and fallback is disallowed → empty
+                best = "" if not allow_city_fallback else best
 
             results.append({
                 "input_address": input_address,
@@ -629,6 +724,7 @@ def render_run_tab(state: Optional[dict] = None):
                 "preview_url": make_preview_url(best) if best else "",
                 "display_url": best,
                 "csv_photo": csv_photo,
+                "status": status if best else ("city_fallback" if (allow_city_fallback and input_address) else "no_result")
             })
 
             prog.progress(i / total, text=f"Resolved {i}/{total}")
@@ -636,8 +732,6 @@ def render_run_tab(state: Optional[dict] = None):
         prog.progress(1.0, text="Done")
 
         st.subheader("Results")
-        if not any(r.get("zillow_url") for r in results):
-            st.warning("No solid Zillow links could be built from the provided inputs.")
         _results_list_with_copy_all(results)
 
         st.subheader("Images (confirmation)")
@@ -652,12 +746,14 @@ def render_run_tab(state: Optional[dict] = None):
                 return r.get("preview_url") or r.get("zillow_url") or r.get("display_url") or ""
 
             if fmt == "csv":
-                fields = ["input_address", "url"]
+                fields = ["input_address", "status", "url"]
                 buf = io.StringIO()
                 w = csv.DictWriter(buf, fieldnames=fields)
                 w.writeheader()
                 for r in rows:
-                    w.writerow({"input_address": r.get("input_address") or "", "url": pick_url(r)})
+                    w.writerow({"input_address": r.get("input_address") or "",
+                                "status": r.get("status") or "",
+                                "url": pick_url(r)})
                 return buf.getvalue(), "text/csv", "results.csv"
 
             if fmt == "html":
@@ -704,24 +800,24 @@ def render_run_tab(state: Optional[dict] = None):
         for i, u in enumerate(lines, start=1):
             best = ""
             try:
-                if _is_homespotter_like(u) and HS_ADDRESS_RESOLVER_URL:
-                    z, addr = resolve_hs_to_zillow(u, default_state=DEFAULT_STATE)
+                if _is_homespotter_like(u):
+                    z, addr, _st = resolve_hs_to_zillow(u, default_state=DEFAULT_STATE, allow_city_fallback=True)
                     if not z and addr:
-                        stt, cty, sta, zc = parse_freeform_address_components(addr, default_state=DEFAULT_STATE)
-                        z = build_zillow_deeplink(stt, cty, sta or DEFAULT_STATE, zc, default_state=DEFAULT_STATE) or ""
+                        s1, c1, s2, zc = parse_freeform_address_components(addr, default_state=DEFAULT_STATE)
+                        z = build_zillow_deeplink(s1, c1, s2 or DEFAULT_STATE, zc,
+                                                  default_state=DEFAULT_STATE,
+                                                  allow_city_fallback=True) or ""
                     if not z:
-                        z, _ = resolve_generic_url(u, default_state=DEFAULT_STATE)
-                    best = z or ""
+                        z, _ = resolve_generic_url(u, default_state=DEFAULT_STATE, allow_city_fallback=True)
+                    best = z or u
                 else:
-                    z, _ = resolve_generic_url(u, default_state=DEFAULT_STATE)
-                    best = z or ""
+                    z, _ = resolve_generic_url(u, default_state=DEFAULT_STATE, allow_city_fallback=True)
+                    best = z or u
 
-                if best:
+                if best and "zillow.com/homes/" in best:
                     best = upgrade_to_homedetails_if_needed(best)
                     canon, _ = canonicalize_zillow(best)
                     best = canon or best
-                if is_bad_nc_only(best):
-                    best = u  # keep original if we couldn't build a valid Zillow link
             except Exception:
                 best = u
             fixed.append(best)
