@@ -1,23 +1,22 @@
 # ui/run_tab.py
-# Robust Homespotter → Address (no Bing), then compose clean Zillow /homes/*_rb/ deeplinks.
-# Adds deep-scan for inline JSON (addressLine1/city/state/zip), AMP & social-UAs, Jina fallback.
-# Keeps CSV upload, "Fix links" section, and thumbnail previews.
+# Robust Homespotter → Address (no Bing). If full address is hidden, extract lat/lon and reverse-geocode
+# to recover house number + street. Then compose clean Zillow /homes/*_rb/ deeplinks.
+# Keeps CSV upload, "Fix links" section, and Street View thumbs.
 
-import os, csv, io, re, time, json, asyncio
+import os, csv, io, re, time, json
 from typing import List, Dict, Any, Optional, Tuple
 from datetime import datetime
 from html import escape
 from urllib.parse import urlparse, urlunparse, quote_plus
 
 import requests
-import httpx
 import streamlit as st
 import streamlit.components.v1 as components
 
 # ==========================
 # ---- Page + Styles -------
 # ==========================
-st.set_page_config(page_title="Address Alchemist (no-Bing resolver)", layout="centered")
+st.set_page_config(page_title="Address Alchemist (no-Bing resolver + reverse geocode)", layout="centered")
 
 st.markdown("""
 <style>
@@ -35,8 +34,8 @@ ul.link-list { margin:0.25rem 0 0 1.1rem; padding:0; }
 # ==========================
 # ---- Config / Secrets ----
 # ==========================
-GOOGLE_MAPS_API_KEY = os.getenv("GOOGLE_MAPS_API_KEY", "")
-REQUEST_TIMEOUT = 15
+GOOGLE_MAPS_API_KEY = os.getenv("GOOGLE_MAPS_API_KEY", st.secrets.get("GOOGLE_MAPS_API_KEY", ""))
+REQUEST_TIMEOUT = 18
 
 # ==========================
 # ---- HTTP helpers --------
@@ -68,7 +67,7 @@ def _get(url: str, ua: str = DEFAULT_UA, allow_redirects: bool = True) -> Tuple[
         return url, "", 0, {}
 
 def _jina_readable(url: str) -> str:
-    """Plain-text readability proxy (free) for stubborn JS pages."""
+    """Plain-text readability proxy for stubborn JS pages (free)."""
     try:
         u = urlparse(url)
         inner = "http://" + u.netloc + u.path
@@ -108,7 +107,9 @@ def _jsonld_blocks(html: str) -> List[Dict[str, Any]]:
 
 def _extract_address_from_jsonld(html: str) -> Dict[str,str]:
     for blk in _jsonld_blocks(html):
-        addr = blk.get("address") or blk.get("itemOffered", {}).get("address") if isinstance(blk, dict) else None
+        if not isinstance(blk, dict):
+            continue
+        addr = blk.get("address") or blk.get("itemOffered", {}).get("address")
         if isinstance(addr, dict):
             street = (addr.get("streetAddress") or "").strip()
             city   = (addr.get("addressLocality") or "").strip()
@@ -148,20 +149,35 @@ def _extract_address_from_text(txt: str) -> Dict[str,str]:
         return {"street":"", "city": s2.group(1).strip(), "state": s2.group(2).upper(), "zip": s2.group(3).strip()}
     return {"street":"", "city":"", "state":"", "zip":""}
 
-# ---- NEW: deep-scan inline JSON for address keys (very permissive) ----
-STREET_KEYS = ["streetAddress","street","street1","address1","addressLine1","line1","line"]
+# ---- Deep-scan inline JSON for address & LAT/LON ----
+STREET_KEYS = ["streetAddress","street","street1","address1","addressLine1","line1","line","unparsedAddress","displayAddress","route"]
 CITY_KEYS   = ["addressLocality","locality","city","town"]
 STATE_KEYS  = ["addressRegion","region","state","stateOrProvince","province"]
 ZIP_KEYS    = ["postalCode","zip","zipCode","postcode"]
 
+LAT_KEYS = ["latitude","lat","latDeg","y"]
+LON_KEYS = ["longitude","lng","lon","long","x"]
+
 def _find_first(html: str, keys: List[str]) -> str:
-    # find first match of any "key":"value" (or 'key':'value') pairs
     for k in keys:
         pat = rf'["\']{re.escape(k)}["\']\s*:\s*["\']([^"\']+)["\']'
         m = re.search(pat, html, re.I)
         if m and m.group(1).strip():
             return m.group(1).strip()
     return ""
+
+def _find_first_number(html: str, keys: List[str]) -> Optional[float]:
+    for k in keys:
+        # allow either number or quoted number
+        pat = rf'["\']{re.escape(k)}["\']\s*:\s*(?:["\']([\-0-9\.]+)["\']|([\-0-9\.]+))'
+        m = re.search(pat, html, re.I)
+        if m:
+            val = m.group(1) or m.group(2)
+            try:
+                return float(val)
+            except Exception:
+                continue
+    return None
 
 def _extract_address_inline_json(html: str) -> Dict[str,str]:
     if not html:
@@ -170,12 +186,73 @@ def _extract_address_inline_json(html: str) -> Dict[str,str]:
     city   = _find_first(html, CITY_KEYS)
     state  = _find_first(html, STATE_KEYS)
     zipc   = _find_first(html, ZIP_KEYS)
-    # If only a single "fullAddress" style key exists, parse it
+    # Single blob (fallback)
     if not (street or (city and state)):
         m = re.search(r'["\'](?:fullAddress|address|line|location)["\']\s*:\s*["\']([^"\']+?)["\']', html, re.I)
         if m:
             return _extract_address_from_text(m.group(1))
     return {"street":street, "city":city, "state":(state[:2] if state else ""), "zip":zipc}
+
+def _extract_latlon_inline(html: str) -> Tuple[Optional[float], Optional[float]]:
+    lat = _find_first_number(html, LAT_KEYS)
+    lon = _find_first_number(html, LON_KEYS)
+    # Also try common patterns like "latLng":{"lat":..,"lng":..}
+    if lat is None or lon is None:
+        m = re.search(r'"latLng"\s*:\s*\{\s*"lat"\s*:\s*([\-0-9\.]+)\s*,\s*"lng"\s*:\s*([\-0-9\.]+)\s*\}', html, re.I)
+        if m:
+            try:
+                return float(m.group(1)), float(m.group(2))
+            except Exception:
+                pass
+    return lat, lon
+
+# ==========================
+# ---- Geocoding helpers ---
+# ==========================
+def reverse_geocode(lat: float, lon: float) -> Dict[str,str]:
+    """
+    Use Google Geocoding API to get a precise address from coordinates.
+    Returns dict with street (number+route), city, state (2-letter), zip.
+    """
+    key = GOOGLE_MAPS_API_KEY
+    if not key:
+        return {"street":"","city":"","state":"","zip":""}
+    try:
+        r = requests.get(
+            "https://maps.googleapis.com/maps/api/geocode/json",
+            params={"latlng": f"{lat},{lon}", "key": key},
+            timeout=REQUEST_TIMEOUT
+        )
+        if not r.ok:
+            return {"street":"","city":"","state":"","zip":""}
+        data = r.json() or {}
+        results = data.get("results") or []
+        if not results:
+            return {"street":"","city":"","state":"","zip":""}
+        # pick the first result (usually rooftop)
+        comp = results[0].get("address_components") or []
+        def _get(types):
+            for c in comp:
+                t = c.get("types") or []
+                if any(tt in t for tt in types):
+                    return c.get("long_name") or c.get("short_name") or ""
+            return ""
+        num   = _get(["street_number"])
+        route = _get(["route"])
+        city  = _get(["locality","postal_town","sublocality","administrative_area_level_3"])
+        state = _get(["administrative_area_level_1"])
+        zipc  = _get(["postal_code"])
+        street = (" ".join([p for p in [num, route] if p])).strip()
+        state2 = _get(["administrative_area_level_1"]) or ""
+        if len(state2) > 2:
+            # if long form, also try short_name
+            for c in comp:
+                if "administrative_area_level_1" in (c.get("types") or []):
+                    state2 = c.get("short_name") or state2
+                    break
+        return {"street":street, "city":city, "state":state2[:2], "zip":zipc}
+    except Exception:
+        return {"street":"","city":"","state":"","zip":""}
 
 # ==========================
 # ---- Zillow builders -----
@@ -205,19 +282,13 @@ def zillow_rb_from_address(street: str, city: str, state: str, zipc: str) -> Opt
     loc = (city + " " + state).strip()
     if loc: parts.append(loc)
     if zipc:
-        parts[-1] = (parts[-1] + " " + zipc) if parts else zipc
+        if parts:
+            parts[-1] = parts[-1] + " " + zipc
+        else:
+            parts.append(zipc)
 
     slug = _slugify(", ".join(parts))
     return f"https://www.zillow.com/homes/{slug}_rb/"
-
-# ==========================
-# ---- Thumbnails ----------
-# ==========================
-def _streetview_or_none(query_addr: str) -> Optional[str]:
-    if not GOOGLE_MAPS_API_KEY or not query_addr:
-        return None
-    loc = quote_plus(query_addr)
-    return f"https://maps.googleapis.com/maps/api/streetview?size=600x400&location={loc}&key={GOOGLE_MAPS_API_KEY}"
 
 # ==========================
 # ---- Core Resolve --------
@@ -251,12 +322,11 @@ def _try_variants(url: str) -> List[Tuple[str,str,int]]:
 def best_effort_address_from_hs(url: str) -> Dict[str,str]:
     """
     Try very hard (no Bing) to get (street, city, state, zip) from Homespotter (or l.hms.pt) link.
-    Order: JSON-LD → meta → inline JSON deep-scan → readability text.
+    Order: JSON-LD → meta → inline JSON deep-scan → lat/lon reverse-geocode → readability text.
     """
-    # 1) fan out attempts
     tries = _try_variants(url)
 
-    # 2) structured first (json-ld/meta)
+    # 1) structured first (json-ld/meta)
     for _, html, code in tries:
         if code == 200 and html:
             a = _extract_address_from_jsonld(html)
@@ -266,15 +336,36 @@ def best_effort_address_from_hs(url: str) -> Dict[str,str]:
             if b.get("street") or (b.get("city") and b.get("state")):
                 return b
 
-    # 3) deep-scan inline JSON keys (very permissive)
+    # 2) deep-scan inline JSON keys (very permissive)
     for _, html, code in tries:
         if code == 200 and html:
             c = _extract_address_inline_json(html)
             if c.get("street") or (c.get("city") and c.get("state")):
+                # if street missing number, see if lat/lon exists to refine
+                lat, lon = _extract_latlon_inline(html)
+                if (not c.get("street") or not re.match(r'^\d+\s', c["street"])) and lat is not None and lon is not None:
+                    geo = reverse_geocode(lat, lon)
+                    # prefer reverse-geocoded street if it has a number
+                    if geo.get("street") and re.match(r'^\d+\s', geo["street"]):
+                        c = {
+                            "street": geo["street"],
+                            "city":   c.get("city") or geo.get("city",""),
+                            "state":  c.get("state") or geo.get("state",""),
+                            "zip":    c.get("zip")   or geo.get("zip",""),
+                        }
                 return c
 
+    # 3) lat/lon reverse-geocode even if no address keys matched
+    #    (Some pages show only a map JSON.)
+    for _, html, code in tries:
+        if code == 200 and html:
+            lat, lon = _extract_latlon_inline(html)
+            if lat is not None and lon is not None:
+                g = reverse_geocode(lat, lon)
+                if g.get("city") and g.get("state"):
+                    return g
+
     # 4) readability plaintext (last resort)
-    # only once on the final of the first try to limit calls
     f0, _, _, _ = _get(url, ua=DEFAULT_UA, allow_redirects=True)
     txt = _jina_readable(f0 or url)
     if txt:
@@ -287,7 +378,7 @@ def best_effort_address_from_hs(url: str) -> Dict[str,str]:
 def resolve_any_link_to_zillow_rb(source_url: str) -> Tuple[str, str]:
     """
     Return (zillow_deeplink, human_readable_address) or (original_url, "") if we couldn't form a deeplink.
-    No Bing/Azure dependency.
+    No Bing/Azure dependency. Uses reverse geocoding if needed to get full street number.
     """
     if not source_url:
         return "", ""
@@ -297,31 +388,47 @@ def resolve_any_link_to_zillow_rb(source_url: str) -> Tuple[str, str]:
     target = final or source_url
 
     # If already Zillow homedetails/homes, keep it (strip query/fragment)
-    if "zillow.com" in (target or ""):
-        if "/homedetails/" in target or "/homes/" in target:
-            return re.sub(r"[?#].*$", "", target), ""
+    if "zillow.com" in (target or "") and ("/homedetails/" in target or "/homes/" in target):
+        return re.sub(r"[?#].*$", "", target), ""
 
     # Homespotter-ish?
     host = (urlparse(target).hostname or "").lower()
     if any(k in host for k in ["homespotter", "hms.pt", "idx."]):
         addr = best_effort_address_from_hs(target)
     else:
-        addr = _extract_address_from_jsonld(html or "") if (code == 200 and html) else {"street":"","city":"","state":"","zip":""}
-        if not (addr.get("street") or (addr.get("city") and addr.get("state"))):
-            if code == 200 and html:
+        # generic: try json-ld/meta/inline + reverse geocode if lat/lon
+        addr = {"street":"","city":"","state":"","zip":""}
+        if code == 200 and html:
+            addr = _extract_address_from_jsonld(html)
+            if not (addr.get("street") or (addr.get("city") and addr.get("state"))):
                 tmp = _extract_address_from_meta(html)
                 if tmp.get("street") or (tmp.get("city") and tmp.get("state")):
                     addr = tmp
-        if not (addr.get("street") or (addr.get("city") and addr.get("state"))):
-            addr = _extract_address_inline_json(html or "")
+        if code == 200 and html and not (addr.get("street") or (addr.get("city") and addr.get("state"))):
+            addr = _extract_address_inline_json(html)
             if not (addr.get("street") or (addr.get("city") and addr.get("state"))):
-                txt = _jina_readable(target)
-                addr = _extract_address_from_text(txt)
+                lat, lon = _extract_latlon_inline(html)
+                if lat is not None and lon is not None:
+                    addr = reverse_geocode(lat, lon)
+        if not (addr.get("street") or (addr.get("city") and addr.get("state"))):
+            txt = _jina_readable(target)
+            addr = _extract_address_from_text(txt)
 
     street = addr.get("street","")
     city   = addr.get("city","")
     state  = addr.get("state","")
     zipc   = addr.get("zip","")
+
+    # If street lacks a number but we have lat/lon on the original page, try once more to refine using reverse geocode.
+    if (not street or not re.match(r'^\d+\s', street)) and code == 200 and html:
+        lat, lon = _extract_latlon_inline(html)
+        if lat is not None and lon is not None:
+            geo = reverse_geocode(lat, lon)
+            if geo.get("street") and re.match(r'^\d+\s', geo["street"]):
+                street = geo["street"]
+                city   = city or geo.get("city","")
+                state  = state or geo.get("state","")
+                zipc   = zipc or geo.get("zip","")
 
     deeplink = zillow_rb_from_address(street, city, state, zipc)
     if not deeplink:
@@ -401,7 +508,7 @@ def _results_list(results: List[Dict[str, Any]]):
         scrolling=False
     )
 
-def _streetview_or_none(query_addr: str) -> Optional[str]:
+def _streetview_thumb(query_addr: str) -> Optional[str]:
     if not GOOGLE_MAPS_API_KEY or not query_addr:
         return None
     loc = quote_plus(query_addr)
@@ -411,7 +518,7 @@ def _streetview_or_none(query_addr: str) -> Optional[str]:
 # ---- Main UI -------------
 # ==========================
 def render_run_tab(state: dict):
-    st.header("Address Alchemist — robust Homespotter resolver (no Bing)")
+    st.header("Address Alchemist — Homespotter resolver (reverse geocode enabled)")
 
     # Paste OR CSV
     st.subheader("Input")
@@ -422,7 +529,7 @@ def render_run_tab(state: dict):
     with colB:
         file = st.file_uploader("Upload CSV", type=["csv"], label_visibility="visible")
 
-    use_streetview = st.checkbox("Try Street View thumbs (needs GOOGLE_MAPS_API_KEY)", value=False)
+    use_streetview = st.checkbox("Show Street View thumbnails (needs GOOGLE_MAPS_API_KEY)", value=False)
 
     # Parse pasted
     rows_in: List[Dict[str, Any]] = []
@@ -463,7 +570,7 @@ def render_run_tab(state: dict):
                     "display_address": addr or "",
                 }
                 if use_streetview and addr:
-                    thumb = _streetview_or_none(addr)
+                    thumb = _streetview_thumb(addr)
                     if thumb:
                         out["image_url"] = thumb
                 results.append(out)
@@ -482,7 +589,7 @@ def render_run_tab(state: dict):
                 results.append({"original": u, "zillow_url": z or u, "display_address": u})
 
             prog.progress(i/len(rows_in), text=f"Resolved {i}/{len(rows_in)}")
-            time.sleep(0.03)
+            time.sleep(0.02)
 
         prog.progress(1.0, text="Done")
 
@@ -527,7 +634,7 @@ def render_run_tab(state: dict):
     # ---- Fix links ----------
     # ==========================
     st.subheader("Fix / Re-run links")
-    st.caption("Paste any Homespotter or other listing links; I’ll try to pull the address and build a Zillow **/_rb/** deeplink.")
+    st.caption("Paste any Homespotter or other listing links; I’ll try to pull the address and build a Zillow **/_rb/** deeplink. Reverse-geocodes when needed.")
     fix_text = st.text_area("Links to fix", height=140, key="fix_area")
     if st.button("🔧 Fix / Re-run"):
         lines = [l.strip() for l in (fix_text or "").splitlines() if l.strip()]
