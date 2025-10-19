@@ -1,6 +1,7 @@
 # ui/run_tab.py
-# Homespotter → Address (no Bing), then compose clean Zillow /homes/*_rb/ deeplinks.
-# Also supports CSV upload, "Fix links" section, and thumbnail previews.
+# Robust Homespotter → Address (no Bing), then compose clean Zillow /homes/*_rb/ deeplinks.
+# Adds deep-scan for inline JSON (addressLine1/city/state/zip), AMP & social-UAs, Jina fallback.
+# Keeps CSV upload, "Fix links" section, and thumbnail previews.
 
 import os, csv, io, re, time, json, asyncio
 from typing import List, Dict, Any, Optional, Tuple
@@ -27,6 +28,7 @@ ul.link-list { margin:0.25rem 0 0 1.1rem; padding:0; }
 .badge.new { background:#dcfce7; color:#065f46; border-color:#86efac; }
 .badge.dup { background:#fee2e2; color:#7f1d1d; border-color:#fecaca; }
 .run-zone .stButton>button { background: linear-gradient(180deg, #2563eb 0%, #1d4ed8 100%) !important; color:#fff !important; font-weight:800 !important; border:0 !important; border-radius:12px !important; box-shadow:0 10px 22px rgba(29,78,216,.35),0 2px 6px rgba(0,0,0,.18)!important; }
+.img-label { font-size:13px; margin-top:6px; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -34,16 +36,13 @@ ul.link-list { margin:0.25rem 0 0 1.1rem; padding:0; }
 # ---- Config / Secrets ----
 # ==========================
 GOOGLE_MAPS_API_KEY = os.getenv("GOOGLE_MAPS_API_KEY", "")
-BITLY_TOKEN         = os.getenv("BITLY_TOKEN", "")
+REQUEST_TIMEOUT = 15
 
 # ==========================
 # ---- HTTP helpers --------
 # ==========================
-REQUEST_TIMEOUT = 15
-
 DEFAULT_UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36"
 SOCIAL_UAS = [
-    # These often trigger server-side share markup with address/title/JSON-LD
     "facebookexternalhit/1.1 (+http://www.facebook.com/externalhit_uatext.php)",
     "Twitterbot/1.0",
     "Slackbot-LinkExpanding 1.0 (+https://api.slack.com/robots)",
@@ -69,13 +68,9 @@ def _get(url: str, ua: str = DEFAULT_UA, allow_redirects: bool = True) -> Tuple[
         return url, "", 0, {}
 
 def _jina_readable(url: str) -> str:
-    """
-    Free plain-text readability proxy. Great for stubborn JS sites.
-    Example: https://r.jina.ai/http://idx.homespotter.com/hs_triangle/tmlspar/10127718
-    """
+    """Plain-text readability proxy (free) for stubborn JS pages."""
     try:
         u = urlparse(url)
-        # Build: https://r.jina.ai/http://HOST/PATH?QUERY
         inner = "http://" + u.netloc + u.path
         if u.query:
             inner += "?" + u.query
@@ -124,7 +119,6 @@ def _extract_address_from_jsonld(html: str) -> Dict[str,str]:
     return {"street":"", "city":"", "state":"", "zip":""}
 
 def _extract_address_from_meta(html: str) -> Dict[str,str]:
-    # Try og:title, twitter:title, description
     for pat in [
         r"<meta[^>]+property=['\"]og:title['\"][^>]+content=['\"]([^'\"]+)['\"]",
         r"<meta[^>]+name=['\"]twitter:title['\"][^>]+content=['\"]([^'\"]+)['\"]",
@@ -135,18 +129,15 @@ def _extract_address_from_meta(html: str) -> Dict[str,str]:
         if not m:
             continue
         text = re.sub(r'\s+', ' ', m.group(1)).strip()
-        # direct "123 Main St, City, NC 27577"?
         s1 = RE_STREET_CITY_ST_ZIP.search(text)
         if s1:
             return {"street": s1.group(1), "city": s1.group(2), "state": s1.group(3).upper(), "zip": s1.group(4)}
-        # maybe "City, NC 27577" only
         s2 = RE_CITY_ST_ZIP.search(text)
         if s2:
             return {"street": "", "city": s2.group(1), "state": s2.group(2).upper(), "zip": s2.group(3)}
     return {"street":"", "city":"", "state":"", "zip":""}
 
 def _extract_address_from_text(txt: str) -> Dict[str,str]:
-    # Scan the plain text body (Jina readability) for the first addressy thing
     if not txt:
         return {"street":"", "city":"", "state":"", "zip":""}
     s1 = RE_STREET_CITY_ST_ZIP.search(txt)
@@ -157,72 +148,34 @@ def _extract_address_from_text(txt: str) -> Dict[str,str]:
         return {"street":"", "city": s2.group(1).strip(), "state": s2.group(2).upper(), "zip": s2.group(3).strip()}
     return {"street":"", "city":"", "state":"", "zip":""}
 
-def best_effort_address_from_hs(url: str) -> Dict[str,str]:
-    """
-    Try very hard, without Bing, to get (street, city, state, zip) from a Homespotter (or l.hms.pt) link.
-    Order:
-      1) default UA
-      2) social UAs (FB/Twitter/Slack/Googlebot)
-      3) AMP variants (?amp=1, /amp)
-      4) Jina readability proxy (plaintext)
-    """
-    # 1) default UA
-    final, html, code, _ = _get(url, ua=DEFAULT_UA, allow_redirects=True)
-    if code == 200 and html:
-        a = _extract_address_from_jsonld(html)
-        if a.get("street") or (a.get("city") and a.get("state")):
-            return a
-        b = _extract_address_from_meta(html)
-        if b.get("street") or (b.get("city") and b.get("state")):
-            return b
+# ---- NEW: deep-scan inline JSON for address keys (very permissive) ----
+STREET_KEYS = ["streetAddress","street","street1","address1","addressLine1","line1","line"]
+CITY_KEYS   = ["addressLocality","locality","city","town"]
+STATE_KEYS  = ["addressRegion","region","state","stateOrProvince","province"]
+ZIP_KEYS    = ["postalCode","zip","zipCode","postcode"]
 
-    # 2) social UAs
-    for ua in SOCIAL_UAS:
-        _, html2, code2, _ = _get(final or url, ua=ua, allow_redirects=True)
-        if code2 == 200 and html2:
-            a2 = _extract_address_from_jsonld(html2)
-            if a2.get("street") or (a2.get("city") and a2.get("state")):
-                return a2
-            b2 = _extract_address_from_meta(html2)
-            if b2.get("street") or (b2.get("city") and b2.get("state")):
-                return b2
+def _find_first(html: str, keys: List[str]) -> str:
+    # find first match of any "key":"value" (or 'key':'value') pairs
+    for k in keys:
+        pat = rf'["\']{re.escape(k)}["\']\s*:\s*["\']([^"\']+)["\']'
+        m = re.search(pat, html, re.I)
+        if m and m.group(1).strip():
+            return m.group(1).strip()
+    return ""
 
-    # 3) AMP variants
-    # try ?amp=1
-    amp_q = (final or url)
-    amp_join = amp_q + ("&amp=1" if ("?" in amp_q) else "?amp=1")
-    _, html3, code3, _ = _get(amp_join, ua=DEFAULT_UA, allow_redirects=True)
-    if code3 == 200 and html3:
-        a3 = _extract_address_from_jsonld(html3)
-        if a3.get("street") or (a3.get("city") and a3.get("state")):
-            return a3
-        b3 = _extract_address_from_meta(html3)
-        if b3.get("street") or (b3.get("city") and b3.get("state")):
-            return b3
-    # try /amp
-    try:
-        u = urlparse(final or url)
-        amp_path = (u.path.rstrip("/") + "/amp")
-        amp_url = urlunparse((u.scheme, u.netloc, amp_path, "", "", ""))
-        _, html4, code4, _ = _get(amp_url, ua=DEFAULT_UA, allow_redirects=True)
-        if code4 == 200 and html4:
-            a4 = _extract_address_from_jsonld(html4)
-            if a4.get("street") or (a4.get("city") and a4.get("state")):
-                return a4
-            b4 = _extract_address_from_meta(html4)
-            if b4.get("street") or (b4.get("city") and b4.get("state")):
-                return b4
-    except Exception:
-        pass
-
-    # 4) Jina readability proxy
-    text = _jina_readable(final or url)
-    if text:
-        a5 = _extract_address_from_text(text)
-        if a5.get("street") or (a5.get("city") and a5.get("state")):
-            return a5
-
-    return {"street":"", "city":"", "state":"", "zip":""}
+def _extract_address_inline_json(html: str) -> Dict[str,str]:
+    if not html:
+        return {"street":"","city":"","state":"","zip":""}
+    street = _find_first(html, STREET_KEYS)
+    city   = _find_first(html, CITY_KEYS)
+    state  = _find_first(html, STATE_KEYS)
+    zipc   = _find_first(html, ZIP_KEYS)
+    # If only a single "fullAddress" style key exists, parse it
+    if not (street or (city and state)):
+        m = re.search(r'["\'](?:fullAddress|address|line|location)["\']\s*:\s*["\']([^"\']+?)["\']', html, re.I)
+        if m:
+            return _extract_address_from_text(m.group(1))
+    return {"street":street, "city":city, "state":(state[:2] if state else ""), "zip":zipc}
 
 # ==========================
 # ---- Zillow builders -----
@@ -234,25 +187,27 @@ def _slugify(s: str) -> str:
     return re.sub(r"\s+", "-", s.strip())
 
 def zillow_rb_from_address(street: str, city: str, state: str, zipc: str) -> Optional[str]:
-    # Need at least a street + city + state to make a meaningful deeplink
-    city = (city or "").strip()
+    city  = (city or "").strip()
     state = (state or "").strip()
     street = (street or "").strip()
-    zipc = (zipc or "").strip()
+    zipc  = (zipc or "").strip()
 
+    # Require city+state to avoid garbage like /homes/nc_rb/
     if not (city and state):
-        # last resort: fail safe
         return None
 
-    # Build slug like: "123 Main St, City NC 27577" → /homes/123-main-st-city-nc-27577_rb/
-    bits = [street] if street else []
-    loc = city + " " + state
-    if loc.strip():
-        bits.append(loc.strip())
+    # Prevent “nc-nc”
+    if street.lower() == state.lower():
+        street = ""
+
+    parts = []
+    if street: parts.append(street)
+    loc = (city + " " + state).strip()
+    if loc: parts.append(loc)
     if zipc:
-        bits[-1] = (bits[-1] + " " + zipc) if bits else zipc
-    base = ", ".join(bits)
-    slug = _slugify(base)
+        parts[-1] = (parts[-1] + " " + zipc) if parts else zipc
+
+    slug = _slugify(", ".join(parts))
     return f"https://www.zillow.com/homes/{slug}_rb/"
 
 # ==========================
@@ -267,6 +222,68 @@ def _streetview_or_none(query_addr: str) -> Optional[str]:
 # ==========================
 # ---- Core Resolve --------
 # ==========================
+def _try_variants(url: str) -> List[Tuple[str,str,int]]:
+    """Try multiple UA + URL variants and return list of (final_url, html, status)."""
+    variants = [url]
+    # AMP-ish toggles
+    variants.append(url + ("&amp=1" if "?" in url else "?amp=1"))
+    try:
+        u = urlparse(url); variants.append(urlunparse((u.scheme,u.netloc,u.path.rstrip('/')+'/amp',"","","")))
+    except Exception:
+        pass
+
+    out = []
+    # default first
+    f1, h1, c1, _ = _get(url, ua=DEFAULT_UA, allow_redirects=True)
+    out.append((f1, h1, c1))
+    # social UAs on base
+    for ua in SOCIAL_UAS:
+        f2, h2, c2, _ = _get(url, ua=ua, allow_redirects=True); out.append((f2, h2, c2))
+    # default UA on variants
+    for v in variants[1:]:
+        f3, h3, c3, _ = _get(v, ua=DEFAULT_UA, allow_redirects=True); out.append((f3, h3, c3))
+    # social UAs on variants
+    for v in variants[1:]:
+        for ua in SOCIAL_UAS:
+            f4, h4, c4, _ = _get(v, ua=ua, allow_redirects=True); out.append((f4, h4, c4))
+    return out
+
+def best_effort_address_from_hs(url: str) -> Dict[str,str]:
+    """
+    Try very hard (no Bing) to get (street, city, state, zip) from Homespotter (or l.hms.pt) link.
+    Order: JSON-LD → meta → inline JSON deep-scan → readability text.
+    """
+    # 1) fan out attempts
+    tries = _try_variants(url)
+
+    # 2) structured first (json-ld/meta)
+    for _, html, code in tries:
+        if code == 200 and html:
+            a = _extract_address_from_jsonld(html)
+            if a.get("street") or (a.get("city") and a.get("state")):
+                return a
+            b = _extract_address_from_meta(html)
+            if b.get("street") or (b.get("city") and b.get("state")):
+                return b
+
+    # 3) deep-scan inline JSON keys (very permissive)
+    for _, html, code in tries:
+        if code == 200 and html:
+            c = _extract_address_inline_json(html)
+            if c.get("street") or (c.get("city") and c.get("state")):
+                return c
+
+    # 4) readability plaintext (last resort)
+    # only once on the final of the first try to limit calls
+    f0, _, _, _ = _get(url, ua=DEFAULT_UA, allow_redirects=True)
+    txt = _jina_readable(f0 or url)
+    if txt:
+        d = _extract_address_from_text(txt)
+        if d.get("street") or (d.get("city") and d.get("state")):
+            return d
+
+    return {"street":"", "city":"", "state":"", "zip":""}
+
 def resolve_any_link_to_zillow_rb(source_url: str) -> Tuple[str, str]:
     """
     Return (zillow_deeplink, human_readable_address) or (original_url, "") if we couldn't form a deeplink.
@@ -279,17 +296,16 @@ def resolve_any_link_to_zillow_rb(source_url: str) -> Tuple[str, str]:
     final, html, code, _ = _get(source_url, ua=DEFAULT_UA, allow_redirects=True)
     target = final or source_url
 
-    # If this is already a Zillow homedetails or homes deeplink, pass through
+    # If already Zillow homedetails/homes, keep it (strip query/fragment)
     if "zillow.com" in (target or ""):
         if "/homedetails/" in target or "/homes/" in target:
             return re.sub(r"[?#].*$", "", target), ""
 
-    # If Homespotter-ish, extract address via robust path
+    # Homespotter-ish?
     host = (urlparse(target).hostname or "").lower()
     if any(k in host for k in ["homespotter", "hms.pt", "idx."]):
         addr = best_effort_address_from_hs(target)
     else:
-        # generic page – try JSON-LD/meta first, then Jina
         addr = _extract_address_from_jsonld(html or "") if (code == 200 and html) else {"street":"","city":"","state":"","zip":""}
         if not (addr.get("street") or (addr.get("city") and addr.get("state"))):
             if code == 200 and html:
@@ -297,8 +313,10 @@ def resolve_any_link_to_zillow_rb(source_url: str) -> Tuple[str, str]:
                 if tmp.get("street") or (tmp.get("city") and tmp.get("state")):
                     addr = tmp
         if not (addr.get("street") or (addr.get("city") and addr.get("state"))):
-            text = _jina_readable(target)
-            addr = _extract_address_from_text(text)
+            addr = _extract_address_inline_json(html or "")
+            if not (addr.get("street") or (addr.get("city") and addr.get("state"))):
+                txt = _jina_readable(target)
+                addr = _extract_address_from_text(txt)
 
     street = addr.get("street","")
     city   = addr.get("city","")
@@ -306,8 +324,8 @@ def resolve_any_link_to_zillow_rb(source_url: str) -> Tuple[str, str]:
     zipc   = addr.get("zip","")
 
     deeplink = zillow_rb_from_address(street, city, state, zipc)
-    # If absolutely nothing – return original URL, address blank
     if not deeplink:
+        # Could not form a meaningful rb; return original link and blank address
         return target, ""
 
     display_addr = ", ".join([p for p in [street, f"{city} {state}".strip(), zipc] if p])
@@ -320,7 +338,7 @@ def _rows_from_paste(text: str) -> List[Dict[str, Any]]:
     text = (text or "").strip()
     if not text:
         return []
-    # Try CSV (header present)
+    # Try CSV if header present
     try:
         sample = text.splitlines()
         if len(sample) >= 2 and ("," in sample[0] or "\t" in sample[0]):
@@ -331,7 +349,7 @@ def _rows_from_paste(text: str) -> List[Dict[str, Any]]:
                 return rows
     except Exception:
         pass
-    # Fallback: 1 item per line
+    # Fallback: 1 per line
     rows: List[Dict[str, Any]] = []
     for line in text.splitlines():
         s = line.strip()
@@ -342,10 +360,6 @@ def _rows_from_paste(text: str) -> List[Dict[str, Any]]:
         else:
             rows.append({"address": s})
     return rows
-
-def _thumbnail_for(deeplink: str, fallback_addr: str) -> Optional[str]:
-    # We don't scrape Zillow images here; just Street View if you have a key
-    return _streetview_or_none(fallback_addr)
 
 def _results_list(results: List[Dict[str, Any]]):
     li_html = []
@@ -387,11 +401,17 @@ def _results_list(results: List[Dict[str, Any]]):
         scrolling=False
     )
 
+def _streetview_or_none(query_addr: str) -> Optional[str]:
+    if not GOOGLE_MAPS_API_KEY or not query_addr:
+        return None
+    loc = quote_plus(query_addr)
+    return f"https://maps.googleapis.com/maps/api/streetview?size=600x400&location={loc}&key={GOOGLE_MAPS_API_KEY}"
+
 # ==========================
 # ---- Main UI -------------
 # ==========================
 def render_run_tab(state: dict):
-    st.header("Address Alchemist — no-Bing Homespotter resolver")
+    st.header("Address Alchemist — robust Homespotter resolver (no Bing)")
 
     # Paste OR CSV
     st.subheader("Input")
@@ -406,8 +426,7 @@ def render_run_tab(state: dict):
 
     # Parse pasted
     rows_in: List[Dict[str, Any]] = []
-    for r in _rows_from_paste(paste):
-        rows_in.append(r)
+    rows_in.extend(_rows_from_paste(paste))
 
     # CSV
     if file is not None:
@@ -444,19 +463,18 @@ def render_run_tab(state: dict):
                     "display_address": addr or "",
                 }
                 if use_streetview and addr:
-                    thumb = _thumbnail_for(z or "", addr)
+                    thumb = _streetview_or_none(addr)
                     if thumb:
                         out["image_url"] = thumb
                 results.append(out)
             else:
-                # Treat as address string → direct rb deeplink
+                # Treat as address string → direct rb deeplink (best effort)
                 parts = re.split(r"\s*,\s*", u)
                 city = state = zipc = ""
                 street = u
                 if len(parts) >= 2:
                     street = parts[0]
                     tail = ", ".join(parts[1:])
-                    # crude parse city, state, zip from tail
                     m = RE_CITY_ST_ZIP.search(tail)
                     if m:
                         city, state, zipc = m.group(1), m.group(2), m.group(3)
@@ -464,7 +482,7 @@ def render_run_tab(state: dict):
                 results.append({"original": u, "zillow_url": z or u, "display_address": u})
 
             prog.progress(i/len(rows_in), text=f"Resolved {i}/{len(rows_in)}")
-            time.sleep(0.05)
+            time.sleep(0.03)
 
         prog.progress(1.0, text="Done")
 
@@ -478,8 +496,8 @@ def render_run_tab(state: dict):
             cols = st.columns(3)
             for i, (link, img, addr) in enumerate(thumbs):
                 with cols[i % 3]:
-                    st.image(img, use_container_width=True, caption=addr or "")
-                    st.markdown(f'<a href="{escape(link)}" target="_blank" rel="noopener">{escape(link)}</a>', unsafe_allow_html=True)
+                    st.image(img, use_container_width=True)
+                    st.markdown(f'<div class="img-label">{escape(addr or "")}</div>', unsafe_allow_html=True)
 
         # Download
         st.markdown("#### Export")
@@ -520,7 +538,8 @@ def render_run_tab(state: dict):
             z, addr = resolve_any_link_to_zillow_rb(u)
             best = z or u
             fixed.append(best)
-            shown.append(f"- [{escape(addr or best)}]({escape(best)})")
+            label = addr or best
+            shown.append(f"- [{escape(label)}]({escape(best)})")
             prog.progress(i/len(lines), text=f"Fixed {i}/{len(lines)}")
         prog.progress(1.0, text="Done")
 
