@@ -549,13 +549,41 @@ def render_run_tab(state: dict = None):
     rows_in: List[Dict[str, Any]] = []
     rows_in.extend(_rows_from_paste(paste))
 
+    # ---- CSV upload: case-insensitive headers, multiple URL/address column names ----
     if up is not None:
         try:
-            content = up.getvalue().decode("utf-8-sig")
+            content = up.getvalue().decode("utf-8-sig", errors="ignore")
             reader = csv.DictReader(io.StringIO(content))
+
             for row in reader:
-                u = (row.get("url") or row.get("link") or row.get("source_url") or "").strip()
-                if u: rows_in.append({"url": u})
+                if not row:
+                    continue
+
+                # Normalize header names to lowercase once
+                row_lc = {(k or "").strip().lower(): (v or "").strip() for k, v in row.items()}
+
+                # Try a bunch of common URL column names
+                u = (
+                    row_lc.get("url")
+                    or row_lc.get("link")
+                    or row_lc.get("source_url")
+                    or row_lc.get("listing_url")
+                    or row_lc.get("property_url")
+                    or row_lc.get("hs_link")
+                )
+
+                # Optionally support an address column from CSV
+                addr = (
+                    row_lc.get("address")
+                    or row_lc.get("full_address")
+                    or row_lc.get("property_address")
+                )
+
+                if u:
+                    rows_in.append({"url": u})
+                elif addr:
+                    rows_in.append({"address": addr})
+
         except Exception as e:
             st.warning(f"Could not read CSV: {e}")
 
@@ -569,26 +597,52 @@ def render_run_tab(state: dict = None):
         prog = st.progress(0.0, text="Resolving…")
 
         for i, row in enumerate(rows_in, start=1):
-            u = (row.get("url") or row.get("source_url") or row.get("href") or row.get("address") or "").strip()
-            if not u: continue
+            raw = (row.get("url") or row.get("source_url") or row.get("href") or row.get("address") or "").strip()
+            if not raw:
+                continue
 
-            if u.startswith("http"):
+            # Guess if this is a URL even if scheme is missing
+            looks_like_url = (
+                raw.startswith(("http://", "https://"))
+                or re.match(r'^[\w.-]+\.[a-z]{2,10}(/|$)', raw, re.I)  # e.g. homespotter.com/..., hms.pt/...
+            )
+
+            if looks_like_url:
+                # Ensure we have a scheme
+                if not raw.startswith(("http://", "https://")):
+                    u = "https://" + raw
+                else:
+                    u = raw
+
                 z, addr, note = resolve_any_link_to_zillow_rb(u)
-                out = {"original": u, "zillow_url": z or u, "display_address": addr or "", "note": note}
+                out: Dict[str, Any] = {
+                    "original": raw,
+                    "zillow_url": z or u,
+                    "display_address": addr or "",
+                    "note": note,
+                }
                 if show_sv and addr:
                     thumb = _streetview_thumb(addr)
-                    if thumb: out["image_url"] = thumb
+                    if thumb:
+                        out["image_url"] = thumb
                 results.append(out)
+
             else:
                 # Treat as address → rb best-effort
-                parts = re.split(r"\s*,\s*", u)
-                street, city, state, zipc = u, "", "", ""
+                parts = re.split(r"\s*,\s*", raw)
+                street, city, state, zipc = raw, "", "", ""
                 if len(parts) >= 2:
                     street = parts[0]
                     m = RE_CITY_ST_ZIP.search(", ".join(parts[1:]))
-                    if m: city, state, zipc = m.group(1), m.group(2), m.group(3)
+                    if m:
+                        city, state, zipc = m.group(1), m.group(2), m.group(3)
                 z = zillow_rb_from_address(street, city, state, zipc) or ""
-                results.append({"original": u, "zillow_url": z or u, "display_address": u, "note":"manual"})
+                results.append({
+                    "original": raw,
+                    "zillow_url": z or raw,
+                    "display_address": raw,
+                    "note": "manual"
+                })
 
             prog.progress(i/len(rows_in), text=f"Resolved {i}/{len(rows_in)}")
             time.sleep(0.02)
