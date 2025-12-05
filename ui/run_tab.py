@@ -1,13 +1,19 @@
 # ui/run_tab.py
-# Always output ONLY Zillow /homes/<slug>_rb/ links.
-# - If you paste URLs (Homespotter, HMS, etc.), we try to extract an address from the HTML
-#   and build a Zillow search link.
-# - If you paste plain addresses, we slugify them directly into Zillow /homes/..._rb/.
-# - NO Google links leave this file.
+# Resolve listing links or addresses to Zillow URLs.
+# Preference order:
+#  1) Canonical homedetails/..._zpid/ URL
+#  2) Fallback: /homes/<slug>_rb/ search URL
+#
+# NO Google links ever leave this file.
 
-import os, csv, io, re, json, time, html
-from typing import List, Dict, Any, Optional, Tuple
+import csv
+import html
+import io
+import json
+import re
+import time
 from html import escape
+from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
 import requests
@@ -15,7 +21,7 @@ import streamlit as st
 import streamlit.components.v1 as components
 
 # ---------------- Page ----------------
-st.set_page_config(page_title="Address Alchemist — Zillow-only Resolver", layout="centered")
+st.set_page_config(page_title="Address Alchemist — Zillow homedetails", layout="centered")
 st.markdown("""
 <style>
 .block-container { max-width: 980px; }
@@ -36,9 +42,13 @@ ul.link-list { margin:0.25rem 0 0 1.1rem; padding:0; }
 </style>
 """, unsafe_allow_html=True)
 
-# ---------------- Config ----------------
+# ---------------- HTTP ----------------
 REQUEST_TIMEOUT = 12
-DEFAULT_UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36"
+DEFAULT_UA = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36"
+)
+
 SOCIAL_UAS = [
     "facebookexternalhit/1.1 (+http://www.facebook.com/externalhit_uatext.php)",
     "Twitterbot/1.0",
@@ -46,8 +56,8 @@ SOCIAL_UAS = [
     "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)",
 ]
 
-# ---------------- HTTP helpers (only for parsing, never for output URLs) ----------------
-def _get(url: str, ua: str = DEFAULT_UA, allow_redirects: bool = True) -> Tuple[str, str, int, Dict[str,str]]:
+
+def _get(url: str, ua: str = DEFAULT_UA, allow_redirects: bool = True) -> Tuple[str, str, int, Dict[str, str]]:
     try:
         r = requests.get(
             url,
@@ -64,75 +74,90 @@ def _get(url: str, ua: str = DEFAULT_UA, allow_redirects: bool = True) -> Tuple[
     except Exception:
         return url, "", 0, {}
 
-# ---------------- Address patterns & extractors ----------------
+
+# ---------------- Address extraction ----------------
 RE_STREET_CITY_ST_ZIP = re.compile(
-    r'(\d{1,6}\s+[A-Za-z0-9\.\'\-\s]+(?:Road|Rd|Street|St|Avenue|Ave|Boulevard|Blvd|Drive|Dr|Lane|Ln|Way|Court|Ct|Circle|Cir|Highway|Hwy|Route|Parkway|Pkwy)\b[^\n,]*)\s*,\s*([A-Za-z\.\'\-\s]+),\s*([A-Z]{2})\s+(\d{5}(?:-\d{4})?)',
-    re.I
+    r'(\d{1,6}\s+[A-Za-z0-9\.\'\-\s]+'
+    r'(?:Road|Rd|Street|St|Avenue|Ave|Boulevard|Blvd|Drive|Dr|Lane|Ln|Way|Court|Ct|Circle|Cir|Highway|Hwy|Route|Parkway|Pkwy)\b[^\n,]*)'
+    r'\s*,\s*([A-Za-z\.\'\-\s]+),\s*([A-Z]{2})\s+(\d{5}(?:-\d{4})?)',
+    re.I,
 )
 RE_CITY_ST_ZIP = re.compile(r'([A-Za-z\.\'\-\s]+),\s*([A-Z]{2})\s+(\d{5}(?:-\d{4})?)', re.I)
 
+
 def _jsonld_blocks(html_txt: str) -> List[Dict[str, Any]]:
     out = []
-    if not html_txt: return out
+    if not html_txt:
+        return out
     un = html.unescape(html_txt)
-    for m in re.finditer(r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>(.*?)</script>', un, re.I|re.S):
+    for m in re.finditer(
+        r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>(.*?)</script>',
+        un,
+        re.I | re.S,
+    ):
         blob = (m.group(1) or "").strip()
         try:
             data = json.loads(blob)
-            if isinstance(data, dict):
-                out.append(data)
-            elif isinstance(data, list):
-                out.extend([d for d in data if isinstance(d, dict)])
         except Exception:
             continue
+        if isinstance(data, dict):
+            out.append(data)
+        elif isinstance(data, list):
+            out.extend([d for d in data if isinstance(d, dict)])
     return out
+
 
 def _extract_address_from_jsonld(html_txt: str) -> str:
     """
-    Return a single best address string like '123 Main St, City ST 12345'
-    using JSON-LD blocks.
+    Return a single best address string like:
+    '123 Main St, City ST 12345'
     """
     for blk in _jsonld_blocks(html_txt):
-        addr = (blk.get("address")
-                or blk.get("itemOffered", {}).get("address")
-                or blk.get("item", {}).get("address"))
+        addr = (
+            blk.get("address")
+            or blk.get("itemOffered", {}).get("address")
+            or blk.get("item", {}).get("address")
+        )
         if isinstance(addr, dict):
             street = (addr.get("streetAddress") or "").strip()
-            city   = (addr.get("addressLocality") or "").strip()
-            state  = (addr.get("addressRegion") or addr.get("addressCountry") or "").strip()
-            zipc   = (addr.get("postalCode") or "").strip()
-            parts = [street, f"{city} {state}".strip(), zipc]
-            s = ", ".join([p for p in parts if p])
+            city = (addr.get("addressLocality") or "").strip()
+            state = (addr.get("addressRegion") or addr.get("addressCountry") or "").strip()
+            zipc = (addr.get("postalCode") or "").strip()
+            pieces = [street, f"{city} {state}".strip(), zipc]
+            s = ", ".join([p for p in pieces if p])
             if s:
                 return s
     return ""
+
 
 def _extract_address_from_meta(html_txt: str) -> str:
     """
     Try og:title, twitter:title, meta description, <title>, og:street-address.
     """
     un = html.unescape(html_txt or "")
-    for pat in [
+    patterns = [
         r"<meta[^>]+property=['\"]og:title['\"][^>]+content=['\"]([^'\"]+)['\"]",
         r"<meta[^>]+name=['\"]twitter:title['\"][^>]+content=['\"]([^'\"]+)['\"]",
         r"<meta[^>]+name=['\"]description['\"][^>]+content=['\"]([^'\"]+)['\"]",
         r"<title>\s*([^<]+)\s*</title>",
         r"<meta[^>]+property=['\"]og:street-address['\"][^>]+content=['\"]([^'\"]+)['\"]",
-    ]:
+    ]
+    for pat in patterns:
         m = re.search(pat, un, re.I)
-        if not m: 
+        if not m:
             continue
-        text = re.sub(r'\s+', ' ', m.group(1)).strip()
+        text = re.sub(r"\s+", " ", m.group(1)).strip()
         s1 = RE_STREET_CITY_ST_ZIP.search(text)
         if s1:
             return f"{s1.group(1)}, {s1.group(2)} {s1.group(3)} {s1.group(4)}".strip()
         s2 = RE_CITY_ST_ZIP.search(text)
         if s2:
             return f"{s2.group(1)}, {s2.group(2)} {s2.group(3)}".strip()
-        # Sometimes the meta text is just full address
-        if re.search(r'^\d+\s', text) and "," in text:
+        # Full address in one string
+        if re.search(r"^\d+\s", text) and "," in text:
             return text
     return ""
+
 
 def _extract_address_from_text(txt: str) -> str:
     if not txt:
@@ -140,56 +165,107 @@ def _extract_address_from_text(txt: str) -> str:
     s1 = RE_STREET_CITY_ST_ZIP.search(txt)
     if s1:
         return f"{s1.group(1)}, {s1.group(2)} {s1.group(3)} {s1.group(4)}".strip()
-    # last-resort: first line with a street-number pattern
+    # Fallback: first line that looks like "123 Something"
     for line in txt.splitlines():
         l = line.strip()
         if re.match(r"^\d+\s+[A-Za-z0-9]", l):
             return l
     return ""
 
+
 def extract_best_address_string(html_txt: str) -> str:
     """
-    Try JSON-LD first, then meta tags, then raw text.
+    Try JSON-LD, then meta tags, then raw text.
     """
     if not html_txt:
         return ""
-    for fn in (_extract_address_from_jsonld,
-               _extract_address_from_meta,
-               _extract_address_from_text):
+    for fn in (
+        _extract_address_from_jsonld,
+        _extract_address_from_meta,
+        _extract_address_from_text,
+    ):
         s = fn(html_txt)
         if s:
             return s.strip()
     return ""
 
-# ---------------- Zillow slug builder ----------------
+
+# ---------------- Zillow URL building ----------------
 def _slugify_for_zillow(s: str) -> str:
     """
-    Turn any address-ish string into something Zillow will parse as a search term.
+    Convert '1008 Joe Collins Road, Lillington NC 27546' ->
+    '1008-joe-collins-road-lillington-nc-27546'
     """
     s = (s or "").lower()
-    # strip weird stuff
     s = re.sub(r"[^\w\s,-]", "", s)
     s = s.replace(",", " ")
     return re.sub(r"\s+", "-", s.strip())
 
+
+def _zillow_homedetails_from_search(search_url: str) -> str:
+    """
+    Given a /homes/<slug>_rb/ search URL, try to find the canonical
+    /homedetails/..._zpid/ URL.
+
+    If we can't, we fall back to the search_url itself.
+    """
+    final, html_txt, code, _ = _get(search_url, ua=DEFAULT_UA, allow_redirects=True)
+
+    # If we got redirected straight to homedetails, use that.
+    if "zillow.com" in final and "/homedetails/" in final and "_zpid" in final:
+        clean = re.sub(r"[?#].*$", "", final)
+        return clean
+
+    if code == 200 and html_txt:
+        # 1) canonical link
+        m = re.search(
+            r'<link[^>]+rel=["\']canonical["\'][^>]+href=["\']([^"\']+)["\']',
+            html_txt,
+            re.I,
+        )
+        if m:
+            canon = m.group(1).strip()
+            if "zillow.com" in canon and "/homedetails/" in canon:
+                return re.sub(r"[?#].*$", "", canon)
+
+        # 2) any homedetails zpid link in the HTML
+        m2 = re.search(
+            r'https://www\.zillow\.com/homedetails/[^"\']+?_zpid/',
+            html_txt,
+        )
+        if m2:
+            return re.sub(r"[?#].*$", "", m2.group(0).strip())
+
+    # Fallback: still a valid Zillow URL, just not homedetails.
+    clean = re.sub(r"[?#].*$", "", search_url)
+    return clean
+
+
 def zillow_from_freeform_address(addr_str: str) -> str:
     """
-    Core rule: ALWAYS return a Zillow /homes/..._rb/ URL for any non-empty addr_str.
+    Core rule:
+      - If we can, return /homedetails/..._zpid/ (canonical listing URL).
+      - Otherwise, return /homes/<slug>_rb/ (Zillow search URL).
+
+    We NEVER return non-Zillow URLs.
     """
     addr_str = (addr_str or "").strip()
     if not addr_str:
         return ""
+
     slug = _slugify_for_zillow(addr_str)
     if not slug:
         return ""
-    return f"https://www.zillow.com/homes/{slug}_rb/"
 
-# ---------------- Resolver: any link -> Zillow search link ----------------
-def _try_variants(url: str) -> List[Tuple[str,str,int]]:
+    search_url = f"https://www.zillow.com/homes/{slug}_rb/"
+    return _zillow_homedetails_from_search(search_url)
+
+
+# ---------------- Resolver: any link -> Zillow ----------------
+def _try_variants(url: str) -> List[Tuple[str, str, int]]:
     variants = [url]
     try:
         u = urlparse(url)
-        variants.append(url)  # original
         variants.append(url.rstrip("/") + "/")
         variants.append(url.rstrip("/") + "/amp")
         variants.append(url.rstrip("/") + "/share")
@@ -197,7 +273,7 @@ def _try_variants(url: str) -> List[Tuple[str,str,int]]:
     except Exception:
         pass
 
-    out = []
+    out: List[Tuple[str, str, int]] = []
     # main hit
     f1, h1, c1, _ = _get(url, ua=DEFAULT_UA, allow_redirects=True)
     out.append((f1, h1, c1))
@@ -205,33 +281,39 @@ def _try_variants(url: str) -> List[Tuple[str,str,int]]:
     for ua in SOCIAL_UAS:
         f2, h2, c2, _ = _get(url, ua=ua, allow_redirects=True)
         out.append((f2, h2, c2))
-    # a couple permutations
+    # some variants
     for v in variants[1:]:
         f3, h3, c3, _ = _get(v, ua=DEFAULT_UA, allow_redirects=True)
         out.append((f3, h3, c3))
     return out
 
-def resolve_any_link_to_zillow_rb(source_url: str) -> Tuple[str, str, str]:
+
+def resolve_any_link_to_zillow(source_url: str) -> Tuple[str, str, str]:
     """
     Returns: (zillow_url_or_empty, display_address, note)
-    NOTE: This will NEVER return a non-zillow URL.
+
+    NOTE: This NEVER returns non-zillow URLs.
     """
     if not source_url:
         return "", "", "empty"
 
-    # If it's already Zillow, trust it (and try to derive display address from the page).
+    # If it's already a Zillow URL
     if "zillow.com" in source_url:
         clean = re.sub(r"[?#].*$", "", source_url)
-        if "zillow.com" not in clean:
-            return "", "", "failed"
-        # Optionally, fetch title for display
+        # Convert /homes/... to homedetails if possible
+        if "/homes/" in clean and "_rb/" in clean and "/homedetails/" not in clean:
+            hd = _zillow_homedetails_from_search(clean)
+            if "zillow.com" in hd:
+                clean = hd
+
+        # Optionally extract display address from the page
         final, html_txt, code, _ = _get(clean, ua=DEFAULT_UA, allow_redirects=True)
         addr_str = ""
         if code == 200 and html_txt:
             addr_str = extract_best_address_string(html_txt)
         return clean, addr_str, "already_zillow"
 
-    # For non-zillow URLs (Homespotter, HMS, etc.) → pull HTML & find address text.
+    # Non-Zillow URL: fetch HTML, extract address, then hit Zillow
     tries = _try_variants(source_url)
     addr_str = ""
     for final, html_txt, code in tries:
@@ -241,8 +323,8 @@ def resolve_any_link_to_zillow_rb(source_url: str) -> Tuple[str, str, str]:
         if addr_str:
             break
 
-    # If we still didn't find anything, just use the URL path as a "search hint"
     if not addr_str:
+        # Use path as best-effort "search hint"
         parsed = urlparse(source_url)
         guess = (parsed.path or "").replace("-", " ").replace("/", " ").strip()
         addr_str = guess or source_url
@@ -252,6 +334,7 @@ def resolve_any_link_to_zillow_rb(source_url: str) -> Tuple[str, str, str]:
         return "", addr_str, "failed"
 
     return zurl, addr_str, "from_html"
+
 
 # ---------------- UI helpers ----------------
 def _rows_from_paste(text: str) -> List[Dict[str, Any]]:
@@ -286,6 +369,7 @@ def _rows_from_paste(text: str) -> List[Dict[str, Any]]:
             rows.append({"address": s})
     return rows
 
+
 def _results_list(results: List[Dict[str, Any]]):
     """
     Render only Zillow URLs as clickable links + a "Copy" button with pure Zillow URL list.
@@ -300,23 +384,27 @@ def _results_list(results: List[Dict[str, Any]]):
 
         urls_for_copy.append(u)
         addr = r.get("display_address") or ""
-        badge = r.get("note","")
+        badge = r.get("note", "")
         bh = ""
-        if badge == "ok":
-            bh = ' <span class="badge ok">street # found</span>'
+        if badge in ("ok", "already_zillow", "from_html", "manual"):
+            bh = ' <span class="badge ok">ok</span>'
         elif badge == "no_number":
-            bh = ' <span class="badge warn">no street #</span>'
+            bh = ' <span class="badge warn">loose address</span>'
+        elif badge == "failed":
+            bh = ' <span class="badge warn">failed</span>'
+
         label = (addr + " — " + u) if addr else u
         items.append(
             f'<li style="margin:0.2rem 0;"><a href="{escape(u)}" target="_blank" rel="noopener">'
-            f'{escape(label)}</a>{bh}</li>'
+            f"{escape(label)}</a>{bh}</li>"
         )
 
     html_list = "\n".join(items) if items else "<li>(no Zillow results)</li>"
     raw_lines = "\n".join(urls_for_copy) + ("\n" if urls_for_copy else "")
     js_lines = json.dumps(raw_lines)
 
-    components.html(f"""
+    components.html(
+        f"""
       <html><head><meta charset="utf-8" />
       <style>
         html,body {{ margin:0; font-family:-apple-system, Segoe UI, Roboto, Arial, sans-serif; }}
@@ -350,15 +438,19 @@ def _results_list(results: List[Dict[str, Any]]):
           }})();
         </script>
       </body></html>
-    """, height=min(600, 40 * max(1, len(items)) + 60), scrolling=False)
+    """,
+        height=min(600, 40 * max(1, len(items)) + 60),
+        scrolling=False,
+    )
+
 
 # ---------------- Main UI ----------------
 def render_run_tab(state: dict = None):
-    st.header("Address Alchemist — Zillow-only Resolver")
+    st.header("Address Alchemist — Zillow homedetails resolver")
     st.caption(
-        "Paste listing links (Homespotter / HMS / MLS) or plain addresses. "
-        "This will output **ONLY** Zillow `/homes/..._rb/` links. "
-        "Any row that can’t be turned into a Zillow link is skipped."
+        "Paste listing links (Homespotter / HMS / MLS / Zillow) or plain addresses. "
+        "I’ll output Zillow links, preferring **homedetails/..._zpid/** (canonical), "
+        "falling back to /homes/<slug>_rb/ only if needed."
     )
 
     colA, colB = st.columns([1.4, 1])
@@ -370,18 +462,15 @@ def render_run_tab(state: dict = None):
     rows_in: List[Dict[str, Any]] = []
     rows_in.extend(_rows_from_paste(paste))
 
-    # ---- CSV upload: case-insensitive headers, multiple URL/address column names ----
+    # CSV upload
     if up is not None:
         try:
             content = up.getvalue().decode("utf-8-sig", errors="ignore")
             reader = csv.DictReader(io.StringIO(content))
-
             for row in reader:
                 if not row:
                     continue
-
                 row_lc = {(k or "").strip().lower(): (v or "").strip() for k, v in row.items()}
-
                 u = (
                     row_lc.get("url")
                     or row_lc.get("link")
@@ -390,24 +479,20 @@ def render_run_tab(state: dict = None):
                     or row_lc.get("property_url")
                     or row_lc.get("hs_link")
                 )
-
                 addr = (
                     row_lc.get("address")
                     or row_lc.get("full_address")
                     or row_lc.get("property_address")
                 )
-
                 if u:
                     rows_in.append({"url": u})
                 elif addr:
                     rows_in.append({"address": addr})
-
         except Exception as e:
             st.warning(f"Could not read CSV: {e}")
 
     st.write(f"Parsed **{len(rows_in)}** row(s).")
 
-    # ---------- MAIN BUTTON ----------
     if st.button("🚀 Resolve to Zillow"):
         if not rows_in:
             st.warning("Nothing to process.")
@@ -417,107 +502,147 @@ def render_run_tab(state: dict = None):
         prog = st.progress(0.0, text="Resolving…")
 
         for i, row in enumerate(rows_in, start=1):
-            raw = (row.get("url") or row.get("source_url") or row.get("href") or row.get("address") or "").strip()
+            raw = (
+                row.get("url")
+                or row.get("source_url")
+                or row.get("href")
+                or row.get("address")
+                or ""
+            ).strip()
             if not raw:
                 continue
 
             looks_like_url = (
                 raw.startswith(("http://", "https://"))
-                or re.match(r'^[\w.-]+\.[a-z]{2,10}(/|$)', raw, re.I)
+                or re.match(r"^[\w.-]+\.[a-z]{2,10}(/|$)", raw, re.I)
             )
 
             if looks_like_url:
-                # Make sure it has a scheme if it's a domain-only thing
                 if not raw.startswith(("http://", "https://")):
                     u = "https://" + raw
                 else:
                     u = raw
-
-                z, addr_str, note = resolve_any_link_to_zillow_rb(u)
-                results.append({
-                    "original": raw,
-                    "zillow_url": z,           # may be ""
-                    "display_address": addr_str or "",
-                    "note": note,
-                })
+                z, addr_str, note = resolve_any_link_to_zillow(u)
+                results.append(
+                    {
+                        "original": raw,
+                        "zillow_url": z,
+                        "display_address": addr_str or "",
+                        "note": note,
+                    }
+                )
             else:
-                # Plain address string → direct Zillow search link
+                # Plain address → go straight to Zillow builder
                 z = zillow_from_freeform_address(raw)
-                results.append({
-                    "original": raw,
-                    "zillow_url": z,           # may be ""
-                    "display_address": raw,
-                    "note": "manual" if z else "failed",
-                })
+                note = "manual" if z else "failed"
+                results.append(
+                    {
+                        "original": raw,
+                        "zillow_url": z,
+                        "display_address": raw,
+                        "note": note,
+                    }
+                )
 
-            prog.progress(i/len(rows_in), text=f"Resolved {i}/{len(rows_in)}")
+            prog.progress(i / len(rows_in), text=f"Resolved {i}/{len(rows_in)}")
             time.sleep(0.02)
 
         prog.progress(1.0, text="Done")
 
-        st.subheader("Results (Zillow-only)")
+        st.subheader("Results (Zillow homedetails preferred)")
         _results_list(results)
 
         zillow_results = [
-            r for r in results
-            if r.get("zillow_url") and "zillow.com" in r.get("zillow_url","")
+            r for r in results if r.get("zillow_url") and "zillow.com" in r.get("zillow_url", "")
         ]
 
         st.markdown("#### Export (Zillow links only)")
-        fmt = st.radio("Format", ["txt","csv","md","html"], horizontal=True)
+        fmt = st.radio("Format", ["txt", "csv", "md", "html"], horizontal=True)
         if fmt == "csv":
             buf = io.StringIO()
-            w = csv.DictWriter(buf, fieldnames=["original","zillow_url","display_address","note"])
+            w = csv.DictWriter(
+                buf, fieldnames=["original", "zillow_url", "display_address", "note"]
+            )
             w.writeheader()
             for r in zillow_results:
-                w.writerow({k: r.get(k,"") for k in ["original","zillow_url","display_address","note"]})
+                w.writerow(
+                    {
+                        k: r.get(k, "")
+                        for k in ["original", "zillow_url", "display_address", "note"]
+                    }
+                )
             payload, mime, fname = buf.getvalue(), "text/csv", "resolved.csv"
         elif fmt == "html":
-            items = "\n".join([
-                f'<li><a href="{escape(r.get("zillow_url",""))}" target="_blank" rel="noopener">{escape(r.get("zillow_url",""))}</a></li>'
-                for r in zillow_results
-            ])
-            payload, mime, fname = "<ul>\n"+items+"\n</ul>\n", "text/html", "resolved.html"
+            items = "\n".join(
+                [
+                    f'<li><a href="{escape(r.get("zillow_url",""))}" target="_blank" '
+                    f'rel="noopener">{escape(r.get("zillow_url",""))}</a></li>'
+                    for r in zillow_results
+                ]
+            )
+            payload, mime, fname = "<ul>\n" + items + "\n</ul>\n", "text/html", "resolved.html"
         elif fmt == "md":
-            payload, mime, fname = "\n".join([r.get("zillow_url","") for r in zillow_results]) + "\n", "text/markdown", "resolved.md"
+            payload, mime, fname = (
+                "\n".join([r.get("zillow_url", "") for r in zillow_results]) + "\n",
+                "text/markdown",
+                "resolved.md",
+            )
         else:
-            payload, mime, fname = "\n".join([r.get("zillow_url","") for r in zillow_results]) + "\n", "text/plain", "resolved.txt"
+            payload, mime, fname = (
+                "\n".join([r.get("zillow_url", "") for r in zillow_results]) + "\n",
+                "text/plain",
+                "resolved.txt",
+            )
 
-        st.download_button("Download", data=payload.encode("utf-8"), file_name=fname, mime=mime, use_container_width=True)
+        st.download_button(
+            "Download", data=payload.encode("utf-8"), file_name=fname, mime=mime, use_container_width=True
+        )
 
-    # ---------- FIX / RE-RUN ----------
+    # ---------- Fix / Re-run ----------
     st.divider()
     st.subheader("Fix / Re-run links")
-    st.caption("Paste any listing links; I’ll convert them to Zillow `/homes/..._rb/` links.")
+    st.caption("Paste any listing links; I’ll convert them to Zillow homedetails/search URLs.")
     fix_text = st.text_area("Links to fix", height=140, key="fix_area")
     if st.button("🔧 Fix / Re-run"):
         lines = [l.strip() for l in (fix_text or "").splitlines() if l.strip()]
         fixed, shown = [], []
         prog = st.progress(0, text="Fixing…")
+
         for i, u in enumerate(lines, start=1):
             if not u:
                 continue
-            if u.startswith(("http://","https://")) or re.match(r'^[\w.-]+\.[a-z]{2,10}(/|$)', u, re.I):
-                z, addr_str, note = resolve_any_link_to_zillow_rb(u)
+            if u.startswith(("http://", "https://")) or re.match(
+                r"^[\w.-]+\.[a-z]{2,10}(/|$)", u, re.I
+            ):
+                z, addr_str, note = resolve_any_link_to_zillow(u)
             else:
                 z = zillow_from_freeform_address(u)
-                addr_str, note = u, "manual" if z else "failed"
+                addr_str, note = u, ("manual" if z else "failed")
 
             if not z or "zillow.com" not in z:
-                prog.progress(i/len(lines), text=f"Fixed {i}/{len(lines)} (skipped)")
+                prog.progress(i / len(lines), text=f"Fixed {i}/{len(lines)} (skipped)")
                 continue
 
             best = z
-            badge = "✅" if note in ("ok","already_zillow","from_html","manual") else "⚠️"
+            badge = "✅" if note in ("ok", "already_zillow", "from_html", "manual") else "⚠️"
             fixed.append(best)
-            label = (addr_str or best)
+            label = addr_str or best
             shown.append(f"- {badge} [{escape(label)}]({escape(best)})")
-            prog.progress(i/len(lines), text=f"Fixed {i}/{len(lines)}")
+            prog.progress(i / len(lines), text=f"Fixed {i}/{len(lines)}")
 
         prog.progress(1.0, text="Done")
         st.markdown("**Fixed Zillow links**")
-        st.markdown("\n".join(shown) if shown else "_(No Zillow links could be resolved.)_", unsafe_allow_html=True)
-        st.text_area("Copy clean list", value=("\n".join(fixed) + "\n") if fixed else "", height=140, label_visibility="collapsed")
+        st.markdown(
+            "\n".join(shown) if shown else "_(No Zillow links could be resolved.)_",
+            unsafe_allow_html=True,
+        )
+        st.text_area(
+            "Copy clean list",
+            value=("\n".join(fixed) + "\n") if fixed else "",
+            height=140,
+            label_visibility="collapsed",
+        )
+
 
 if __name__ == "__main__":
     render_run_tab(st.session_state)
