@@ -462,7 +462,8 @@ def best_effort_address_from_hs(url: str) -> Dict[str,str]:
 
 def resolve_any_link_to_zillow_rb(source_url: str) -> Tuple[str, str, str]:
     """
-    Returns: (deeplink_or_fallback, display_address, note)
+    Returns: (zillow_deeplink_or_empty, display_address, note)
+    note: "ok", "no_number", "already_zillow", "failed", etc.
     """
     if not source_url: return "", "", "empty"
     final, html_txt, code, _ = _get(source_url, ua=DEFAULT_UA, allow_redirects=True)
@@ -503,14 +504,8 @@ def resolve_any_link_to_zillow_rb(source_url: str) -> Tuple[str, str, str]:
     display_addr = ", ".join([p for p in [street, f"{city} {state}".strip(), zipc] if p])
 
     if not deeplink:
-        # Fallback: always return a real http(s) URL so Streamlit doesn't treat it as a local path
-        if source_url.startswith(("http://", "https://")):
-            fallback_url = source_url
-        else:
-            query = display_addr or source_url
-            fallback_url = "https://www.google.com/maps/search/?api=1&query=" + quote_plus(query)
-
-        return fallback_url, display_addr, "fallback"
+        # Could not build a Zillow link – mark as failed and return empty URL
+        return "", display_addr, "failed"
 
     return deeplink, display_addr, note
 
@@ -540,14 +535,14 @@ def _rows_from_paste(text: str) -> List[Dict[str, Any]]:
 
 def _results_list(results: List[Dict[str, Any]]):
     items = []
-    for r in results:
-        u = (r.get("zillow_url") or r.get("original") or "").strip()
-        if not u:
-            continue
+    urls_for_copy: List[str] = []
 
-        # Safety: if somehow we still get a non-URL, make it a Google search
-        if not (u.startswith("http://") or u.startswith("https://")):
-            u = "https://www.google.com/search?q=" + quote_plus(u)
+    for r in results:
+        u = (r.get("zillow_url") or "").strip()
+        if not u:
+            continue  # skip non-zillow rows
+
+        urls_for_copy.append(u)
 
         addr = r.get("display_address") or ""
         badge = r.get("note","")
@@ -558,9 +553,9 @@ def _results_list(results: List[Dict[str, Any]]):
             bh = ' <span class="badge warn">no street #</span>'
         label = (addr + " — " + u) if addr else u
         items.append(f'<li style="margin:0.2rem 0;"><a href="{escape(u)}" target="_blank" rel="noopener">{escape(label)}</a>{bh}</li>')
-    html_list = "\n".join(items) if items else "<li>(no results)</li>"
 
-    raw_lines = "\n".join([(r.get("zillow_url") or r.get("original") or "").strip() for r in results if (r.get("zillow_url") or r.get("original"))]) + "\n"
+    html_list = "\n".join(items) if items else "<li>(no results)</li>"
+    raw_lines = "\n".join(urls_for_copy) + ("\n" if urls_for_copy else "")
     js_lines = json.dumps(raw_lines)
 
     components.html(f"""
@@ -597,7 +592,7 @@ def _streetview_thumb(query_addr: str) -> Optional[str]:
 # ---------------- Main UI ----------------
 def render_run_tab(state: dict = None):
     st.header("Address Alchemist — Homespotter Resolver")
-    st.caption("Paste Homespotter / HMS links or upload CSV with a `url` column. We’ll pull the full address (with number) and build a Zillow **/_rb/** deeplink.")
+    st.caption("Paste Homespotter / HMS links or upload CSV with a `url` column. We’ll pull the full address (with number) and build a Zillow **/_rb/** deeplink. Only Zillow links are output.")
 
     colA, colB = st.columns([1.4, 1])
     with colA:
@@ -677,11 +672,11 @@ def render_run_tab(state: dict = None):
                 z, addr, note = resolve_any_link_to_zillow_rb(u)
                 out: Dict[str, Any] = {
                     "original": raw,
-                    "zillow_url": z or u,
+                    "zillow_url": z,  # Zillow-only; if z is "", this row won't show
                     "display_address": addr or "",
                     "note": note,
                 }
-                if show_sv and addr:
+                if show_sv and addr and z:
                     thumb = _streetview_thumb(addr)
                     if thumb:
                         out["image_url"] = thumb
@@ -699,9 +694,9 @@ def render_run_tab(state: dict = None):
                 z = zillow_rb_from_address(street, city, state, zipc) or ""
                 results.append({
                     "original": raw,
-                    "zillow_url": z or raw,
+                    "zillow_url": z,
                     "display_address": raw,
-                    "note": "manual"
+                    "note": "manual" if z else "failed"
                 })
 
             prog.progress(i/len(rows_in), text=f"Resolved {i}/{len(rows_in)}")
@@ -709,10 +704,10 @@ def render_run_tab(state: dict = None):
 
         prog.progress(1.0, text="Done")
 
-        st.subheader("Results")
+        st.subheader("Results (Zillow-only)")
         _results_list(results)
 
-        thumbs = [(r.get("zillow_url",""), r.get("image_url",""), r.get("display_address","")) for r in results if r.get("image_url")]
+        thumbs = [(r.get("zillow_url",""), r.get("image_url",""), r.get("display_address","")) for r in results if r.get("zillow_url") and r.get("image_url")]
         if thumbs:
             st.markdown("#### Images")
             cols = st.columns(3)
@@ -721,24 +716,33 @@ def render_run_tab(state: dict = None):
                     st.image(img, use_container_width=True)
                     st.markdown(f'<div class="img-label">{escape(addr or "")}</div>', unsafe_allow_html=True)
 
-        st.markdown("#### Export")
+        # Filter only rows that have Zillow URLs for export
+        zillow_results = [r for r in results if r.get("zillow_url")]
+
+        st.markdown("#### Export (Zillow links only)")
         fmt = st.radio("Format", ["txt","csv","md","html"], horizontal=True)
         if fmt == "csv":
-            buf = io.StringIO(); w = csv.DictWriter(buf, fieldnames=["original","zillow_url","display_address","note"]); w.writeheader()
-            for r in results: w.writerow({k: r.get(k,"") for k in ["original","zillow_url","display_address","note"]})
+            buf = io.StringIO()
+            w = csv.DictWriter(buf, fieldnames=["original","zillow_url","display_address","note"])
+            w.writeheader()
+            for r in zillow_results:
+                w.writerow({k: r.get(k,"") for k in ["original","zillow_url","display_address","note"]})
             payload, mime, fname = buf.getvalue(), "text/csv", "resolved.csv"
         elif fmt == "html":
-            items = "\n".join([f'<li><a href="{escape(r.get("zillow_url",""))}" target="_blank" rel="noopener">{escape(r.get("zillow_url",""))}</a></li>' for r in results])
+            items = "\n".join([
+                f'<li><a href="{escape(r.get("zillow_url",""))}" target="_blank" rel="noopener">{escape(r.get("zillow_url",""))}</a></li>'
+                for r in zillow_results
+            ])
             payload, mime, fname = "<ul>\n"+items+"\n</ul>\n", "text/html", "resolved.html"
         elif fmt == "md":
-            payload, mime, fname = "\n".join([r.get("zillow_url","") for r in results]) + "\n", "text/markdown", "resolved.md"
+            payload, mime, fname = "\n".join([r.get("zillow_url","") for r in zillow_results]) + "\n", "text/markdown", "resolved.md"
         else:
-            payload, mime, fname = "\n".join([r.get("zillow_url","") for r in results]) + "\n", "text/plain", "resolved.txt"
+            payload, mime, fname = "\n".join([r.get("zillow_url","") for r in zillow_results]) + "\n", "text/plain", "resolved.txt"
         st.download_button("Download", data=payload.encode("utf-8"), file_name=fname, mime=mime, use_container_width=True)
 
     st.divider()
     st.subheader("Fix / Re-run links")
-    st.caption("Paste any listing links; I’ll parse + reverse-geocode if needed to build clean Zillow **/_rb/** links.")
+    st.caption("Paste any listing links; I’ll re-resolve and only show Zillow **/_rb/** links.")
     fix_text = st.text_area("Links to fix", height=140, key="fix_area")
     if st.button("🔧 Fix / Re-run"):
         lines = [l.strip() for l in (fix_text or "").splitlines() if l.strip()]
@@ -746,16 +750,19 @@ def render_run_tab(state: dict = None):
         prog = st.progress(0, text="Fixing…")
         for i, u in enumerate(lines, start=1):
             z, addr, note = resolve_any_link_to_zillow_rb(u)
-            best = z or u
+            if not z:
+                prog.progress(i/len(lines), text=f"Fixed {i}/{len(lines)} (skipped non-zillow)")
+                continue
+            best = z  # Zillow-only
             badge = "✅" if note == "ok" else "⚠️"
             fixed.append(best)
             label = (addr or best)
             shown.append(f"- {badge} [{escape(label)}]({escape(best)})")
             prog.progress(i/len(lines), text=f"Fixed {i}/{len(lines)}")
         prog.progress(1.0, text="Done")
-        st.markdown("**Fixed links**")
-        st.markdown("\n".join(shown), unsafe_allow_html=True)
-        st.text_area("Copy clean list", value="\n".join(fixed) + "\n", height=140, label_visibility="collapsed")
+        st.markdown("**Fixed Zillow links**")
+        st.markdown("\n".join(shown) if shown else "_(No Zillow links could be resolved.)_", unsafe_allow_html=True)
+        st.text_area("Copy clean list", value=("\n".join(fixed) + "\n") if fixed else "", height=140, label_visibility="collapsed")
 
 if __name__ == "__main__":
     render_run_tab(st.session_state)
